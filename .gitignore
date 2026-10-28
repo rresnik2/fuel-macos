@@ -1,0 +1,23 @@
+# Build output
+build/
+*.metallib
+
+# Never commit game files or anything extracted from them.
+# The port reads the player's own copy at run time.
+*.DPC
+*.dpc
+*.IWR
+*.iwr
+*.exe
+*.dll
+*.bik
+*.sdx
+*.cab
+*.iso
+game/
+out/
+shots/
+*.dds
+*.png
+
+.DS_Store
