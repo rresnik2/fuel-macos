@@ -1,6 +1,6 @@
 // fuelview: browse the meshes in a FUEL .DPC file with Metal.
 //
-//   fuelview [--data DIR] [--mesh ID] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]
+//   fuelview [--data DIR] [--mesh ID | --scene FILE.json] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]
 //            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]
 //
 // DPC paths are relative to the game data directory (the folder that holds
@@ -11,6 +11,9 @@
 //   L = next livery, P = next palette colour (with --vehicle).
 // --vehicle NAME (for example QUAD_ALL_1) picks the vehicle whose palette and
 // liveries paint the bodywork; --livery 0 shows plain paint.
+// --scene loads an assembled vehicle exported by the reverse-engineering
+// tools (a JSON list of parts with mesh IDs and Direct3D row-major world
+// matrices); its variant name also selects the paint.
 
 #import <Cocoa/Cocoa.h>
 #import <ImageIO/ImageIO.h>
@@ -42,6 +45,7 @@ struct Options {
     uint32_t meshId = 0;
     bool haveMeshId = false;
     std::string shot;
+    std::string scene;
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
     bool cull = true;
@@ -108,6 +112,7 @@ Options parseArgs(int argc, const char** argv) {
         if (a == "--data") o.dataDir = next();
         else if (a == "--mesh") { o.meshId = uint32_t(std::stoul(next(), nullptr, 16)); o.haveMeshId = true; }
         else if (a == "--shot") o.shot = next();
+        else if (a == "--scene") o.scene = next();
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
         else if (a == "--yaw") o.yawDeg = std::stof(next());
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
@@ -116,7 +121,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--livery") o.livery = std::stoi(next());
         else if (a == "--color") o.color = std::stoi(next());
         else if (a == "--paint") { const std::string v = next(); if (std::sscanf(v.c_str(), "%d,%d,%d", &o.paint[0], &o.paint[1], &o.paint[2]) != 3) die("bad --paint"); o.havePaint = true; }
-        else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]\n"
+        else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID | --scene FILE.json] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]\n"
                                                          "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]"); std::exit(0); }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.dpcs.push_back(a);
@@ -144,6 +149,36 @@ std::vector<MeshEntry> listMeshes(const fuel::DpcFile& dpc) {
     }
     std::stable_sort(out.begin(), out.end(), [](const MeshEntry& a, const MeshEntry& b) { return a.triangles > b.triangles; });
     return out;
+}
+
+struct SceneFile {
+    std::string variant;
+    std::vector<fuel::MeshInstance> parts;
+};
+
+SceneFile loadScene(const std::string& path) {
+    NSData* data = [NSData dataWithContentsOfFile:@(path.c_str())];
+    if (data == nil) die("cannot read " + path);
+    NSError* err = nil;
+    NSDictionary* root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (![root isKindOfClass:[NSDictionary class]]) die("bad scene file " + path);
+    SceneFile sf;
+    if (NSString* v = root[@"variant"]; [v isKindOfClass:[NSString class]]) sf.variant = v.UTF8String;
+    for (NSDictionary* part in root[@"parts"]) {
+        NSString* kind = part[@"kind"];
+        NSString* meshId = part[@"mesh_id"];
+        NSArray* m = part[@"world_matrix"];
+        if (![meshId isKindOfClass:[NSString class]] || ![m isKindOfClass:[NSArray class]] || m.count != 16) continue;
+        if ([kind hasSuffix:@"_unplaced"] || [kind hasPrefix:@"light"]) continue;
+        // Row-major row-vector (p * M) is the transpose of simd's column-vector
+        // form, so the file's rows become simd columns.
+        simd_float4 cols[4];
+        for (int r = 0; r < 4; ++r)
+            cols[r] = simd_make_float4([m[r * 4] floatValue], [m[r * 4 + 1] floatValue], [m[r * 4 + 2] floatValue], [m[r * 4 + 3] floatValue]);
+        sf.parts.push_back({uint32_t(std::stoul(meshId.UTF8String, nullptr, 16)), simd_matrix(cols[0], cols[1], cols[2], cols[3])});
+    }
+    if (sf.parts.empty()) die("no drawable parts in " + path);
+    return sf;
 }
 
 MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
@@ -225,6 +260,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     fuel::OrbitCamera _cam;
     size_t _index;
     VehicleLook _look;
+    SceneFile _scene;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -234,7 +270,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                      fileName:(const std::string&)fileName
                         start:(size_t)start
                        camera:(fuel::OrbitCamera)cam
-                         look:(const VehicleLook&)look {
+                         look:(const VehicleLook&)look
+                        scene:(const SceneFile&)scene {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -243,6 +280,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _cam = cam;
         _index = start;
         _look = look;
+        _scene = scene;
         self.colorPixelFormat = kColorFormat;
         self.depthStencilPixelFormat = kDepthFormat;
         self.sampleCount = kSamples;
@@ -255,6 +293,12 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 - (BOOL)acceptsFirstResponder { return YES; }
 
 - (void)updateTitle {
+    if (!_scene.parts.empty()) {
+        self.window.title = [NSString stringWithFormat:@"FUEL viewer — %s — %zu parts — %u triangles%s",
+                                                       _scene.variant.c_str(), _scene.parts.size(), _renderer->triangleCount(),
+                                                       _look.describe().c_str()];
+        return;
+    }
     const MeshEntry& m = (*_meshes)[_index];
     NSString* title = [NSString stringWithFormat:@"FUEL viewer — %s — mesh %zu/%zu — %08x — %u triangles%s%s%s%s%s",
                                                  _fileName.c_str(), _index + 1, _meshes->size(), m.id, _renderer->triangleCount(),
@@ -266,12 +310,17 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 - (void)showMesh:(size_t)index {
     _index = index;
     std::string err;
+    if (!_scene.parts.empty()) {
+        if (!_renderer->setScene(_scene.parts, &err) || !err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
+        [self updateTitle];
+        return;
+    }
     if (!_renderer->setMesh((*_meshes)[_index].id, &err)) std::fprintf(stderr, "fuelview: mesh %08x: %s\n", (*_meshes)[_index].id, err.c_str());
     [self updateTitle];
 }
 
 - (void)keyDown:(NSEvent*)e {
-    const size_t n = _meshes->size();
+    const size_t n = _scene.parts.empty() ? _meshes->size() : 1;
     switch (e.keyCode) {
         case 123: [self showMesh:(_index + n - 1) % n]; return;  // left
         case 124: [self showMesh:(_index + 1) % n]; return;      // right
@@ -364,9 +413,13 @@ int main(int argc, const char** argv) {
         fuel::MeshRenderer renderer(device, kColorFormat, kDepthFormat, kSamples, library);
         renderer.cullBackFaces = opt.cull;
 
+        SceneFile scene;
+        if (!opt.scene.empty()) scene = loadScene(opt.scene);
+        const std::string vehicle = !opt.vehicle.empty() ? opt.vehicle : scene.variant;
+
         VehicleLook look;
-        if (!opt.vehicle.empty()) {
-            look.name = opt.vehicle;
+        if (!vehicle.empty()) {
+            look.name = vehicle;
             const fs::path tsc = fs::path(opt.dataDir) / "LocalizedComponent/GameTsc/Story/VehiclesDef.tsc";
             if (FILE* f = std::fopen(tsc.c_str(), "rb")) {
                 std::string text;
@@ -374,11 +427,11 @@ int main(int argc, const char** argv) {
                 for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
                 std::fclose(f);
                 const auto colors = fuel::parseVehicleColors(text);
-                if (auto it = colors.find(opt.vehicle); it != colors.end()) look.palette = it->second;
+                if (auto it = colors.find(vehicle); it != colors.end()) look.palette = it->second;
             }
-            if (look.palette.empty()) std::fprintf(stderr, "fuelview: warning: no palette for %s in VehiclesDef.tsc\n", opt.vehicle.c_str());
-            for (int i = 1; i <= 9; ++i) look.liveries[size_t(i)] = fuel::findLiveryTextures(subject, opt.vehicle, i);
-            if (look.liveries[1][0] == 0) std::fprintf(stderr, "fuelview: warning: no liveries for %s in %s\n", opt.vehicle.c_str(), subject.path().c_str());
+            if (look.palette.empty()) std::fprintf(stderr, "fuelview: warning: no palette for %s in VehiclesDef.tsc\n", vehicle.c_str());
+            for (int i = 1; i <= 9; ++i) look.liveries[size_t(i)] = fuel::findLiveryTextures(subject, vehicle, i);
+            if (look.liveries[1][0] == 0) std::fprintf(stderr, "fuelview: warning: no liveries for %s in %s\n", vehicle.c_str(), subject.path().c_str());
             look.livery = std::clamp(opt.livery, 0, 9);
             look.color = std::max(0, opt.color);
             if (opt.havePaint) {
@@ -394,6 +447,13 @@ int main(int argc, const char** argv) {
 
         if (!opt.shot.empty()) {
             std::string err;
+            if (!scene.parts.empty()) {
+                if (!renderer.setScene(scene.parts, &err)) die(err);
+                if (!err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
+                renderShot(device, renderer, opt, cam);
+                std::printf("wrote %s: %s, %zu parts, %u triangles\n", opt.shot.c_str(), scene.variant.c_str(), scene.parts.size(), renderer.triangleCount());
+                return 0;
+            }
             if (!renderer.setMesh(meshes[start].id, &err)) die(err);
             renderShot(device, renderer, opt, cam);
             std::printf("wrote %s: mesh %08x, %u triangles\n", opt.shot.c_str(), meshes[start].id, renderer.triangleCount());
@@ -418,7 +478,8 @@ int main(int argc, const char** argv) {
                                                 fileName:fs::path(subject.path()).filename().string()
                                                    start:start
                                                   camera:cam
-                                                    look:look];
+                                                    look:look
+                                                   scene:scene];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];
