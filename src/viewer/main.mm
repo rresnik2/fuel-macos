@@ -414,6 +414,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     WorldStreamer* _streamer; // --drive: the static world
     Garage* _garage;          // --drive: vehicles to switch between
     std::unique_ptr<DriveSession> _switched;  // a vehicle chosen with Tab
+    NSTextField* _hud;        // --drive: speed, gear, race
     std::set<unsigned short> _keys;
     double _lastTime;
     float _steer;             // smoothed keyboard steering
@@ -446,6 +447,17 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _drive = drive;
         _streamer = streamer;
         _garage = garage;
+        if (drive) {
+            _hud = [NSTextField labelWithString:@""];
+            _hud.font = [NSFont monospacedDigitSystemFontOfSize:22 weight:NSFontWeightSemibold];
+            _hud.textColor = NSColor.whiteColor;
+            _hud.shadow = [NSShadow new];
+            _hud.shadow.shadowBlurRadius = 3;
+            _hud.shadow.shadowColor = [NSColor colorWithWhite:0 alpha:0.8];
+            _hud.frame = NSMakeRect(18, 14, 900, 64);
+            _hud.maximumNumberOfLines = 2;
+            [self addSubview:_hud];
+        }
         _lastTime = 0;
         _steer = 0;
         _camYawOffset = 0;
@@ -632,8 +644,9 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     _cam.yaw += diff * std::min(1.0f, dt * 3.0f);
     _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
     const fuel::VehicleState st = _drive->state();
-    self.window.title = [NSString stringWithFormat:@"FUEL — %s — %.0f km/h — gear %d — %.0f rpm", _scene.variant.c_str(),
-                                                   std::fabs(st.speedKmh), st.gear, st.rpm];
+    self.window.title = [NSString stringWithFormat:@"FUEL — %s", _scene.variant.c_str()];
+    _hud.stringValue = [NSString stringWithFormat:@"%s\n%3.0f km/h   gear %d   %5.0f rpm", _scene.variant.c_str(), std::fabs(st.speedKmh),
+                                                  st.gear, st.rpm];
 }
 
 - (void)drawInMTKView:(MTKView*)view {
