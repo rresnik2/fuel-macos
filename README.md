@@ -21,19 +21,27 @@ Early. What works today:
   the game's data) with a modern GPU terrain renderer, sky and haze;
   `--at X,Z` stands the vehicle on it. `--world` draws a world archive's
   placed objects. `fuelterrain` decodes and checks the heightfield.
+- **Driving**: `--drive` puts an assembled vehicle on the terrain under Jolt
+  Physics, tuned from the game's own vehicle data (mass, engine, torque curve,
+  gearbox, drive axles, collision shapes), plus arcade additions (air control,
+  landing stabilisation, speed-sensitive steering, self-righting). Keys:
+  W/S or Up/Down throttle and brake/reverse, A/D or Left/Right steer, Space
+  handbrake, R back on the wheels; gamepads work (stick, triggers, X handbrake,
+  Y reset). `fueldrive` runs a scripted drive without a window.
 - **`fuelscene`** lists the vehicle variants in an archive and prints how each
   one is assembled.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
+Next steps, roughly in order: motorbikes, collisions with world objects, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
 ## Requirements
 
 - A Mac with Apple silicon
+- An internet connection for the first build (CMake downloads Jolt Physics)
 - Xcode or the Xcode Command Line Tools (`xcode-select --install`)
 - CMake 3.24 or newer (`brew install cmake`)
 - FUEL for Windows (disc or a digital copy)
@@ -65,6 +73,7 @@ cmake --build build
 ./build/fuelview --assemble QUAD_ROAD_2             # a whole quad bike
 ./build/fuelview --assemble TRUCK_OFF_1 CommonComponent/DATAS/TRUCK.DPC
 ./build/fuelscene ~/Library/Application\ Support/FUEL/game/CommonComponent/DATAS/QUAD.DPC
+./build/fuelview --assemble QUAD_ROAD_2 --drive          # drive it
 ./build/fuelview --assemble QUAD_ROAD_2 --at -1000,-30000   # on the terrain
 ./build/fuelview                                   # quad bike parts
 ./build/fuelview CommonComponent/DATAS/BUGGY.DPC   # any other archive

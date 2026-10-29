@@ -755,10 +755,12 @@ bool MeshRenderer::setMesh(uint32_t meshId, std::string* error) {
 
 bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::string* error) {
     instances_.clear();
+    inputToInstance_.assign(instances.size(), -1);
     triangles_ = 0;
     error->clear();
     simd_float3 lo = simd_make_float3(1e30f, 1e30f, 1e30f), hi = -lo;
-    for (const MeshInstance& in : instances) {
+    for (size_t k = 0; k < instances.size(); ++k) {
+        const MeshInstance& in = instances[k];
         std::string err;
         const GpuMesh* gm = loadMesh(in.meshId, &err);
         if (gm == nullptr) {
@@ -769,6 +771,7 @@ bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::str
         }
         if (gm->indices == nil) continue;
         const simd_float4x4 world = simd_mul(placement, in.world);
+        inputToInstance_[k] = int(instances_.size());
         instances_.push_back({gm, world});
         triangles_ += gm->triangles;
         for (int c = 0; c < 8; ++c) {
@@ -789,6 +792,11 @@ bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::str
     center_ = (lo + hi) * 0.5f;
     radius_ = std::max(0.05f, simd_length(hi - lo) * 0.5f);
     return true;
+}
+
+void MeshRenderer::setInstanceWorlds(const std::vector<simd_float4x4>& worlds) {
+    for (size_t k = 0; k < worlds.size() && k < inputToInstance_.size(); ++k)
+        if (inputToInstance_[k] >= 0) instances_[size_t(inputToInstance_[k])].world = worlds[k];
 }
 
 simd_float4x4 MeshRenderer::sunViewProj() const {

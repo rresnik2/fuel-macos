@@ -29,6 +29,12 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #import "renderer.h"
+#import "drive.h"
+#import <GameController/GameController.h>
+#include "core/vehicle_params.hpp"
+#include <fstream>
+#include <set>
+#include <sstream>
 #include "core/terrain.hpp"
 #include "core/world.hpp"
 
@@ -67,6 +73,8 @@ struct Options {
     std::string scene;
     bool world = false;
     bool terrain = false;
+    bool drive = false;
+    float driveTime = 4.0f;
     bool haveAt = false;
     float atX = 0, atZ = 0;
     std::string assemble;
@@ -142,6 +150,8 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--scene") o.scene = next();
         else if (a == "--world") o.world = true;
         else if (a == "--terrain") o.terrain = true;
+        else if (a == "--drive") { o.drive = true; o.terrain = true; }
+        else if (a == "--drive-time") o.driveTime = std::stof(next());
         else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
@@ -374,6 +384,11 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     SceneFile _scene;
     bool _sceneMode;          // showing a scene file or an assembled variant
     AssemblyMode* _assembly;  // --assemble, else nullptr
+    DriveSession* _drive;     // --drive, else nullptr
+    std::set<unsigned short> _keys;
+    double _lastTime;
+    float _steer;             // smoothed keyboard steering
+    float _camYawOffset;      // mouse look around the chase camera
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -385,7 +400,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                        camera:(fuel::OrbitCamera)cam
                          look:(const VehicleLook&)look
                         scene:(const SceneFile&)scene
-                     assembly:(AssemblyMode*)assembly {
+                     assembly:(AssemblyMode*)assembly
+                        drive:(DriveSession*)drive {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -396,6 +412,10 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _look = look;
         _scene = scene;
         _assembly = assembly;
+        _drive = drive;
+        _lastTime = 0;
+        _steer = 0;
+        _camYawOffset = 0;
         _sceneMode = assembly != nullptr || !scene.parts.empty();
         self.colorPixelFormat = kColorFormat;
         self.depthStencilPixelFormat = kDepthFormat;
@@ -459,7 +479,28 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     }
 }
 
+// Drive controls: W/S or Up/Down throttle and brake (reverse), A/D or
+// Left/Right steer, Space handbrake, R back on the wheels. A gamepad works too.
+- (bool)driveKey:(unsigned short)code {
+    switch (code) {
+        case 13: case 1: case 0: case 2: case 49: case 123: case 124: case 125: case 126: return true;
+        default: return false;
+    }
+}
+
+- (void)keyUp:(NSEvent*)e { _keys.erase(e.keyCode); }
+
 - (void)keyDown:(NSEvent*)e {
+    if (_drive) {
+        if ([self driveKey:e.keyCode]) {
+            _keys.insert(e.keyCode);
+            return;
+        }
+        if (e.keyCode == 15) {  // R
+            _drive->reset();
+            return;
+        }
+    }
     switch (e.keyCode) {
         case 123: [self step:false]; return;  // left
         case 124: [self step:true]; return;   // right
@@ -486,7 +527,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 }
 
 - (void)mouseDragged:(NSEvent*)e {
-    _cam.yaw -= float(e.deltaX) * 0.008f;
+    if (_drive) _camYawOffset -= float(e.deltaX) * 0.008f;
+    else _cam.yaw -= float(e.deltaX) * 0.008f;
     _cam.pitch = std::clamp(_cam.pitch + float(e.deltaY) * 0.008f, -1.45f, 1.45f);
 }
 
@@ -500,7 +542,41 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
 
+- (void)driveStep {
+    const double now = CACurrentMediaTime();
+    const float dt = _lastTime > 0 ? float(std::min(now - _lastTime, 0.1)) : 0.0f;
+    _lastTime = now;
+    auto down = [&](unsigned short a, unsigned short b) { return _keys.count(a) || _keys.count(b); };
+    fuel::DriveInput in;
+    in.throttle = down(13, 126) ? 1.0f : 0.0f;
+    in.brake = down(1, 125) ? 1.0f : 0.0f;
+    const float target = (down(2, 124) ? 1.0f : 0.0f) - (down(0, 123) ? 1.0f : 0.0f);
+    _steer += std::clamp(target - _steer, -4.0f * dt, 4.0f * dt);
+    in.steer = _steer;
+    in.handbrake = _keys.count(49) > 0;
+    if (GCExtendedGamepad* pad = GCController.controllers.firstObject.extendedGamepad) {
+        const float stick = pad.leftThumbstick.xAxis.value;
+        if (std::fabs(stick) > 0.1f) in.steer = stick;
+        in.throttle = std::max(in.throttle, pad.rightTrigger.value);
+        in.brake = std::max(in.brake, pad.leftTrigger.value);
+        in.handbrake = in.handbrake || pad.buttonX.pressed;
+        if (pad.buttonY.pressed) _drive->reset();
+    }
+    _drive->update(dt, in);
+    _renderer->setInstanceWorlds(_drive->partWorlds());
+    _renderer->setFocus(_drive->position());
+    // Chase camera: swing behind the vehicle, mouse look decays back.
+    float targetYaw = _drive->heading() + float(M_PI) + _camYawOffset;
+    float diff = std::remainder(targetYaw - _cam.yaw, 2.0f * float(M_PI));
+    _cam.yaw += diff * std::min(1.0f, dt * 3.0f);
+    _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
+    const fuel::VehicleState st = _drive->state();
+    self.window.title = [NSString stringWithFormat:@"FUEL — %s — %.0f km/h — gear %d — %.0f rpm", _scene.variant.c_str(),
+                                                   std::fabs(st.speedKmh), st.gear, st.rpm];
+}
+
 - (void)drawInMTKView:(MTKView*)view {
+    if (_drive) [self driveStep];
     id<MTLCommandBuffer> cb = [_queue commandBuffer];
     _renderer->encodeShadows(cb);
     MTLRenderPassDescriptor* rp = view.currentRenderPassDescriptor;
@@ -561,14 +637,15 @@ int main(int argc, const char** argv) {
         fuel::MeshRenderer renderer(device, kSamples, library);
         renderer.cullBackFaces = opt.cull;
         renderer.dirt = std::clamp(opt.dirt, 0.0f, 1.0f);
+        std::unique_ptr<fuel::Heightfield> terrain;
         if (opt.terrain) {
             const fs::path world = fs::path(opt.dataDir) / "CommonComponent/WORLD/USA1.DPC";
             try {
                 fuel::DpcFile usa1(world.string());
-                const fuel::Heightfield hf = fuel::loadWorldHeightfield(usa1);
-                renderer.setTerrain(hf);
-                if (opt.haveAt && !opt.world)
-                    renderer.placement = matrix_from_translation(opt.atX, hf.heightAt(opt.atX, opt.atZ), opt.atZ);
+                terrain = std::make_unique<fuel::Heightfield>(fuel::loadWorldHeightfield(usa1));
+                renderer.setTerrain(*terrain);
+                if (opt.haveAt && !opt.world && !opt.drive)
+                    renderer.placement = matrix_from_translation(opt.atX, terrain->heightAt(opt.atX, opt.atZ), opt.atZ);
             } catch (const std::exception& e) {
                 die(std::string("terrain: ") + e.what());
             }
@@ -585,6 +662,8 @@ int main(int argc, const char** argv) {
         SceneFile scene;
         VehicleLook look;
         std::unique_ptr<AssemblyMode> assembly;
+        std::unique_ptr<DriveSession> drive;
+        if (opt.drive && opt.assemble.empty()) die("--drive needs --assemble VARIANT");
         if (!opt.assemble.empty()) {
             assembly = std::make_unique<AssemblyMode>();
             try {
@@ -605,6 +684,24 @@ int main(int argc, const char** argv) {
             scene = assembly->scene();
             look = assembly->look(prefs);
             renderer.setPaint(look.paint());
+            if (opt.drive) {
+                std::ifstream f(fs::path(opt.dataDir) / "CommonComponent/Param/VehiclesParam.tsc");
+                std::stringstream text;
+                text << f.rdbuf();
+                const auto params = fuel::parseVehiclesParam(text.str());
+                const std::string name = assembly->variant().label;
+                const auto it = params.find(name);
+                if (it == params.end()) die("no driving parameters for " + name + " in Param/VehiclesParam.tsc");
+                try {
+                    const fuel::AssembledVehicle av = assembly->assembler->assemble(assembly->variant(), assembly->lod);
+                    const fuel::VehicleSetup setup = fuel::makeVehicleSetup(subject, name, it->second, assembledHubs(av));
+                    drive = std::make_unique<DriveSession>(av, setup, *terrain, opt.haveAt ? opt.atX : -1000.0, opt.haveAt ? opt.atZ : -30000.0,
+                                                           0.0f);
+                } catch (const std::exception& e) {
+                    die(name + ": " + e.what());
+                }
+                scene.parts = drive->parts();
+            }
         } else {
             if (!opt.scene.empty()) scene = loadScene(opt.scene);
             if (opt.world) {
@@ -642,6 +739,14 @@ int main(int argc, const char** argv) {
             if (sceneMode) {
                 if (!renderer.setScene(scene.parts, &err)) die(scene.variant + ": " + err);
                 if (!err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
+                if (drive) {  // drive straight ahead for a while, then look from behind
+                    for (int i = 0; i < int(opt.driveTime * 60); ++i) drive->update(1.0f / 60, {1.0f, 0, 0, false});
+                    renderer.setInstanceWorlds(drive->partWorlds());
+                    renderer.setFocus(drive->position());
+                    cam.yaw += drive->heading() + float(M_PI);
+                    const fuel::VehicleState st = drive->state();
+                    std::printf("after %.1f s: %.1f km/h, gear %d, %d wheels on the ground\n", opt.driveTime, st.speedKmh, st.gear, st.wheelsOnGround);
+                }
                 renderShot(device, renderer, opt, cam);
                 std::printf("wrote %s: %s, %zu parts, %u triangles\n", opt.shot.c_str(), scene.variant.c_str(), scene.parts.size(), renderer.triangleCount());
                 return 0;
@@ -672,7 +777,8 @@ int main(int argc, const char** argv) {
                                                   camera:cam
                                                     look:look
                                                    scene:scene
-                                                assembly:assembly.get()];
+                                                assembly:assembly.get()
+                                                   drive:drive.get()];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];

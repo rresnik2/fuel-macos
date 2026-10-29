@@ -73,6 +73,11 @@ public:
     // reported in `error`; returns false only when nothing could be shown.
     bool setScene(const std::vector<MeshInstance>& instances, std::string* error);
     uint32_t triangleCount() const { return triangles_; }
+    // Moves the instances of the last setScene (same order as its input;
+    // `placement` is not applied) without reloading anything.
+    void setInstanceWorlds(const std::vector<simd_float4x4>& worlds);
+    // Points the camera at `centre` instead of the scene's centre.
+    void setFocus(simd_float3 centre) { center_ = centre; }
 
     // Takes effect for meshes loaded afterwards (the colour applies at once).
     void setPaint(const Paint& paint);
@@ -173,6 +178,7 @@ private:
     Paint paint_;
     simd_float3 sunDir_;
     std::vector<Instance> instances_;
+    std::vector<int> inputToInstance_;  // setScene input index -> instance, or -1
     simd_float3 center_ = {0, 0, 0};
     simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};
     float radius_ = 1.0f;

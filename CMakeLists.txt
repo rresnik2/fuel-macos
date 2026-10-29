@@ -36,9 +36,10 @@ target_link_libraries(fuelscene PRIVATE fuelcore)
 add_executable(fuelview
   src/viewer/main.mm
   src/viewer/renderer.mm
+  src/viewer/drive.mm
 )
 target_compile_options(fuelview PRIVATE -fobjc-arc)
-target_link_libraries(fuelview PRIVATE fuelcore
+target_link_libraries(fuelview PRIVATE fuelphysics "-framework GameController"
   "-framework Cocoa" "-framework Metal" "-framework MetalKit"
   "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics"
   "-framework UniformTypeIdentifiers")
