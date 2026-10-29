@@ -1,5 +1,7 @@
 #include "resources.hpp"
 
+#include "reader.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -15,39 +17,6 @@ T rd(const uint8_t* p) {
     std::memcpy(&v, p, sizeof(T));
     return v;
 }
-
-// Bounds-checked little-endian reader over a body.
-class Reader {
-public:
-    explicit Reader(const std::vector<uint8_t>& b) : b_(b) {}
-
-    size_t offset() const { return o_; }
-    size_t size() const { return b_.size(); }
-
-    const uint8_t* raw(size_t n) {
-        if (n > b_.size() - o_) throw std::runtime_error("overrun reading " + std::to_string(n) + " bytes at " + std::to_string(o_));
-        const uint8_t* p = b_.data() + o_;
-        o_ += n;
-        return p;
-    }
-    uint32_t u32() { return rd<uint32_t>(raw(4)); }
-    uint16_t u16() { return rd<uint16_t>(raw(2)); }
-    uint32_t count(uint32_t limit = 5'000'000) {
-        const uint32_t n = u32();
-        if (n > limit) throw std::runtime_error("implausible count " + std::to_string(n));
-        return n;
-    }
-    // u32 count followed by count * elemSize bytes; returns the count.
-    uint32_t skipArray(size_t elemSize) {
-        const uint32_t n = count();
-        raw(size_t(n) * elemSize);
-        return n;
-    }
-
-private:
-    const std::vector<uint8_t>& b_;
-    size_t o_ = 0;
-};
 
 struct FormatDesc {
     PixelFormat format;
@@ -190,7 +159,7 @@ MeshLink parseMeshLink(const std::vector<uint8_t>& link) {
 }
 
 Mesh parseMeshBody(const std::vector<uint8_t>& body, uint32_t linkFlags) {
-    Reader r(body);
+    ByteReader r(body);
     Mesh m;
     // Point arrays: positions, plus three per-point attribute arrays.
     r.skipArray(12);
