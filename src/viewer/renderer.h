@@ -38,13 +38,22 @@ struct OrbitCamera {
     float distance = 2.1f; // in model radii
 };
 
+// One placed copy of a mesh.
+struct MeshInstance {
+    uint32_t meshId = 0;
+    simd_float4x4 world = matrix_identity_float4x4;
+};
+
 class MeshRenderer {
 public:
     MeshRenderer(id<MTLDevice> device, MTLPixelFormat colorFormat, MTLPixelFormat depthFormat, NSUInteger sampleCount,
                  const ResourceLibrary& library);
 
-    // Uploads one Mesh_Z; returns false with a reason on failure.
+    // Shows one Mesh_Z at the origin; returns false with a reason on failure.
     bool setMesh(uint32_t meshId, std::string* error);
+    // Shows several placed meshes. Meshes that fail to load are skipped and
+    // reported in `error`; returns false only when nothing could be shown.
+    bool setScene(const std::vector<MeshInstance>& instances, std::string* error);
     uint32_t triangleCount() const { return triangles_; }
 
     bool cullBackFaces = true;
@@ -69,7 +78,22 @@ private:
         uint32_t indexCount = 0;
         uint32_t material = 0;
     };
+    // GPU copy of one Mesh_Z, cached by ID.
+    struct GpuMesh {
+        std::vector<id<MTLBuffer>> vbs;
+        std::vector<uint32_t> vbStrides;
+        id<MTLBuffer> indices;
+        std::vector<GpuMaterial> materials;  // [0] = no material
+        std::vector<Draw> draws[3];          // by AlphaMode
+        simd_float3 boundsMin = {0, 0, 0}, boundsMax = {0, 0, 0};
+        uint32_t triangles = 0;
+    };
+    struct Instance {
+        const GpuMesh* mesh = nullptr;
+        simd_float4x4 world = matrix_identity_float4x4;
+    };
 
+    const GpuMesh* loadMesh(uint32_t meshId, std::string* error);
     id<MTLTexture> texture(uint32_t bitmapId, uint8_t* alphaKind);
     id<MTLRenderPipelineState> pipeline(uint32_t stride, AlphaMode mode);
     GpuMaterial makeMaterial(uint32_t materialId);
@@ -85,12 +109,9 @@ private:
     std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
     std::unordered_map<uint32_t, id<MTLTexture>> textures_;
     std::unordered_map<uint32_t, uint8_t> textureAlpha_;
+    std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> meshes_;
 
-    std::vector<id<MTLBuffer>> vbs_;
-    std::vector<uint32_t> vbStrides_;
-    id<MTLBuffer> indices_;
-    std::vector<GpuMaterial> materials_;
-    std::vector<Draw> draws_[3];  // by AlphaMode
+    std::vector<Instance> instances_;
     simd_float3 center_ = {0, 0, 0};
     float radius_ = 1.0f;
     uint32_t triangles_ = 0;

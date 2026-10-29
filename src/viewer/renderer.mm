@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace fuel {
@@ -41,10 +42,11 @@ struct VertexOut {
     float2 uv;
 };
 
-vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]]) {
+vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
+                        constant float4x4& model [[buffer(2)]]) {
     VertexOut o;
-    o.position = f.viewProj * float4(in.position, 1.0);
-    o.normal = in.normal.xyz * 2.0 - 1.0;
+    o.position = f.viewProj * (model * float4(in.position, 1.0));
+    o.normal = (model * float4(in.normal.xyz * 2.0 - 1.0, 0.0)).xyz;
     o.uv = in.uv;
     return o;
 }
@@ -297,11 +299,12 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId) {
     return gm;
 }
 
-bool MeshRenderer::setMesh(uint32_t meshId, std::string* error) {
+const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string* error) {
+    if (auto it = meshes_.find(meshId); it != meshes_.end()) return it->second.get();
     auto hit = library_.find(meshId, cls::Mesh);
     if (!hit) {
         *error = "no such Mesh_Z";
-        return false;
+        return nullptr;
     }
     Mesh mesh;
     MeshStats stats;
@@ -310,62 +313,93 @@ bool MeshRenderer::setMesh(uint32_t meshId, std::string* error) {
         const auto body = hit.file->body(*hit.entry);
         if (!body) {
             *error = "mesh has no body";
-            return false;
+            return nullptr;
         }
         mesh = parseMeshBody(*body, link.flags);
         const auto problems = checkMesh(mesh, &stats);
         if (!problems.empty()) {
             *error = problems.front();
-            return false;
+            return nullptr;
         }
     } catch (const std::exception& e) {
         *error = e.what();
-        return false;
+        return nullptr;
     }
 
-    vbs_.clear();
-    vbStrides_.clear();
+    auto gm = std::make_unique<GpuMesh>();
     for (const VertexBuffer& vb : mesh.vbs) {
-        vbs_.push_back(vb.data.empty() ? nil
-                                       : [device_ newBufferWithBytes:vb.data.data()
-                                                              length:vb.data.size()
-                                                             options:MTLResourceStorageModeShared]);
-        vbStrides_.push_back(vb.stride);
+        gm->vbs.push_back(vb.data.empty() ? nil
+                                          : [device_ newBufferWithBytes:vb.data.data()
+                                                                 length:vb.data.size()
+                                                                options:MTLResourceStorageModeShared]);
+        gm->vbStrides.push_back(vb.stride);
     }
-
-    materials_.clear();
     GpuMaterial none;
     none.texture = white_;
-    materials_.push_back(none);  // index 0: batches without a material
-    for (uint32_t id : mesh.materials) materials_.push_back(makeMaterial(id));
+    gm->materials.push_back(none);
+    for (uint32_t id : mesh.materials) gm->materials.push_back(makeMaterial(id));
 
-    for (auto& d : draws_) d.clear();
     std::vector<uint32_t> indices;
-    triangles_ = 0;
     for (const Batch& b : mesh.batches) {
         if (b.vb >= mesh.vbs.size() || mesh.vbs[b.vb].stride < kMinDrawableStride) continue;
         const uint32_t mat = b.material < mesh.materials.size() ? b.material + 1u : 0u;
-        if (materials_[mat].skip) continue;
+        if (gm->materials[mat].skip) continue;
         const std::vector<uint32_t> tris = batchTriangles(mesh, b);
         Draw d{b.vb, uint32_t(indices.size()), uint32_t(tris.size()), mat};
         indices.insert(indices.end(), tris.begin(), tris.end());
-        draws_[uint32_t(materials_[mat].alpha)].push_back(d);
-        triangles_ += uint32_t(tris.size() / 3);
+        gm->draws[uint32_t(gm->materials[mat].alpha)].push_back(d);
+        gm->triangles += uint32_t(tris.size() / 3);
     }
-    indices_ = indices.empty() ? nil
-                               : [device_ newBufferWithBytes:indices.data()
-                                                      length:indices.size() * 4
-                                                     options:MTLResourceStorageModeShared];
+    gm->indices = indices.empty() ? nil
+                                  : [device_ newBufferWithBytes:indices.data()
+                                                         length:indices.size() * 4
+                                                        options:MTLResourceStorageModeShared];
+    gm->boundsMin = simd_make_float3(stats.boundsMin[0], stats.boundsMin[1], stats.boundsMin[2]);
+    gm->boundsMax = simd_make_float3(stats.boundsMax[0], stats.boundsMax[1], stats.boundsMax[2]);
+    return (meshes_[meshId] = std::move(gm)).get();
+}
 
-    const simd_float3 lo = simd_make_float3(stats.boundsMin[0], stats.boundsMin[1], stats.boundsMin[2]);
-    const simd_float3 hi = simd_make_float3(stats.boundsMax[0], stats.boundsMax[1], stats.boundsMax[2]);
+bool MeshRenderer::setMesh(uint32_t meshId, std::string* error) {
+    return setScene({MeshInstance{meshId, matrix_identity_float4x4}}, error);
+}
+
+bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::string* error) {
+    instances_.clear();
+    triangles_ = 0;
+    error->clear();
+    simd_float3 lo = simd_make_float3(1e30f, 1e30f, 1e30f), hi = -lo;
+    for (const MeshInstance& in : instances) {
+        std::string err;
+        const GpuMesh* gm = loadMesh(in.meshId, &err);
+        if (gm == nullptr) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%08x", in.meshId);
+            *error += (error->empty() ? "" : "; ") + std::string(buf) + ": " + err;
+            continue;
+        }
+        if (gm->indices == nil) continue;
+        instances_.push_back({gm, in.world});
+        triangles_ += gm->triangles;
+        for (int c = 0; c < 8; ++c) {
+            const simd_float3 corner = simd_make_float3((c & 1) ? gm->boundsMax.x : gm->boundsMin.x,
+                                                        (c & 2) ? gm->boundsMax.y : gm->boundsMin.y,
+                                                        (c & 4) ? gm->boundsMax.z : gm->boundsMin.z);
+            const simd_float4 w = simd_mul(in.world, simd_make_float4(corner, 1.0f));
+            lo = simd_min(lo, w.xyz);
+            hi = simd_max(hi, w.xyz);
+        }
+    }
+    if (instances_.empty()) {
+        if (error->empty()) *error = "nothing to draw";
+        return false;
+    }
     center_ = (lo + hi) * 0.5f;
     radius_ = std::max(0.05f, simd_length(hi - lo) * 0.5f);
     return true;
 }
 
 void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam) {
-    if (indices_ == nil) return;
+    if (instances_.empty()) return;
     const float dist = cam.distance * radius_;
     const simd_float3 eye = center_ + dist * simd_make_float3(std::cos(cam.pitch) * std::sin(cam.yaw), std::sin(cam.pitch),
                                                               std::cos(cam.pitch) * std::cos(cam.yaw));
@@ -384,19 +418,24 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     for (uint32_t pass = 0; pass < 3; ++pass) {
         const AlphaMode mode = AlphaMode(pass);
         [enc setDepthStencilState:mode == AlphaMode::Blend ? depthNoWrite_ : depthWrite_];
-        for (const Draw& d : draws_[pass]) {
-            const GpuMaterial& m = materials_[d.material];
-            [enc setRenderPipelineState:pipeline(vbStrides_[d.vb], mode)];
-            [enc setVertexBuffer:vbs_[d.vb] offset:0 atIndex:0];
-            MaterialUniforms mu{m.diffuse, uint32_t(m.alpha), m.lit ? 1u : 0u, 0, 0};
-            [enc setFragmentBytes:&mu length:sizeof mu atIndex:2];
-            [enc setFragmentTexture:m.texture atIndex:0];
-            [enc setFragmentSamplerState:samplers_[m.samplerIndex] atIndex:0];
-            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                            indexCount:d.indexCount
-                             indexType:MTLIndexTypeUInt32
-                           indexBuffer:indices_
-                     indexBufferOffset:size_t(d.firstIndex) * 4];
+        for (const Instance& inst : instances_) {
+            const GpuMesh& gm = *inst.mesh;
+            if (gm.draws[pass].empty()) continue;
+            [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
+            for (const Draw& d : gm.draws[pass]) {
+                const GpuMaterial& m = gm.materials[d.material];
+                [enc setRenderPipelineState:pipeline(gm.vbStrides[d.vb], mode)];
+                [enc setVertexBuffer:gm.vbs[d.vb] offset:0 atIndex:0];
+                MaterialUniforms mu{m.diffuse, uint32_t(m.alpha), m.lit ? 1u : 0u, 0, 0};
+                [enc setFragmentBytes:&mu length:sizeof mu atIndex:2];
+                [enc setFragmentTexture:m.texture atIndex:0];
+                [enc setFragmentSamplerState:samplers_[m.samplerIndex] atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:d.indexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:gm.indices
+                         indexBufferOffset:size_t(d.firstIndex) * 4];
+            }
         }
     }
 }
