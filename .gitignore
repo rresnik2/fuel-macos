@@ -21,3 +21,6 @@ shots/
 *.png
 
 .DS_Store
+
+# Agent worktrees
+.claude/

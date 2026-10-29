@@ -1,5 +1,9 @@
-// Metal renderer for one FUEL mesh at a time: uploads a Mesh_Z with its
-// materials and textures and draws it lit by a single sun.
+// Metal renderer for FUEL meshes and assembled vehicles.
+//
+// A modern forward renderer driven by the game's material data: physically
+// based shading of the diffuse, normal, specular, occlusion and dirt texture
+// slots, car paint and liveries, a sun with a shadow map, sky lighting and
+// reflections, a ground plane, and HDR tone mapping into an sRGB target.
 #pragma once
 
 #import <Metal/Metal.h>
@@ -9,6 +13,7 @@
 #include "core/resources.hpp"
 #include "core/vehicle.hpp"
 
+#include <array>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -43,7 +48,7 @@ struct OrbitCamera {
 // livery texture (per LOD 1..3) that replaces slot 0 of LIVERY_XX_LOD<k>
 // materials. Without a livery those materials show plain paint.
 struct Paint {
-    simd_float3 color = {60.0f / 255, 60.0f / 255, 60.0f / 255};
+    simd_float3 color = {60.0f / 255, 60.0f / 255, 60.0f / 255};  // sRGB
     std::array<uint32_t, 3> livery{};
 };
 
@@ -53,10 +58,13 @@ struct MeshInstance {
     simd_float4x4 world = matrix_identity_float4x4;
 };
 
+// Render target formats the renderer's pipelines are built for.
+inline constexpr MTLPixelFormat kRenderColorFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+inline constexpr MTLPixelFormat kRenderDepthFormat = MTLPixelFormatDepth32Float;
+
 class MeshRenderer {
 public:
-    MeshRenderer(id<MTLDevice> device, MTLPixelFormat colorFormat, MTLPixelFormat depthFormat, NSUInteger sampleCount,
-                 const ResourceLibrary& library);
+    MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const ResourceLibrary& library);
 
     // Shows one Mesh_Z at the origin; returns false with a reason on failure.
     bool setMesh(uint32_t meshId, std::string* error);
@@ -70,21 +78,39 @@ public:
 
     bool cullBackFaces = true;
     bool wireframe = false;
+    bool showGround = true;
+    float dirt = 0.0f;  // 0 clean .. 1 fully dirty (vehicles with dirt maps)
 
+    // Call before the main pass each frame: renders the sun's shadow map.
+    void encodeShadows(id<MTLCommandBuffer> cb);
+    // Draws the scene into a pass with kRenderColorFormat/kRenderDepthFormat.
     void encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam);
 
 private:
     enum class AlphaMode : uint32_t { Opaque = 0, Test = 1, Blend = 2 };
+    enum Feature : uint32_t {
+        PaintOnly = 1u << 0,
+        HasOcclusion = 1u << 1,
+        HasNormal = 1u << 2,
+        HasSpecular = 1u << 3,
+        HasNormalLocal = 1u << 4,
+        HasDirt = 1u << 5,
+        Reflective = 1u << 6,
+    };
+    enum Slot { kDiffuse = 0, kOcclusion = 2, kNormal = 3, kSpecular = 4, kNormalLocal = 5, kDirt = 6 };
 
     struct GpuMaterial {
-        id<MTLTexture> texture;
+        std::array<id<MTLTexture>, 7> textures;
         simd_float4 diffuse = {0.7f, 0.7f, 0.7f, 1.0f};
+        simd_float4 specular = {0.5f, 0.5f, 0.5f, 20.0f};
+        simd_float4 emissive = {0, 0, 0, 0};
+        simd_float2 fresnel = {0, 0};
         AlphaMode alpha = AlphaMode::Opaque;
         bool lit = true;
         bool skip = false;
         uint32_t samplerIndex = 0;  // bit 0 clamp U, bit 1 clamp V
         uint32_t code = 0;          // MatCodeId (flags & 0x1f)
-        bool paintOnly = false;     // livery material without a livery texture
+        uint32_t features = 0;
     };
     struct Draw {
         uint32_t vb = 0;
@@ -108,26 +134,31 @@ private:
     };
 
     const GpuMesh* loadMesh(uint32_t meshId, std::string* error);
-    id<MTLTexture> texture(uint32_t bitmapId, uint8_t* alphaKind);
+    id<MTLTexture> texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind);
     id<MTLRenderPipelineState> pipeline(uint32_t stride, AlphaMode mode);
+    id<MTLRenderPipelineState> shadowPipeline(uint32_t stride);
     GpuMaterial makeMaterial(uint32_t materialId);
+    simd_float4x4 sunViewProj() const;
 
     id<MTLDevice> device_;
-    MTLPixelFormat colorFormat_, depthFormat_;
     NSUInteger sampleCount_;
     const ResourceLibrary& library_;
     id<MTLLibrary> shaders_;
     id<MTLDepthStencilState> depthWrite_, depthNoWrite_;
     id<MTLSamplerState> samplers_[4];
-    id<MTLTexture> white_;
+    id<MTLTexture> white_, shadowMap_;
+    id<MTLRenderPipelineState> groundPipeline_;
     std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
-    std::unordered_map<uint32_t, id<MTLTexture>> textures_;
+    std::unordered_map<uint32_t, id<MTLRenderPipelineState>> shadowPipelines_;
+    std::unordered_map<uint64_t, id<MTLTexture>> textures_;  // key: id << 1 | srgb
     std::unordered_map<uint32_t, uint8_t> textureAlpha_;
     std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> meshes_;
 
     Paint paint_;
+    simd_float3 sunDir_;
     std::vector<Instance> instances_;
     simd_float3 center_ = {0, 0, 0};
+    simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};
     float radius_ = 1.0f;
     uint32_t triangles_ = 0;
 };

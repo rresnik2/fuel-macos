@@ -55,6 +55,9 @@ std::vector<std::string> checkBitmap(const BitmapInfo& bm, uint32_t bodySize);
 struct Material {
     std::array<float, 3> diffuse{};
     float alpha = 1.0f;
+    std::array<float, 3> emissive{};
+    std::array<float, 4> specular{};  // rgb, power
+    std::array<float, 2> fresnel{};   // reflectance at normal and grazing incidence (0 = none)
     uint16_t textureMask = 0;  // bit i = texture slot i is used
     uint32_t flags = 0;
     // Slot 0 diffuse, 1 envmap, 2 occlusion, 3 normal, 4 specular,

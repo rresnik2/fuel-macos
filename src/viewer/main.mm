@@ -1,14 +1,14 @@
 // fuelview: browse the meshes in a FUEL .DPC file with Metal.
 //
 //   fuelview [--data DIR] [--mesh ID | --scene FILE.json] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]
-//            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]
+//            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull] [--dirt 0..1]] [DPC ...]
 //
 // DPC paths are relative to the game data directory (the folder that holds
 // CommonComponent/); the first one is browsed, the others only supply
 // textures and materials. Without --shot it opens a window:
 //   drag = orbit, scroll/pinch = zoom, left/right = previous/next mesh,
 //   C = back-face culling, W = wireframe, R = reset view, Q/Esc = quit,
-//   L = next livery, P = next palette colour (with --vehicle).
+//   L = next livery, P = next palette colour (with --vehicle), D = dirt level, G = ground.
 // --vehicle NAME (for example QUAD_ALL_1) picks the vehicle whose palette and
 // liveries paint the bodywork; --livery 0 shows plain paint.
 // --scene loads an assembled vehicle exported by the reverse-engineering
@@ -35,8 +35,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr MTLPixelFormat kColorFormat = MTLPixelFormatBGRA8Unorm;
-constexpr MTLPixelFormat kDepthFormat = MTLPixelFormatDepth32Float;
+constexpr MTLPixelFormat kColorFormat = fuel::kRenderColorFormat;
+constexpr MTLPixelFormat kDepthFormat = fuel::kRenderDepthFormat;
 constexpr NSUInteger kSamples = 4;
 
 struct Options {
@@ -49,6 +49,7 @@ struct Options {
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
     bool cull = true;
+    float dirt = 0.0f;
     std::string vehicle;
     int livery = 1;
     int color = 0;
@@ -117,12 +118,13 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--yaw") o.yawDeg = std::stof(next());
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
         else if (a == "--no-cull") o.cull = false;
+        else if (a == "--dirt") o.dirt = std::stof(next());
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
         else if (a == "--color") o.color = std::stoi(next());
         else if (a == "--paint") { const std::string v = next(); if (std::sscanf(v.c_str(), "%d,%d,%d", &o.paint[0], &o.paint[1], &o.paint[2]) != 3) die("bad --paint"); o.havePaint = true; }
         else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID | --scene FILE.json] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]\n"
-                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]"); std::exit(0); }
+                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull] [--dirt 0..1]] [DPC ...]"); std::exit(0); }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.dpcs.push_back(a);
     }
@@ -236,6 +238,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     rp.depthAttachment.storeAction = MTLStoreActionDontCare;
 
     id<MTLCommandBuffer> cb = [queue commandBuffer];
+    renderer.encodeShadows(cb);
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     renderer.encode(enc, float(o.width) / float(o.height), cam);
     [enc endEncoding];
@@ -333,6 +336,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     if ([ch isEqualToString:@"c"]) _renderer->cullBackFaces = !_renderer->cullBackFaces;
     else if ([ch isEqualToString:@"w"]) _renderer->wireframe = !_renderer->wireframe;
     else if ([ch isEqualToString:@"r"]) _cam = fuel::OrbitCamera{};
+    else if ([ch isEqualToString:@"d"]) _renderer->dirt = _renderer->dirt >= 1.0f ? 0.0f : _renderer->dirt + 0.5f;
+    else if ([ch isEqualToString:@"g"]) _renderer->showGround = !_renderer->showGround;
     else if ([ch isEqualToString:@"q"]) [NSApp terminate:nil];
     else if (!_look.name.empty() && ([ch isEqualToString:@"l"] || [ch isEqualToString:@"p"])) {
         if ([ch isEqualToString:@"l"]) _look.livery = (_look.livery + 1) % 10;
@@ -360,9 +365,13 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
 
 - (void)drawInMTKView:(MTKView*)view {
-    MTLRenderPassDescriptor* rp = view.currentRenderPassDescriptor;
-    if (rp == nil) return;
     id<MTLCommandBuffer> cb = [_queue commandBuffer];
+    _renderer->encodeShadows(cb);
+    MTLRenderPassDescriptor* rp = view.currentRenderPassDescriptor;
+    if (rp == nil) {
+        [cb commit];
+        return;
+    }
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     const CGSize s = view.drawableSize;
     _renderer->encode(enc, s.height > 0 ? float(s.width / s.height) : 1.0f, _cam);
@@ -410,8 +419,9 @@ int main(int argc, const char** argv) {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (device == nil) die("no Metal device");
         if (!device.supportsBCTextureCompression) die("this GPU cannot sample DXT (BC) textures");
-        fuel::MeshRenderer renderer(device, kColorFormat, kDepthFormat, kSamples, library);
+        fuel::MeshRenderer renderer(device, kSamples, library);
         renderer.cullBackFaces = opt.cull;
+        renderer.dirt = std::clamp(opt.dirt, 0.0f, 1.0f);
 
         SceneFile scene;
         if (!opt.scene.empty()) scene = loadScene(opt.scene);

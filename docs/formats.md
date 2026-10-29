@@ -49,10 +49,11 @@ DXT5 and three A1R5G5B5 textures.
 
 ## Material_Z
 
-172-byte body: +0x00 diffuse RGB, +0x0C opacity, +0x10 second colour,
+172-byte body: +0x00 diffuse RGB, +0x0C opacity, +0x10 emissive RGB,
 +0x20..0x37 and +0x40..0x4B UV transform, +0x38 u16 texture-slot mask, +0x3C
-flags, +0x50 eight shader parameters, +0x70 UV offset, +0x78 UV scale,
-+0x80 UV scroll speed, +0x88 nine texture IDs. Slots: 0 diffuse, 1 envmap,
+flags, +0x50 specular RGB and power, +0x60 four parameters, +0x70 UV offset,
++0x78 UV scale, +0x80/+0x84 Fresnel reflectance at normal and grazing angles
+(nonzero turns on reflections, mask bit 8), +0x88 nine texture IDs. Slots: 0 diffuse, 1 envmap,
 2 occlusion, 3 normal, 4 specular, 5 normal (local), 6 dirt, 7 added normal
 (local), 8 unused. Flags: bits 0-4 select a special material type (17 is used
 for paintable vehicle bodywork, drawn with a white diffuse texture), 0x80 skips

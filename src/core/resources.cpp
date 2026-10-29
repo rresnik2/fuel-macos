@@ -172,6 +172,9 @@ Material parseMaterialBody(const std::vector<uint8_t>& b) {
     Material m;
     for (int i = 0; i < 3; ++i) m.diffuse[size_t(i)] = rd<float>(&b[size_t(i) * 4]);
     m.alpha = rd<float>(&b[0x0C]);
+    for (size_t i = 0; i < 3; ++i) m.emissive[i] = rd<float>(&b[0x10 + i * 4]);
+    for (size_t i = 0; i < 4; ++i) m.specular[i] = rd<float>(&b[0x50 + i * 4]);
+    m.fresnel = {rd<float>(&b[0x80]), rd<float>(&b[0x84])};
     m.textureMask = rd<uint16_t>(&b[0x38]);
     m.flags = rd<uint32_t>(&b[0x3C]);
     for (size_t i = 0; i < 9; ++i) m.textures[i] = rd<uint32_t>(&b[0x88 + i * 4]);
