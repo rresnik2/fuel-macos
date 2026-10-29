@@ -21,6 +21,8 @@ public:
     const std::vector<fuel::MeshInstance>& parts() const { return parts_; }
     void update(float dt, const fuel::DriveInput& input) { world_.update(dt, input); }
     void reset() { world_.reset(); }
+    // Puts the vehicle on its wheels at (x, z) facing `yaw`.
+    void teleport(double x, double z, float yaw) { world_.spawn(setup_, x, z, yaw); }
     // World matrices for the parts, in parts() order.
     std::vector<simd_float4x4> partWorlds() const;
     fuel::VehicleState state() const { return world_.state(); }
@@ -34,6 +36,7 @@ private:
         simd_float4x4 local;         // vehicle space (chassis parts) or wheel-model space (rotation only)
     };
     fuel::DriveWorld world_;
+    fuel::VehicleSetup setup_;
     std::vector<fuel::MeshInstance> parts_;
     std::vector<PartLink> links_;
     float focusHeight_ = 0.5f;  // where the camera looks, above the vehicle origin

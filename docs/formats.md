@@ -132,3 +132,14 @@ cubic B-spline and adds procedural detail at run time.
 The 82 `USA1_*.DPC` sub-worlds (courses, hubs, dressing sets) hold only
 Node_Z placements whose world matrices are final; their meshes live in
 USA1.DPC. WorldRef_Z objects in USA1 give each sub-world's bounds.
+
+## Races
+
+`LocalizedComponent/GameTsc/Story/miss_official.tsc` (career) and
+`missChallenge.tsc` (hub challenges) hold `EMD_Begin` .. `EMD_End` blocks:
+`EMD_SetName`, `EMD_SetNbLoop` (laps), `EMD_SetTimer`, `EMD_SetRaceMode`
+(0 A to B, 1 checkpoints, 2 knock-out, 3 time trial, 4 circuit, 5 baja,
+6 raid), `EMD_SetStartPos/Rot`, `EMD_SetEndPos/Rot` and one
+`EMD_SetCheckpoint x y z rx ry rz 1.0 flag` per checkpoint, in order.
+Rotations are Euler angles in radians; ry is roughly the heading. The
+scripts give no checkpoint width.

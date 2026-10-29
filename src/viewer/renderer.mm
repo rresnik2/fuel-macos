@@ -315,6 +315,32 @@ fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer
     float3 c = skyColor(dir) * 1.4 + float3(1.0, 0.9, 0.7) * pow(saturate(dot(dir, normalize(f.sunDir.xyz))), 800.0) * 30.0;
     return float4(tonemap(c * f.params.y), 1.0);
 }
+
+struct MarkerOut {
+    float4 position [[position]];
+    float3 color;
+    float glow;
+};
+
+// A beacon: an open cylinder from the ground to 150 m, fading upwards.
+vertex MarkerOut vsMarker(uint vid [[vertex_id]], uint iid [[instance_id]], constant FrameUniforms& f [[buffer(1)]],
+                          constant float4* markers [[buffer(2)]]) {
+    float4 m = markers[iid];
+    float a = float(vid / 2) / 32.0 * 2.0 * M_PI_F;
+    bool top = (vid & 1) != 0;
+    float radius = m.w == 2.0 ? 6.0 : 4.0;
+    float3 w = m.xyz + float3(cos(a) * radius, top ? 150.0 : -3.0, sin(a) * radius);
+    MarkerOut o;
+    o.position = f.viewProj * float4(w, 1.0);
+    o.color = m.w == 0.0 ? float3(1.0, 0.55, 0.1) : m.w == 1.0 ? float3(0.35, 0.6, 1.0) : float3(0.3, 1.0, 0.35);
+    o.glow = top ? 0.0 : (m.w == 1.0 ? 0.5 : 1.0);
+    return o;
+}
+
+fragment float4 fsMarker(MarkerOut in [[stage_in]]) {
+    float g = in.glow * in.glow;
+    return float4(in.color * g, g * 0.7);
+}
 )METAL";
 
 struct FrameUniforms {
@@ -493,6 +519,20 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         return ps;
     };
     terrainPipeline_ = makeSimple(@"vsTerrain", @"fsTerrain");
+    {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [shaders_ newFunctionWithName:@"vsMarker"];
+        d.fragmentFunction = [shaders_ newFunctionWithName:@"fsMarker"];
+        d.rasterSampleCount = sampleCount_;
+        d.colorAttachments[0].pixelFormat = kRenderColorFormat;
+        d.colorAttachments[0].blendingEnabled = YES;  // additive glow
+        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+        d.depthAttachmentPixelFormat = kRenderDepthFormat;
+        NSError* e = nil;
+        markerPipeline_ = [device newRenderPipelineStateWithDescriptor:d error:&e];
+        if (markerPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
+    }
     skyPipeline_ = makeSimple(@"vsSky", @"fsSky");
     ds.depthCompareFunction = MTLCompareFunctionAlways;
     ds.depthWriteEnabled = NO;
@@ -936,6 +976,14 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     }
     drawPass(2);
+    if (!markers_.empty()) {
+        [enc setRenderPipelineState:markerPipeline_];
+        [enc setDepthStencilState:depthNoWrite_];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setTriangleFillMode:MTLTriangleFillModeFill];
+        [enc setVertexBytes:markers_.data() length:markers_.size() * sizeof(simd_float4) atIndex:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:66 instanceCount:markers_.size()];
+    }
 }
 
 }  // namespace fuel

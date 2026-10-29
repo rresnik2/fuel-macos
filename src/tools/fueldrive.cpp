@@ -43,6 +43,9 @@ int main(int argc, char** argv) {
         auto report = [&](const char* phase, double t) {
             const fuel::VehicleState s = sim.state();
             const double ground = terrain.smoothHeightAt(s.chassis.position[0], s.chassis.position[2]);
+            const auto& q = s.chassis.rotation;
+            const double fx = 2 * (q[0] * q[2] + q[3] * q[1]), fz = 1 - 2 * (q[0] * q[0] + q[1] * q[1]);
+            std::printf("  heading %6.1f deg ", std::atan2(fx, fz) * 180 / M_PI);
             std::printf("  %-9s t=%5.1fs  %6.1f km/h  gear %d  %5.0f rpm  wheels on ground %d  height above terrain %.2f m  up.y %.2f\n", phase,
                         t, s.speedKmh, s.gear, s.rpm, s.wheelsOnGround, s.chassis.position[1] - ground,
                         1 - 2 * (s.chassis.rotation[0] * s.chassis.rotation[0] + s.chassis.rotation[2] * s.chassis.rotation[2]));

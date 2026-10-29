@@ -31,6 +31,7 @@
 #import "renderer.h"
 #import "drive.h"
 #import <GameController/GameController.h>
+#include "core/races.hpp"
 #include "core/vehicle_params.hpp"
 #include <fstream>
 #include <set>
@@ -74,6 +75,7 @@ struct Options {
     bool world = false;
     bool terrain = false;
     bool drive = false;
+    std::string race;
     float driveTime = 4.0f;
     bool haveAt = false;
     float atX = 0, atZ = 0;
@@ -152,6 +154,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--terrain") o.terrain = true;
         else if (a == "--drive") { o.drive = true; o.terrain = true; }
         else if (a == "--drive-time") o.driveTime = std::stof(next());
+        else if (a == "--race") { o.race = next(); o.drive = true; o.terrain = true; }
         else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
@@ -327,6 +330,106 @@ struct Garage {
     }
 };
 
+// --race: FUEL's races (start line, ordered checkpoints, finish, laps).
+struct RaceSession {
+    enum State { Countdown, Running, Finished };
+    static constexpr float kRadius = 25.0f;  // the scripts give no gate width
+    std::vector<fuel::Race> races;           // those with a usable route
+    size_t index = 0;
+    State state = Countdown;
+    std::vector<std::array<float, 3>> route;  // targets in order: checkpoints (per lap), then the finish
+    size_t next = 0;
+    double clock = 0;  // seconds since the start (negative during the countdown)
+
+    const fuel::Race& race() const { return races[index]; }
+    void begin(DriveSession& d, WorldStreamer* streamer, fuel::MeshRenderer& renderer) {
+        const fuel::Race& r = race();
+        route.clear();
+        for (int lap = 0; lap < (r.loops() ? r.laps : 1); ++lap) route.insert(route.end(), r.checkpoints.begin(), r.checkpoints.end());
+        if (r.finish[0] != 0 || r.finish[2] != 0) route.push_back(r.finish);
+        next = 0;
+        clock = -3.0;
+        state = Countdown;
+        // Face the first target: the scripts' start rotation is only roughly a heading.
+        float yaw = r.startYaw;
+        if (!route.empty()) {
+            const float dx = route[0][0] - r.start[0], dz = route[0][2] - r.start[2];
+            if (std::hypot(dx, dz) > 5 && std::hypot(dx, dz) < 2000) yaw = std::atan2(dx, dz);
+        }
+        d.teleport(r.start[0], r.start[2], yaw);
+        if (streamer) streamer->update(d.position(), renderer, d.physics(), true);
+    }
+    // Advances the race; holds the vehicle on the line during the countdown.
+    void update(float dt, simd_float3 at, fuel::DriveInput& in) {
+        if (state == Finished) return;
+        clock += dt;
+        if (state == Countdown) {
+            in = {0, 0, 0, true};
+            if (clock >= 0) state = Running;
+            return;
+        }
+        const auto& t = route[next];
+        if (std::hypot(at.x - t[0], at.z - t[2]) < kRadius && std::fabs(at.y - t[1]) < 60 && ++next >= route.size()) state = Finished;
+        if (race().timeLimit > 0 && clock > race().timeLimit) state = Finished;
+    }
+    // Test driver: full throttle, steering at the next target.
+    // When stuck against something it backs off with the opposite lock.
+    float stuckTime = 0, reverseTime = 0;
+    fuel::DriveInput autopilot(simd_float3 at, float heading, float speedKmh) {
+        if (state != Running) return {};
+        const auto& t = route[next];
+        const float want = std::atan2(t[0] - at.x, t[2] - at.z);
+        const float err = std::remainder(want - heading, 2.0f * float(M_PI));
+        const float steer = std::clamp(-err * 2.0f, -1.0f, 1.0f);  // positive steer turns right (decreasing heading)
+        stuckTime = std::fabs(speedKmh) < 3 ? stuckTime + 1.0f / 60 : 0;
+        if (stuckTime > 2) reverseTime = 1.5f, stuckTime = 0;
+        if (reverseTime > 0) {
+            reverseTime -= 1.0f / 60;
+            return {0, 1, -steer, false};
+        }
+        return {std::fabs(err) > 1.2f ? 0.4f : 1.0f, 0, steer, false};
+    }
+    std::vector<simd_float4> markers() const {
+        std::vector<simd_float4> m;
+        for (size_t i = next; i < route.size() && i < next + 2; ++i)
+            m.push_back(simd_make_float4(route[i][0], route[i][1], route[i][2], i + 1 == route.size() ? 2.0f : float(i - next)));
+        return m;
+    }
+    std::string hud(simd_float3 at) const {
+        char buf[256];
+        const double t = std::max(0.0, clock);
+        const int min = int(t / 60);
+        const double sec = t - min * 60;
+        const fuel::Race& r = race();
+        if (state == Countdown) {
+            std::snprintf(buf, sizeof buf, "%s   starts in %d", r.name.c_str(), int(std::ceil(-clock)));
+        } else if (state == Finished) {
+            const bool timedOut = next < route.size();
+            std::snprintf(buf, sizeof buf, "%s   %s %d:%04.1f   Enter: retry   N: next race", r.name.c_str(), timedOut ? "OUT OF TIME" : "FINISHED",
+                          min, sec);
+        } else {
+            const auto& tgt = route[next];
+            const size_t perLap = r.loops() && !r.checkpoints.empty() ? r.checkpoints.size() : route.size();
+            std::string lap = r.loops() ? "   lap " + std::to_string(std::min<size_t>(next / perLap + 1, size_t(r.laps))) + "/" + std::to_string(r.laps) : "";
+            std::snprintf(buf, sizeof buf, "%s   checkpoint %zu/%zu%s   %d:%04.1f   next %.0f m", r.name.c_str(), next + 1, route.size(), lap.c_str(),
+                          min, sec, std::hypot(at.x - tgt[0], at.z - tgt[2]));
+        }
+        return buf;
+    }
+};
+
+std::vector<fuel::Race> loadRaces(const std::string& dataDir) {
+    std::vector<fuel::Race> out;
+    for (const char* file : {"miss_official.tsc", "missChallenge.tsc"}) {
+        std::ifstream f(fs::path(dataDir) / "LocalizedComponent/GameTsc/Story" / file);
+        std::stringstream text;
+        text << f.rdbuf();
+        for (fuel::Race& r : fuel::parseMissions(text.str()))
+            if ((r.start[0] != 0 || r.start[2] != 0) && (!r.checkpoints.empty() || r.finish[0] != 0 || r.finish[2] != 0)) out.push_back(r);
+    }
+    return out;
+}
+
 MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
 
 void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> tex, const std::string& path) {
@@ -413,6 +516,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     DriveSession* _drive;     // --drive, else nullptr
     WorldStreamer* _streamer; // --drive: the static world
     Garage* _garage;          // --drive: vehicles to switch between
+    RaceSession* _race;       // --drive: the current race
     std::unique_ptr<DriveSession> _switched;  // a vehicle chosen with Tab
     NSTextField* _hud;        // --drive: speed, gear, race
     std::set<unsigned short> _keys;
@@ -433,7 +537,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                      assembly:(AssemblyMode*)assembly
                         drive:(DriveSession*)drive
                      streamer:(WorldStreamer*)streamer
-                       garage:(Garage*)garage {
+                       garage:(Garage*)garage
+                         race:(RaceSession*)race {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -447,6 +552,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _drive = drive;
         _streamer = streamer;
         _garage = garage;
+        _race = race;
         if (drive) {
             _hud = [NSTextField labelWithString:@""];
             _hud.font = [NSFont monospacedDigitSystemFontOfSize:22 weight:NSFontWeightSemibold];
@@ -568,6 +674,14 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
             _drive->reset();
             return;
         }
+        if (_race && (e.keyCode == 45 || e.keyCode == 36)) {  // N (Shift-N back): another race; Return: restart
+            if (e.keyCode == 45) {
+                const size_t n = _race->races.size();
+                _race->index = (_race->index + ((e.modifierFlags & NSEventModifierFlagShift) ? n - 1 : 1)) % n;
+            }
+            _race->begin(*_drive, _streamer, *_renderer);
+            return;
+        }
         if (e.keyCode == 48 && _garage && !_garage->entries.empty()) {  // Tab / Shift-Tab: another vehicle
             [self switchVehicle:(e.modifierFlags & NSEventModifierFlagShift) ? -1 : 1];
             return;
@@ -634,7 +748,9 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         in.handbrake = in.handbrake || pad.buttonX.pressed;
         if (pad.buttonY.pressed) _drive->reset();
     }
+    if (_race) _race->update(dt, _drive->position(), in);
     _drive->update(dt, in);
+    if (_race) _renderer->setMarkers(_race->markers());
     if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics());
     _renderer->setInstanceWorlds(_drive->partWorlds());
     _renderer->setFocus(_drive->position());
@@ -645,8 +761,9 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
     const fuel::VehicleState st = _drive->state();
     self.window.title = [NSString stringWithFormat:@"FUEL — %s", _scene.variant.c_str()];
-    _hud.stringValue = [NSString stringWithFormat:@"%s\n%3.0f km/h   gear %d   %5.0f rpm", _scene.variant.c_str(), std::fabs(st.speedKmh),
-                                                  st.gear, st.rpm];
+    const std::string raceLine = _race ? _race->hud(_drive->position()) : _scene.variant;
+    _hud.stringValue = [NSString stringWithFormat:@"%s\n%3.0f km/h   gear %d   %5.0f rpm   %s", raceLine.c_str(), std::fabs(st.speedKmh),
+                                                  st.gear, st.rpm, _race ? _scene.variant.c_str() : ""];
 }
 
 - (void)drawInMTKView:(MTKView*)view {
@@ -739,6 +856,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<WorldStreamer> streamer;
         std::unique_ptr<Garage> garage;
+        std::unique_ptr<RaceSession> race;
         if (opt.drive && opt.assemble.empty()) die("--drive needs --assemble VARIANT");
         if (!opt.assemble.empty()) {
             assembly = std::make_unique<AssemblyMode>();
@@ -829,6 +947,16 @@ int main(int argc, const char** argv) {
                     garage->archives.push_back(std::move(am));
                 }
                 std::printf("garage: %zu drivable variants (Tab to switch)\n", garage->entries.size());
+                if (!opt.race.empty()) {
+                    race = std::make_unique<RaceSession>();
+                    race->races = loadRaces(opt.dataDir);
+                    if (race->races.empty()) die("no races found in the mission scripts");
+                    auto it = std::find_if(race->races.begin(), race->races.end(), [&](const fuel::Race& r) { return r.name == opt.race; });
+                    if (it == race->races.end()) die("no race named " + opt.race);
+                    race->index = size_t(it - race->races.begin());
+                    race->begin(*drive, streamer.get(), renderer);
+                    std::printf("race %s: %zu targets; %zu races (N for the next)\n", race->race().name.c_str(), race->route.size(), race->races.size());
+                }
                 if (std::getenv("FUEL_GARAGE_CHECK")) {  // build and drive every vehicle briefly
                     int ok = 0;
                     for (size_t i = 0; i < garage->entries.size(); ++i) {
@@ -886,10 +1014,30 @@ int main(int argc, const char** argv) {
                 if (drive) {  // drive straight ahead for a while, then look from behind
                     if (streamer) streamer->update(drive->position(), renderer, drive->physics(), true);
                     for (int i = 0; i < int(opt.driveTime * 60); ++i) {
-                        drive->update(1.0f / 60, {1.0f, 0, 0, false});
+                        fuel::DriveInput in{1.0f, 0, 0, false};
+                        if (race) {
+                            if (race->state == RaceSession::Finished) break;
+                            in = race->autopilot(drive->position(), drive->heading(), drive->state().speedKmh);
+                            if (std::getenv("FUEL_RACE_WARP") && race->state == RaceSession::Running && i % 60 == 0) {
+                                // Logic test: hop to the next target every second.
+                                const auto& t = race->route[race->next];
+                                drive->teleport(t[0], t[2], drive->heading());
+                            }
+                            race->update(1.0f / 60, drive->position(), in);
+                            if (std::getenv("FUEL_RACE_TRACE") && i % 600 == 0) {
+                                const simd_float3 p = drive->position();
+                                std::printf("  t=%5.0fs at (%.0f, %.0f, %.0f) %5.1f km/h  heading %4.0f  %s\n", i / 60.0, p.x, p.y, p.z,
+                                            drive->state().speedKmh, drive->heading() * 180 / M_PI, race->hud(p).c_str());
+                            }
+                        }
+                        drive->update(1.0f / 60, in);
                         if (streamer && i % 30 == 0) streamer->update(drive->position(), renderer, drive->physics());
                     }
                     renderer.setInstanceWorlds(drive->partWorlds());
+                    if (race) {
+                        renderer.setMarkers(race->markers());
+                        std::printf("%s\n", race->hud(drive->position()).c_str());
+                    }
                     renderer.setFocus(drive->position());
                     cam.yaw += drive->heading() + float(M_PI);
                     const fuel::VehicleState st = drive->state();
@@ -928,7 +1076,8 @@ int main(int argc, const char** argv) {
                                                 assembly:assembly.get()
                                                    drive:drive.get()
                                                 streamer:streamer.get()
-                                                  garage:garage.get()];
+                                                  garage:garage.get()
+                                                    race:race.get()];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];

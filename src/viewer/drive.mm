@@ -35,7 +35,7 @@ std::vector<std::array<float, 3>> assembledHubs(const fuel::AssembledVehicle& ve
 
 DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain,
                            double x, double z, float yaw)
-    : world_(terrain) {
+    : world_(terrain), setup_(setup) {
     for (const fuel::PlacedPart& p : vehicle.parts) {
         if (!p.drawn()) continue;
         const simd_float4x4 m = rowsToSimd(p.world);
@@ -126,8 +126,11 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
                         cm = fuel::loadCollisionMesh(lookup_, p.meshId);
                     } catch (const std::exception&) {
                     }
-                    // Tiny props (grass tufts, cans) would only snag the wheels.
-                    if (cm.radius < 0.6f) cm.indices.clear();
+                    // Only big things are solid (buildings, large rocks, structures). FUEL's
+                    // course props (barriers, banners, signs, fences) get knocked aside, so
+                    // as static walls they would block the courses; they stay passable
+                    // until they become movable bodies.
+                    if (cm.radius < 3.0f) cm.indices.clear();
                     physics.addStaticShape(p.meshId, cm.positions, cm.indices);
                 }
                 std::array<double, 16> m;

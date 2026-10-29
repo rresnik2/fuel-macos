@@ -30,13 +30,17 @@ Early. What works today:
   72 drivable vehicles (bikes, quads, buggies, cars, SUVs, trucks); gamepads
   work (stick, triggers, X handbrake, Y reset). The world's 14,000 placed
   objects stream in around you and are solid. `fueldrive` runs a scripted drive without a window.
+- **Races**: `--race NAME` (for example `CR2-Yell-CP`) loads one of FUEL's 250
+  races from the game's mission scripts: start line, ordered checkpoints shown
+  as glowing beacons, laps, finish and a timer. N / Shift-N picks the next or
+  previous race, Return restarts.
 - **`fuelscene`** lists the vehicle variants in an archive and prints how each
   one is assembled.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: races and checkpoints, an on-screen HUD and sound, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
+Next steps, roughly in order: knock-aside props, sound, AI opponents, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
@@ -76,6 +80,7 @@ cmake --build build
 ./build/fuelview --assemble TRUCK_OFF_1 CommonComponent/DATAS/TRUCK.DPC
 ./build/fuelscene ~/Library/Application\ Support/FUEL/game/CommonComponent/DATAS/QUAD.DPC
 ./build/fuelview --assemble QUAD_ROAD_2 --drive          # drive it
+./build/fuelview --assemble BUGGY_ROAD_2 --race CR2-Yell-CP CommonComponent/DATAS/BUGGY.DPC   # race
 ./build/fuelview --assemble QUAD_ROAD_2 --at -1000,-30000   # on the terrain
 ./build/fuelview                                   # quad bike parts
 ./build/fuelview CommonComponent/DATAS/BUGGY.DPC   # any other archive

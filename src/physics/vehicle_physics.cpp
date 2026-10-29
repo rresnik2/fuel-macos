@@ -14,6 +14,7 @@
 #include <Jolt/Physics/Collision/ObjectLayerPairFilterTable.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
@@ -215,6 +216,7 @@ struct DriveWorld::Impl {
         bs.mMassPropertiesOverride.mMass = s.mass;
         bs.mAllowSleeping = false;
         bs.mAngularDamping = 0.3f;
+        bs.mMotionQuality = EMotionQuality::LinearCast;  // no tunnelling into objects at speed
         car = bodies().CreateAndAddBody(bs, EActivation::Activate);
 
         VehicleConstraintSettings vs;
@@ -424,9 +426,23 @@ void DriveWorld::addStaticShape(uint32_t key, const std::vector<float>& position
     }
     RefConst<Shape> shape;
     if (!tris.empty()) {
-        MeshShapeSettings ms(tris);
-        auto r = ms.Create();
-        if (!r.HasError()) shape = r.Get();
+        // Props get a solid convex hull (a hollow triangle shell can trap a fast
+        // vehicle inside); big structures (buildings, cliffs) keep their exact triangles.
+        float radius = 0;
+        for (size_t k = 0; k + 2 < positions.size(); k += 3)
+            radius = std::max(radius, Vec3(positions[k], positions[k + 1], positions[k + 2]).Length());
+        if (radius < 15.0f) {
+            Array<Vec3> points;
+            for (size_t k = 0; k + 2 < positions.size(); k += 3) points.push_back(Vec3(positions[k], positions[k + 1], positions[k + 2]));
+            ConvexHullShapeSettings hs(points, 0.05f);
+            auto r = hs.Create();
+            if (!r.HasError()) shape = r.Get();
+        }
+        if (shape == nullptr) {
+            MeshShapeSettings ms(tris);
+            auto r = ms.Create();
+            if (!r.HasError()) shape = r.Get();
+        }
     }
     impl_->staticShapes[key] = shape;  // null: nothing to collide with
 }
