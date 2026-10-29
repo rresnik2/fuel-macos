@@ -8,6 +8,7 @@
 #include "renderer.h"
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 class DriveSession {
@@ -24,6 +25,7 @@ public:
     std::vector<simd_float4x4> partWorlds() const;
     fuel::VehicleState state() const { return world_.state(); }
     simd_float3 position() const;  // a point on the body, for the camera
+    fuel::DriveWorld& physics() { return world_; }
     float heading() const;  // radians; 0 = +z
 
 private:
@@ -35,6 +37,27 @@ private:
     std::vector<fuel::MeshInstance> parts_;
     std::vector<PartLink> links_;
     float focusHeight_ = 0.5f;  // where the camera looks, above the vehicle origin
+};
+
+// Streams the static world around the player: every object the sub-worlds
+// place, drawn within kDrawRadius and solid within kCollideRadius.
+class WorldStreamer {
+public:
+    WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup);
+    size_t placementCount() const { return placed_.size(); }
+    // Call every frame; refreshes after the player has moved a little.
+    void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
+
+private:
+    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f;
+    struct Placed {
+        uint32_t meshId;
+        std::array<float, 16> world;  // row-vector convention
+    };
+    std::vector<const fuel::DpcFile*> lookup_;
+    std::vector<Placed> placed_;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> cells_;
+    simd_float3 last_ = {1e30f, 0, 0};
 };
 
 // The assembled wheel centres in vehicle space (for makeVehicleSetup).

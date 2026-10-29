@@ -76,6 +76,9 @@ public:
     // Moves the instances of the last setScene (same order as its input;
     // `placement` is not applied) without reloading anything.
     void setInstanceWorlds(const std::vector<simd_float4x4>& worlds);
+    // World objects drawn with the scene (not part of its bounds); meshes
+    // load on first use. Returns the number of instances that could be shown.
+    size_t setWorldInstances(const std::vector<MeshInstance>& instances);
     // Points the camera at `centre` instead of the scene's centre.
     void setFocus(simd_float3 centre) { center_ = centre; }
 
@@ -178,6 +181,7 @@ private:
     Paint paint_;
     simd_float3 sunDir_;
     std::vector<Instance> instances_;
+    std::vector<Instance> worldInstances_;
     std::vector<int> inputToInstance_;  // setScene input index -> instance, or -1
     simd_float3 center_ = {0, 0, 0};
     simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};

@@ -14,6 +14,8 @@
 #include <Jolt/Physics/Collision/ObjectLayerPairFilterTable.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -27,7 +29,9 @@
 #include <cmath>
 #include <mutex>
 #include <stdexcept>
+#include <map>
 #include <thread>
+#include <unordered_map>
 
 namespace fuel {
 
@@ -136,6 +140,9 @@ struct DriveWorld::Impl {
 
     BodyID terrainBody;
     double patchX = 0, patchZ = 0;  // centre of the terrain patch
+
+    std::unordered_map<uint32_t, RefConst<Shape>> staticShapes;
+    std::map<std::pair<uint32_t, std::array<double, 16>>, BodyID> staticBodies;
 
     VehicleSetup setup;
     BodyID car;
@@ -387,6 +394,58 @@ void DriveWorld::update(float dt, const DriveInput& input) {
         impl_->fixedStep(input);
         impl_->accumulator -= kStep;
     }
+}
+
+bool DriveWorld::hasStaticShape(uint32_t key) const { return impl_->staticShapes.count(key) != 0; }
+
+void DriveWorld::addStaticShape(uint32_t key, const std::vector<float>& positions, const std::vector<uint32_t>& indices) {
+    TriangleList tris;
+    tris.reserve(indices.size() / 3);
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        auto v = [&](uint32_t k) { return Float3(positions[k * 3], positions[k * 3 + 1], positions[k * 3 + 2]); };
+        tris.push_back(Triangle(v(indices[i]), v(indices[i + 1]), v(indices[i + 2])));
+    }
+    RefConst<Shape> shape;
+    if (!tris.empty()) {
+        MeshShapeSettings ms(tris);
+        auto r = ms.Create();
+        if (!r.HasError()) shape = r.Get();
+    }
+    impl_->staticShapes[key] = shape;  // null: nothing to collide with
+}
+
+void DriveWorld::setStaticObjects(const std::vector<std::pair<uint32_t, std::array<double, 16>>>& objects) {
+    BodyInterface& bi = impl_->bodies();
+    std::map<std::pair<uint32_t, std::array<double, 16>>, BodyID> keep;
+    for (const auto& o : objects) {
+        if (auto it = impl_->staticBodies.find(o); it != impl_->staticBodies.end()) {
+            keep.insert(*it);
+            impl_->staticBodies.erase(it);
+            continue;
+        }
+        auto s = impl_->staticShapes.find(o.first);
+        if (s == impl_->staticShapes.end() || s->second == nullptr) continue;
+        const auto& m = o.second;
+        // Rows are the basis vectors (row-vector convention); split off their lengths as scale.
+        Vec3 axes[3];
+        Vec3 scale;
+        for (int r = 0; r < 3; ++r) {
+            axes[r] = Vec3(float(m[size_t(r * 4)]), float(m[size_t(r * 4 + 1)]), float(m[size_t(r * 4 + 2)]));
+            scale.SetComponent(uint(r), std::max(1e-4f, axes[r].Length()));
+            axes[r] /= scale[r];
+        }
+        const Mat44 rot(Vec4(axes[0], 0), Vec4(axes[1], 0), Vec4(axes[2], 0), Vec4(0, 0, 0, 1));
+        RefConst<Shape> shape = s->second;
+        if (!scale.IsClose(Vec3::sReplicate(1.0f), 1e-4f)) shape = new ScaledShape(shape, scale);
+        BodyCreationSettings bs(shape, RVec3(m[12], m[13], m[14]), rot.GetQuaternion().Normalized(), EMotionType::Static, kStatic);
+        bs.mFriction = 0.7f;
+        keep[o] = bi.CreateAndAddBody(bs, EActivation::DontActivate);
+    }
+    for (const auto& [key, id] : impl_->staticBodies) {  // objects no longer near
+        bi.RemoveBody(id);
+        bi.DestroyBody(id);
+    }
+    impl_->staticBodies = std::move(keep);
 }
 
 VehicleState DriveWorld::state() const {

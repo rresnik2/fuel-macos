@@ -21,4 +21,14 @@ struct PlacedMesh {
 // so a sub-world can reference meshes stored in USA1.DPC.
 std::vector<PlacedMesh> collectPlacedMeshes(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup);
 
+// Triangles of a Mesh_Z in its own space, for collision: positions (xyz per
+// vertex) and indices (three per triangle). Empty when the mesh has no
+// drawable geometry. Throws on malformed data.
+struct CollisionMesh {
+    std::vector<float> positions;
+    std::vector<uint32_t> indices;
+    float radius = 0;  // of the bounding sphere around the origin
+};
+CollisionMesh loadCollisionMesh(const std::vector<const DpcFile*>& lookup, uint32_t meshId);
+
 }  // namespace fuel

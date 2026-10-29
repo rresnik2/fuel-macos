@@ -84,6 +84,14 @@ public:
     void update(float dt, const DriveInput& input);
     VehicleState state() const;
 
+    // Static world objects the vehicle collides with. A shape is registered
+    // once per mesh; instances place it with a row-vector world matrix
+    // (translation in 12..14; rotation and uniform or axis scale).
+    bool hasStaticShape(uint32_t key) const;
+    void addStaticShape(uint32_t key, const std::vector<float>& positions, const std::vector<uint32_t>& indices);
+    // Replaces the set of placed static objects: (shape key, world matrix).
+    void setStaticObjects(const std::vector<std::pair<uint32_t, std::array<double, 16>>>& objects);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

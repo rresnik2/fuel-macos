@@ -794,6 +794,16 @@ bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::str
     return true;
 }
 
+size_t MeshRenderer::setWorldInstances(const std::vector<MeshInstance>& instances) {
+    worldInstances_.clear();
+    for (const MeshInstance& in : instances) {
+        std::string err;
+        const GpuMesh* gm = loadMesh(in.meshId, &err);
+        if (gm != nullptr && gm->indices != nil) worldInstances_.push_back({gm, in.world});
+    }
+    return worldInstances_.size();
+}
+
 void MeshRenderer::setInstanceWorlds(const std::vector<simd_float4x4>& worlds) {
     for (size_t k = 0; k < worlds.size() && k < inputToInstance_.size(); ++k)
         if (inputToInstance_[k] >= 0) instances_[size_t(inputToInstance_[k])].world = worlds[k];
@@ -818,7 +828,13 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
     [enc setDepthStencilState:depthWrite_];
     [enc setDepthBias:1.0f slopeScale:2.0f clamp:0.01f];
     [enc setCullMode:MTLCullModeNone];
-    for (const Instance& inst : instances_) {
+    // World objects cast shadows only near the focus (the shadow map covers the scene radius).
+    std::vector<const Instance*> casters;
+    for (const Instance& inst : instances_) casters.push_back(&inst);
+    for (const Instance& inst : worldInstances_)
+        if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
+    for (const Instance* ip : casters) {
+        const Instance& inst = *ip;
         const GpuMesh& gm = *inst.mesh;
         [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
         for (uint32_t pass = 0; pass < 2; ++pass) {  // opaque and alpha-tested parts cast shadows
@@ -876,7 +892,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc setDepthStencilState:mode == AlphaMode::Blend ? depthNoWrite_ : depthWrite_];
         [enc setCullMode:cullBackFaces ? MTLCullModeBack : MTLCullModeNone];
         [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-        for (const Instance& inst : instances_) {
+        for (const std::vector<Instance>* list : {&instances_, &worldInstances_}) for (const Instance& inst : *list) {
             const GpuMesh& gm = *inst.mesh;
             if (gm.draws[pass].empty()) continue;
             [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];

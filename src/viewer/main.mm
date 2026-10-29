@@ -385,6 +385,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     bool _sceneMode;          // showing a scene file or an assembled variant
     AssemblyMode* _assembly;  // --assemble, else nullptr
     DriveSession* _drive;     // --drive, else nullptr
+    WorldStreamer* _streamer; // --drive: the static world
     std::set<unsigned short> _keys;
     double _lastTime;
     float _steer;             // smoothed keyboard steering
@@ -401,7 +402,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                          look:(const VehicleLook&)look
                         scene:(const SceneFile&)scene
                      assembly:(AssemblyMode*)assembly
-                        drive:(DriveSession*)drive {
+                        drive:(DriveSession*)drive
+                     streamer:(WorldStreamer*)streamer {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -413,6 +415,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _scene = scene;
         _assembly = assembly;
         _drive = drive;
+        _streamer = streamer;
         _lastTime = 0;
         _steer = 0;
         _camYawOffset = 0;
@@ -563,6 +566,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         if (pad.buttonY.pressed) _drive->reset();
     }
     _drive->update(dt, in);
+    if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics());
     _renderer->setInstanceWorlds(_drive->partWorlds());
     _renderer->setFocus(_drive->position());
     // Chase camera: swing behind the vehicle, mouse look decays back.
@@ -663,6 +667,7 @@ int main(int argc, const char** argv) {
         VehicleLook look;
         std::unique_ptr<AssemblyMode> assembly;
         std::unique_ptr<DriveSession> drive;
+        std::unique_ptr<WorldStreamer> streamer;
         if (opt.drive && opt.assemble.empty()) die("--drive needs --assemble VARIANT");
         if (!opt.assemble.empty()) {
             assembly = std::make_unique<AssemblyMode>();
@@ -695,12 +700,33 @@ int main(int argc, const char** argv) {
                 try {
                     const fuel::AssembledVehicle av = assembly->assembler->assemble(assembly->variant(), assembly->lod);
                     const fuel::VehicleSetup setup = fuel::makeVehicleSetup(subject, name, it->second, assembledHubs(av));
-                    drive = std::make_unique<DriveSession>(av, setup, *terrain, opt.haveAt ? opt.atX : -1000.0, opt.haveAt ? opt.atZ : -30000.0,
+                    drive = std::make_unique<DriveSession>(av, setup, *terrain, opt.haveAt ? opt.atX : -51358.0, opt.haveAt ? opt.atZ : -30043.0,
                                                            0.0f);
                 } catch (const std::exception& e) {
                     die(name + ": " + e.what());
                 }
                 scene.parts = drive->parts();
+                // The static world: every sub-world's placements (geometry lives in USA1.DPC).
+                std::vector<const fuel::DpcFile*> subs, lookup;
+                const fs::path worldDir = fs::path(opt.dataDir) / "CommonComponent/WORLD";
+                std::vector<fs::path> files;
+                for (const auto& e : fs::directory_iterator(worldDir))
+                    if (e.path().filename().string().rfind("USA1_", 0) == 0 && e.path().extension() == ".DPC") files.push_back(e.path());
+                std::sort(files.begin(), files.end());
+                files.push_back(worldDir / "USA1.DPC");
+                for (const fs::path& f : files) {
+                    try {
+                        auto dpc = std::make_unique<fuel::DpcFile>(f.string());
+                        if (!dpc->isCurrentVersion()) continue;  // the game never loads these
+                        if (f.filename() != "USA1.DPC") subs.push_back(dpc.get());
+                        library.add(std::move(dpc));
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "fuelview: %s\n", e.what());
+                    }
+                }
+                for (const auto& f : library.files()) lookup.push_back(f.get());
+                streamer = std::make_unique<WorldStreamer>(subs, lookup);
+                std::printf("world: %zu objects in %zu sub-worlds\n", streamer->placementCount(), subs.size());
             }
         } else {
             if (!opt.scene.empty()) scene = loadScene(opt.scene);
@@ -740,7 +766,11 @@ int main(int argc, const char** argv) {
                 if (!renderer.setScene(scene.parts, &err)) die(scene.variant + ": " + err);
                 if (!err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
                 if (drive) {  // drive straight ahead for a while, then look from behind
-                    for (int i = 0; i < int(opt.driveTime * 60); ++i) drive->update(1.0f / 60, {1.0f, 0, 0, false});
+                    if (streamer) streamer->update(drive->position(), renderer, drive->physics(), true);
+                    for (int i = 0; i < int(opt.driveTime * 60); ++i) {
+                        drive->update(1.0f / 60, {1.0f, 0, 0, false});
+                        if (streamer && i % 30 == 0) streamer->update(drive->position(), renderer, drive->physics());
+                    }
                     renderer.setInstanceWorlds(drive->partWorlds());
                     renderer.setFocus(drive->position());
                     cam.yaw += drive->heading() + float(M_PI);
@@ -778,7 +808,8 @@ int main(int argc, const char** argv) {
                                                     look:look
                                                    scene:scene
                                                 assembly:assembly.get()
-                                                   drive:drive.get()];
+                                                   drive:drive.get()
+                                                streamer:streamer.get()];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];
