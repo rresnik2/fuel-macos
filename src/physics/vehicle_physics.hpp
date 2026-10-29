@@ -31,7 +31,8 @@ struct VehicleSetup {
         float radius = 0.3f, width = 0.25f;
         bool front = false;
     };
-    std::vector<Wheel> wheels;  // FL, FR, RL, RR (pairs: left = +x)
+    std::vector<Wheel> wheels;  // FL, FR, RL, RR (pairs: left = +x); bikes: front, rear
+    bool bike = false;          // two wheels, leans into turns
     bool frontDriven = true, rearDriven = true;
     float idleRpm = 1000, maxRpm = 6000;
     float peakTorque = 300;  // Nm at the crank

@@ -21,6 +21,7 @@
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
 #include <Jolt/Physics/Vehicle/VehicleConstraint.h>
+#include <Jolt/Physics/Vehicle/MotorcycleController.h>
 #include <Jolt/Physics/Vehicle/WheeledVehicleController.h>
 // clang-format on
 
@@ -87,15 +88,21 @@ VehicleSetup makeVehicleSetup(const DpcFile& dpc, const std::string& variant, co
             s.wheels.push_back(w);
         }
     }
-    if (s.wheels.size() != 4) throw std::runtime_error(variant + ": needs four wheel spheres (bikes are not supported yet)");
+    if (s.wheels.size() == 2 && s.wheels[0].front && !s.wheels[1].front) {
+        s.bike = true;  // front-left and rear-left spheres only: a motorbike
+        for (auto& w : s.wheels) w.width = std::min(w.width, w.radius * 0.45f);
+    } else if (s.wheels.size() != 4) {
+        throw std::runtime_error(variant + ": needs two or four wheel spheres");
+    }
 
     // The proxy boxes include the wheels (their bottoms reach the ground);
     // the collision chassis keeps the part above the axles and between the wheels.
     float hubY = 0, innerX = 1e9f;
     for (const VehicleSetup::Wheel& w : s.wheels) {
-        hubY += w.hub[1] / 4;
+        hubY += w.hub[1] / float(s.wheels.size());
         innerX = std::min(innerX, std::fabs(w.hub[0]) - w.width * 0.5f);
     }
+    if (s.bike) innerX = 0.25f;  // a bike's body is narrow, not boxed in by wheels
     for (const ProxyBox& b : proxy.boxes) {
         const float top = b.centre[1] + b.halfExtents[1];
         const float bottom = std::max(b.centre[1] - b.halfExtents[1], hubY);
@@ -122,7 +129,7 @@ VehicleSetup makeVehicleSetup(const DpcFile& dpc, const std::string& variant, co
     s.topSpeedKmh = param(vp::TopSpeedKmh);
     // FUEL's torque scale (P327) is in unknown units; size the engine for a
     // lively 0.9 g launch in first gear instead.
-    const float r = s.wheels[2].radius;
+    const float r = s.wheels.back().radius;
     s.peakTorque = 0.9f * kGravity * s.mass * r / (s.finalDrive * s.gears[0]);
     return s;
 }
@@ -220,8 +227,11 @@ struct DriveWorld::Impl {
             const float travel = std::clamp(w.radius * 0.9f, 0.18f, 0.9f);
             // The suspension hangs from above the hub so the wheel rests near
             // its authored position.
-            ws->mPosition = toVec3(w.hub) + Vec3(0, 0.6f * travel, 0);
-            ws->mSuspensionDirection = Vec3(0, -1, 0);
+            // Bikes: a raked front fork (25 degrees of caster) steering about its own axis.
+            const Vec3 dir = s.bike && w.front ? Vec3(0, -1, std::tan(0.44f)).Normalized() : Vec3(0, -1, 0);
+            ws->mPosition = toVec3(w.hub) - dir * (0.6f * travel);
+            ws->mSuspensionDirection = dir;
+            ws->mSteeringAxis = -dir;
             ws->mSuspensionMinLength = 0.02f;
             ws->mSuspensionMaxLength = travel;
             ws->mSuspensionSpring.mFrequency = heavy ? 1.1f : 1.6f;
@@ -231,7 +241,7 @@ struct DriveWorld::Impl {
             // Jolt's default inertia suits a 20 kg car wheel; size it for this one (solid disc).
             const float wheelMass = std::clamp(s.mass * 0.02f, 8.0f, 200.0f);
             ws->mInertia = 0.5f * wheelMass * w.radius * w.radius;
-            ws->mMaxSteerAngle = w.front ? 0.6f : 0.0f;
+            ws->mMaxSteerAngle = w.front ? (s.bike ? 0.45f : 0.6f) : 0.0f;
             const float brake = s.mass * kGravity * w.radius * 0.6f;
             ws->mMaxBrakeTorque = brake;
             ws->mMaxHandBrakeTorque = w.front ? 0.0f : brake * 2.0f;
@@ -248,14 +258,17 @@ struct DriveWorld::Impl {
             ws->mLateralFriction.AddPoint(90.0f, 0.85f);
             vs.mWheels.push_back(ws);
         }
-        vs.mAntiRollBars.resize(2);
-        vs.mAntiRollBars[0].mLeftWheel = 0;
-        vs.mAntiRollBars[0].mRightWheel = 1;
-        vs.mAntiRollBars[1].mLeftWheel = 2;
-        vs.mAntiRollBars[1].mRightWheel = 3;
+        if (!s.bike) vs.mAntiRollBars.resize(2);
+        if (!s.bike) {
+            vs.mAntiRollBars[0].mLeftWheel = 0;
+            vs.mAntiRollBars[0].mRightWheel = 1;
+            vs.mAntiRollBars[1].mLeftWheel = 2;
+            vs.mAntiRollBars[1].mRightWheel = 3;
+        }
         for (auto& bar : vs.mAntiRollBars) bar.mStiffness = s.mass * 0.7f;  // Jolt's reference: ~1000 N/m for a 1500 kg car
 
-        auto* cs = new WheeledVehicleControllerSettings;
+        // Bikes use Jolt's motorcycle controller, which leans the bike into turns.
+        auto* cs = s.bike ? new MotorcycleControllerSettings : new WheeledVehicleControllerSettings;
         cs->mEngine.mMaxTorque = s.peakTorque;
         cs->mEngine.mMinRPM = s.idleRpm;
         cs->mEngine.mMaxRPM = s.maxRpm;
@@ -280,13 +293,17 @@ struct DriveWorld::Impl {
             d.mEngineTorqueRatio = share;
             cs->mDifferentials.push_back(d);
         };
-        const float share = s.frontDriven && s.rearDriven ? 0.5f : 1.0f;
-        if (s.frontDriven) addDiff(0, 1, share);
-        if (s.rearDriven) addDiff(2, 3, share);
+        if (s.bike) {
+            addDiff(uint32_t(-1), 1, 1.0f);  // rear wheel only (no left wheel)
+        } else {
+            const float share = s.frontDriven && s.rearDriven ? 0.5f : 1.0f;
+            if (s.frontDriven) addDiff(0, 1, share);
+            if (s.rearDriven) addDiff(2, 3, share);
+        }
         vs.mController = cs;
 
         vehicle = new VehicleConstraint(*physics.GetBodyLockInterface().TryGetBody(car), vs);
-        tester = new VehicleCollisionTesterCastCylinder(kMoving);
+        tester = new VehicleCollisionTesterCastCylinder(kMoving, s.bike ? 1.0f : 0.1f);  // bikes: rounded tyres
         vehicle->SetVehicleCollisionTester(tester);
         physics.AddConstraint(vehicle);
         physics.AddStepListener(vehicle);
