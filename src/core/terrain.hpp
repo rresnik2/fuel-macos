@@ -23,6 +23,9 @@ struct Heightfield {
     float sampleHeight(uint32_t col, uint32_t row) const { return float(raw[size_t(row) * width + col]) * metresPerUnit; }
     // Bilinear height at a world position (clamped to the edges).
     float heightAt(float x, float z) const;
+    // Cubic B-spline height, the smooth surface the renderer draws (and the
+    // original engine samples).
+    float smoothHeightAt(double x, double z) const;
 };
 
 // Decodes the heightfield of a world DPC (WORLD/USA1.DPC). Throws when the

@@ -34,6 +34,30 @@ float Heightfield::heightAt(float x, float z) const {
     return a * (1 - tz) + b * tz;
 }
 
+float Heightfield::smoothHeightAt(double x, double z) const {
+    const double tx = (x - originX) / spacing, tz = (z - originZ) / spacing;
+    const double ix = std::floor(tx), iz = std::floor(tz);
+    const double ax = tx - ix, az = tz - iz;
+    auto weights = [](double a, double w[4]) {
+        w[0] = (1 - a) * (1 - a) * (1 - a) / 6;
+        w[1] = (4 - 6 * a * a + 3 * a * a * a) / 6;
+        w[3] = a * a * a / 6;
+        w[2] = 1 - w[0] - w[1] - w[3];
+    };
+    double wx[4], wz[4];
+    weights(ax, wx);
+    weights(az, wz);
+    double h = 0;
+    for (int j = 0; j < 4; ++j) {
+        const auto r = uint32_t(std::clamp<double>(iz - 1 + j, 0, height - 1));
+        for (int i = 0; i < 4; ++i) {
+            const auto c = uint32_t(std::clamp<double>(ix - 1 + i, 0, width - 1));
+            h += wx[i] * wz[j] * raw[size_t(r) * width + c];
+        }
+    }
+    return float(h * metresPerUnit);
+}
+
 Heightfield loadWorldHeightfield(const DpcFile& world) {
     const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
     if (gens.empty()) throw std::runtime_error(world.path() + ": no GenWorld_Z");
