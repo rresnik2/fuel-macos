@@ -59,6 +59,24 @@ for paintable vehicle bodywork, drawn with a white diffuse texture), 0x80 skips
 drawing, 0x100/0x200 clamp U/V (0x400/0x800 border), 0x3000 unlit. The texture
 mask selects the shader variant (`+bSpecular`, `+bNormal`, `+bDirt`, ...).
 
+## Vehicle paint and liveries
+
+Material codes (flags bits 0-4) 17-20 are car parts: 17 painted with a
+two-state sheet, 18 plain, 19 painted, 20 two-state sheet. A two-state sheet
+holds the intact part in its left half and the damaged part in its right half,
+so intact parts sample the diffuse and normal maps at (u/2, v). Painted parts
+mix the paint colour under the diffuse texture by its alpha
+(`rgb = mix(paint, tex.rgb, tex.a)`, alpha 0 = paint) and are drawn opaque.
+
+Palettes: `LocalizedComponent/GameTsc/Story/VehiclesDef.tsc` has ten
+`AddVehicleColor MESH_ID_<vehicle> R<r>G<g>B<b>` lines per vehicle; the paint
+colour is RGB/255. Liveries: each vehicle DPC has MaterialObj_Z libraries
+(body `u32 groups; {u32 CRC(vehicle name); u32 n; u32 MaterialAnim_Z[n]}`).
+The MaterialAnim_Z whose link is CRC(`LIVERY_<nn>_LOD<k>`) points (body +0x3C)
+to a Material_Z whose slot-0 texture is livery nn for LOD k. That texture
+replaces slot 0 of the vehicle's materials whose link is
+CRC(`LIVERY_XX_LOD<k>`), which otherwise use a plain white texture.
+
 ## Mesh_Z
 
 The link header is a 98-byte object part (+4 MeshData_Z ID, +8 bounding sphere

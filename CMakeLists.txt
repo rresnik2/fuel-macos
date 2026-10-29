@@ -16,6 +16,7 @@ add_library(fuelcore STATIC
   src/core/lz.cpp
   src/core/dpc.cpp
   src/core/resources.cpp
+  src/core/vehicle.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 

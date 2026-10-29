@@ -1,12 +1,16 @@
 // fuelview: browse the meshes in a FUEL .DPC file with Metal.
 //
-//   fuelview [--data DIR] [--mesh ID] [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]
+//   fuelview [--data DIR] [--mesh ID] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]
+//            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]
 //
 // DPC paths are relative to the game data directory (the folder that holds
 // CommonComponent/); the first one is browsed, the others only supply
 // textures and materials. Without --shot it opens a window:
 //   drag = orbit, scroll/pinch = zoom, left/right = previous/next mesh,
-//   C = back-face culling, W = wireframe, R = reset view, Q/Esc = quit.
+//   C = back-face culling, W = wireframe, R = reset view, Q/Esc = quit,
+//   L = next livery, P = next palette colour (with --vehicle).
+// --vehicle NAME (for example QUAD_ALL_1) picks the vehicle whose palette and
+// liveries paint the bodywork; --livery 0 shows plain paint.
 
 #import <Cocoa/Cocoa.h>
 #import <ImageIO/ImageIO.h>
@@ -41,6 +45,39 @@ struct Options {
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
     bool cull = true;
+    std::string vehicle;
+    int livery = 1;
+    int color = 0;
+    bool havePaint = false;
+    int paint[3] = {60, 60, 60};
+};
+
+// Paint and liveries available for the chosen vehicle.
+struct VehicleLook {
+    std::string name;
+    std::vector<fuel::Rgb8> palette;
+    std::array<std::array<uint32_t, 3>, 10> liveries{};  // [1..9]
+    int livery = 1;
+    int color = 0;
+    bool custom = false;
+    simd_float3 customColor = {0, 0, 0};
+
+    fuel::Paint paint() const {
+        fuel::Paint p;
+        if (custom)
+            p.color = customColor;
+        else if (!palette.empty()) {
+            const fuel::Rgb8& c = palette[size_t(color) % palette.size()];
+            p.color = simd_make_float3(c[0], c[1], c[2]) / 255.0f;
+        }
+        if (livery >= 1 && livery <= 9) p.livery = liveries[size_t(livery)];
+        return p;
+    }
+    std::string describe() const {
+        if (name.empty()) return "";
+        std::string d = " — " + name + " livery " + (livery ? std::to_string(livery) : std::string("none"));
+        return d + (custom ? " custom paint" : " colour " + std::to_string(color));
+    }
 };
 
 struct MeshEntry {
@@ -75,7 +112,12 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--yaw") o.yawDeg = std::stof(next());
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
         else if (a == "--no-cull") o.cull = false;
-        else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID] [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]"); std::exit(0); }
+        else if (a == "--vehicle") o.vehicle = next();
+        else if (a == "--livery") o.livery = std::stoi(next());
+        else if (a == "--color") o.color = std::stoi(next());
+        else if (a == "--paint") { const std::string v = next(); if (std::sscanf(v.c_str(), "%d,%d,%d", &o.paint[0], &o.paint[1], &o.paint[2]) != 3) die("bad --paint"); o.havePaint = true; }
+        else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]\n"
+                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]"); std::exit(0); }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.dpcs.push_back(a);
     }
@@ -182,6 +224,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     id<MTLCommandQueue> _queue;
     fuel::OrbitCamera _cam;
     size_t _index;
+    VehicleLook _look;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -190,7 +233,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                        meshes:(std::vector<MeshEntry>*)meshes
                      fileName:(const std::string&)fileName
                         start:(size_t)start
-                       camera:(fuel::OrbitCamera)cam {
+                       camera:(fuel::OrbitCamera)cam
+                         look:(const VehicleLook&)look {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -198,6 +242,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _queue = [device newCommandQueue];
         _cam = cam;
         _index = start;
+        _look = look;
         self.colorPixelFormat = kColorFormat;
         self.depthStencilPixelFormat = kDepthFormat;
         self.sampleCount = kSamples;
@@ -211,9 +256,9 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 - (void)updateTitle {
     const MeshEntry& m = (*_meshes)[_index];
-    NSString* title = [NSString stringWithFormat:@"FUEL viewer — %s — mesh %zu/%zu — %08x — %u triangles%s%s%s%s",
+    NSString* title = [NSString stringWithFormat:@"FUEL viewer — %s — mesh %zu/%zu — %08x — %u triangles%s%s%s%s%s",
                                                  _fileName.c_str(), _index + 1, _meshes->size(), m.id, _renderer->triangleCount(),
-                                                 m.label.empty() ? "" : " — ", m.label.c_str(),
+                                                 m.label.empty() ? "" : " — ", m.label.c_str(), _look.describe().c_str(),
                                                  _renderer->cullBackFaces ? " — cull on" : "", _renderer->wireframe ? " — wireframe" : ""];
     self.window.title = title;
 }
@@ -240,6 +285,13 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     else if ([ch isEqualToString:@"w"]) _renderer->wireframe = !_renderer->wireframe;
     else if ([ch isEqualToString:@"r"]) _cam = fuel::OrbitCamera{};
     else if ([ch isEqualToString:@"q"]) [NSApp terminate:nil];
+    else if (!_look.name.empty() && ([ch isEqualToString:@"l"] || [ch isEqualToString:@"p"])) {
+        if ([ch isEqualToString:@"l"]) _look.livery = (_look.livery + 1) % 10;
+        else { _look.custom = false; _look.color = (_look.color + 1) % int(std::max<size_t>(1, _look.palette.size())); }
+        _renderer->setPaint(_look.paint());
+        [self showMesh:_index];
+        return;
+    }
     [self updateTitle];
 }
 
@@ -312,6 +364,30 @@ int main(int argc, const char** argv) {
         fuel::MeshRenderer renderer(device, kColorFormat, kDepthFormat, kSamples, library);
         renderer.cullBackFaces = opt.cull;
 
+        VehicleLook look;
+        if (!opt.vehicle.empty()) {
+            look.name = opt.vehicle;
+            const fs::path tsc = fs::path(opt.dataDir) / "LocalizedComponent/GameTsc/Story/VehiclesDef.tsc";
+            if (FILE* f = std::fopen(tsc.c_str(), "rb")) {
+                std::string text;
+                char buf[65536];
+                for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+                std::fclose(f);
+                const auto colors = fuel::parseVehicleColors(text);
+                if (auto it = colors.find(opt.vehicle); it != colors.end()) look.palette = it->second;
+            }
+            if (look.palette.empty()) std::fprintf(stderr, "fuelview: warning: no palette for %s in VehiclesDef.tsc\n", opt.vehicle.c_str());
+            for (int i = 1; i <= 9; ++i) look.liveries[size_t(i)] = fuel::findLiveryTextures(subject, opt.vehicle, i);
+            if (look.liveries[1][0] == 0) std::fprintf(stderr, "fuelview: warning: no liveries for %s in %s\n", opt.vehicle.c_str(), subject.path().c_str());
+            look.livery = std::clamp(opt.livery, 0, 9);
+            look.color = std::max(0, opt.color);
+            if (opt.havePaint) {
+                look.custom = true;
+                look.customColor = simd_make_float3(opt.paint[0], opt.paint[1], opt.paint[2]) / 255.0f;
+            }
+            renderer.setPaint(look.paint());
+        }
+
         fuel::OrbitCamera cam;
         cam.yaw = opt.yawDeg * float(M_PI) / 180.0f;
         cam.pitch = opt.pitchDeg * float(M_PI) / 180.0f;
@@ -341,7 +417,8 @@ int main(int argc, const char** argv) {
                                                   meshes:&meshes
                                                 fileName:fs::path(subject.path()).filename().string()
                                                    start:start
-                                                  camera:cam];
+                                                  camera:cam
+                                                    look:look];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];

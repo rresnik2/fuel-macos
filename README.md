@@ -13,8 +13,8 @@ Windows; the programs here read its data at run time.
 Early. What works today:
 
 - **`fuelview`**, a Metal model viewer. It opens any of the game's `.DPC`
-  archives and shows each vehicle part with its textures and materials. This is
-  the first native program in the port.
+  archives and shows each vehicle part with its textures, materials, paint and
+  liveries. This is the first native program in the port.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
@@ -63,6 +63,12 @@ cmake --build build
 Viewer controls: drag to orbit, scroll or pinch to zoom, left/right arrows for
 the previous/next mesh (largest first), `C` back-face culling, `W` wireframe,
 `R` reset view, `Q` or Esc to quit.
+
+Paint: `--vehicle NAME` (for example `QUAD_OFF_5`) paints the bodywork with
+that vehicle's palette and liveries, as set up in the game's `VehiclesDef.tsc`
+and its livery library. `--livery N` (1-9, 0 = plain paint), `--color N`
+(palette index 0-9) or `--paint R,G,B` choose the look; in the window, `L` and
+`P` cycle liveries and colours.
 
 `fuelview --shot out.png` renders one image without opening a window (options:
 `--mesh ID`, `--size WxH`, `--yaw DEG`, `--pitch DEG`).

@@ -7,6 +7,7 @@
 
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
+#include "core/vehicle.hpp"
 
 #include <memory>
 #include <string>
@@ -38,6 +39,14 @@ struct OrbitCamera {
     float distance = 2.1f; // in model radii
 };
 
+// Vehicle paint: the colour mixed in where the diffuse alpha is 0, and the
+// livery texture (per LOD 1..3) that replaces slot 0 of LIVERY_XX_LOD<k>
+// materials. Without a livery those materials show plain paint.
+struct Paint {
+    simd_float3 color = {60.0f / 255, 60.0f / 255, 60.0f / 255};
+    std::array<uint32_t, 3> livery{};
+};
+
 // One placed copy of a mesh.
 struct MeshInstance {
     uint32_t meshId = 0;
@@ -56,6 +65,9 @@ public:
     bool setScene(const std::vector<MeshInstance>& instances, std::string* error);
     uint32_t triangleCount() const { return triangles_; }
 
+    // Takes effect for meshes loaded afterwards (the colour applies at once).
+    void setPaint(const Paint& paint);
+
     bool cullBackFaces = true;
     bool wireframe = false;
 
@@ -71,6 +83,8 @@ private:
         bool lit = true;
         bool skip = false;
         uint32_t samplerIndex = 0;  // bit 0 clamp U, bit 1 clamp V
+        uint32_t code = 0;          // MatCodeId (flags & 0x1f)
+        bool paintOnly = false;     // livery material without a livery texture
     };
     struct Draw {
         uint32_t vb = 0;
@@ -111,6 +125,7 @@ private:
     std::unordered_map<uint32_t, uint8_t> textureAlpha_;
     std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> meshes_;
 
+    Paint paint_;
     std::vector<Instance> instances_;
     simd_float3 center_ = {0, 0, 0};
     float radius_ = 1.0f;

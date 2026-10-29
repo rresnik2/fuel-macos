@@ -27,13 +27,15 @@ struct VertexIn {
 struct FrameUniforms {
     float4x4 viewProj;
     float4 lightDir;
+    float4 paint;
 };
 
 struct MaterialUniforms {
     float4 diffuse;
     uint alphaMode;  // 0 opaque, 1 alpha test, 2 blend
     uint lit;
-    uint pad0, pad1;
+    uint code;       // MatCodeId: 17 painted + two-state sheet, 19 painted, 20 two-state sheet
+    uint paintOnly;
 };
 
 struct VertexOut {
@@ -56,7 +58,17 @@ fragment float4 fsMain(VertexOut in [[stage_in]],
                        constant MaterialUniforms& m [[buffer(2)]],
                        texture2d<float> tex [[texture(0)]],
                        sampler smp [[sampler(0)]]) {
-    float4 c = tex.sample(smp, in.uv) * m.diffuse;
+    // Codes 17 and 20 use a sheet whose left half is the intact part and the
+    // right half the damaged one; draw the intact half.
+    float2 uv = in.uv;
+    if (m.code == 17 || m.code == 20) uv.x *= 0.5;
+    float4 t = tex.sample(smp, uv);
+    if (m.code == 17 || m.code == 19) {
+        // Car paint: the diffuse alpha masks the livery art over the paint colour.
+        t.rgb = mix(f.paint.rgb, t.rgb, m.paintOnly != 0 ? 0.0 : t.a);
+        t.a = 1.0;
+    }
+    float4 c = t * m.diffuse;
     if (m.alphaMode == 1 && c.a < 0.5) discard_fragment();
     float3 rgb = c.rgb;
     if (m.lit != 0) {
@@ -73,13 +85,15 @@ fragment float4 fsMain(VertexOut in [[stage_in]],
 struct FrameUniforms {
     simd_float4x4 viewProj;
     simd_float4 lightDir;
+    simd_float4 paint;
 };
 
 struct MaterialUniforms {
     simd_float4 diffuse;
     uint32_t alphaMode;
     uint32_t lit;
-    uint32_t pad0, pad1;
+    uint32_t code;
+    uint32_t paintOnly;
 };
 
 // Right-handed view and projection with clip z in [0, 1]. FUEL's data is
@@ -282,12 +296,30 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId) {
         const auto body = hit.file->body(*hit.entry);
         if (!body) return gm;
         const Material m = parseMaterialBody(*body);
+        const std::vector<uint8_t> link = hit.file->link(*hit.entry);
+        uint32_t name = 0;
+        if (link.size() >= 4) std::memcpy(&name, link.data(), 4);
+
+        uint32_t diffuseTex = m.textures[0];
+        gm.code = m.flags & 0x1F;
+        for (int lod = 1; lod <= 3; ++lod) {
+            if (name != liveryMaterialName(lod)) continue;
+            if (paint_.livery[size_t(lod - 1)] != 0)
+                diffuseTex = paint_.livery[size_t(lod - 1)];
+            else
+                gm.paintOnly = true;
+        }
         uint8_t alphaKind = 0;
-        gm.texture = texture(m.textures[0], &alphaKind);
+        gm.texture = texture(diffuseTex, &alphaKind);
         gm.diffuse = simd_make_float4(m.diffuse[0], m.diffuse[1], m.diffuse[2], m.alpha);
+        // The cube-map lighting path (texture mask bit 8) ignores the material colour.
+        if (m.textureMask & 0x100) gm.diffuse = simd_make_float4(1, 1, 1, m.alpha);
         // The engine derives the blend mode from the diffuse bitmap's alpha
         // kind and the material opacity; flags 0x180000 force alpha test.
-        if (alphaKind == 2 || m.alpha < 1.0f)
+        // Painted car parts (codes 17 and 19) are always opaque.
+        if (gm.code == 17 || gm.code == 19)
+            gm.alpha = AlphaMode::Opaque;
+        else if (alphaKind == 2 || m.alpha < 1.0f)
             gm.alpha = AlphaMode::Blend;
         else if (alphaKind == 1 || (m.flags & 0x180000))
             gm.alpha = AlphaMode::Test;
@@ -297,6 +329,11 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId) {
     } catch (const std::exception&) {
     }
     return gm;
+}
+
+void MeshRenderer::setPaint(const Paint& paint) {
+    if (paint.livery != paint_.livery) meshes_.clear();  // materials bake in the livery texture
+    paint_ = paint;
 }
 
 const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string* error) {
@@ -408,6 +445,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                            lookAtRH(eye, center_, simd_make_float3(0, 1, 0)));
     // Sun from above, slightly behind the camera's right shoulder.
     fu.lightDir = simd_make_float4(simd_normalize(simd_make_float3(std::sin(cam.yaw + 0.6f), 1.3f, std::cos(cam.yaw + 0.6f))), 0);
+    fu.paint = simd_make_float4(paint_.color, 1);
 
     [enc setVertexBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentBytes:&fu length:sizeof fu atIndex:1];
@@ -426,7 +464,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                 const GpuMaterial& m = gm.materials[d.material];
                 [enc setRenderPipelineState:pipeline(gm.vbStrides[d.vb], mode)];
                 [enc setVertexBuffer:gm.vbs[d.vb] offset:0 atIndex:0];
-                MaterialUniforms mu{m.diffuse, uint32_t(m.alpha), m.lit ? 1u : 0u, 0, 0};
+                MaterialUniforms mu{m.diffuse, uint32_t(m.alpha), m.lit ? 1u : 0u, m.code, m.paintOnly ? 1u : 0u};
                 [enc setFragmentBytes:&mu length:sizeof mu atIndex:2];
                 [enc setFragmentTexture:m.texture atIndex:0];
                 [enc setFragmentSamplerState:samplers_[m.samplerIndex] atIndex:0];
