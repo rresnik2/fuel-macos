@@ -1,6 +1,6 @@
 // fuelview: browse the meshes in a FUEL .DPC file with Metal.
 //
-//   fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json]
+//   fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json | --world]
 //            [--vehicle NAME] [--livery N] [--color N | --paint R,G,B]
 //            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull] [--dirt 0..1]] [DPC ...]
 //
@@ -28,6 +28,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #import "renderer.h"
+#include "core/world.hpp"
 
 #include "core/assembly.hpp"
 
@@ -56,6 +57,7 @@ struct Options {
     bool haveMeshId = false;
     std::string shot;
     std::string scene;
+    bool world = false;
     std::string assemble;
     int lod = 1;
     int width = 1600, height = 1000;
@@ -126,6 +128,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--mesh") { o.meshId = uint32_t(std::stoul(next(), nullptr, 16)); o.haveMeshId = true; }
         else if (a == "--shot") o.shot = next();
         else if (a == "--scene") o.scene = next();
+        else if (a == "--world") o.world = true;
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
@@ -527,7 +530,7 @@ int main(int argc, const char** argv) {
         // Browsing meshes needs the list of drawable meshes; an assembled vehicle does not.
         std::vector<MeshEntry> meshes;
         size_t start = 0;
-        if (opt.assemble.empty()) {
+        if (opt.assemble.empty() && opt.scene.empty() && !opt.world) {
             meshes = listMeshes(subject);
             if (meshes.empty()) die("no drawable meshes in " + subject.path());
             if (opt.haveMeshId) {
@@ -577,7 +580,20 @@ int main(int argc, const char** argv) {
             renderer.setPaint(look.paint());
         } else {
             if (!opt.scene.empty()) scene = loadScene(opt.scene);
-            const std::string vehicle = !opt.vehicle.empty() ? opt.vehicle : scene.variant;
+            if (opt.world) {
+                // Every mesh the first DPC places; the others help resolve references.
+                std::vector<const fuel::DpcFile*> lookup;
+                for (const auto& f : library.files()) lookup.push_back(f.get());
+                for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(subject, lookup)) {
+                    simd_float4 cols[4];
+                    for (size_t r = 0; r < 4; ++r)
+                        cols[r] = simd_make_float4(pm.world[r * 4], pm.world[r * 4 + 1], pm.world[r * 4 + 2], pm.world[r * 4 + 3]);
+                    scene.parts.push_back({pm.meshId, simd_matrix(cols[0], cols[1], cols[2], cols[3])});
+                }
+                if (scene.parts.empty()) die("no placed meshes in " + subject.path());
+                scene.variant = fs::path(subject.path()).filename().string();
+            }
+            const std::string vehicle = !opt.vehicle.empty() ? opt.vehicle : (opt.world ? std::string() : scene.variant);
             if (!vehicle.empty()) {
                 // Unknown names appear as "?<crc>" in scene files.
                 uint32_t crc = fuel::asoboCrc(vehicle);
