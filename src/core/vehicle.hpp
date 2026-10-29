@@ -27,8 +27,10 @@ using Rgb8 = std::array<uint8_t, 3>;
 std::map<std::string, std::vector<Rgb8>> parseVehicleColors(const std::string& tscText);
 
 // Livery texture (Bitmap_Z ID) for LOD 1..3 of one vehicle's livery
-// `index` (1..9); 0 where the DPC has none.
+// `index` (1..9); 0 where the DPC has none. The vehicle is given by name or
+// by the CRC of its name (the variant's GameObj_Z link).
 std::array<uint32_t, 3> findLiveryTextures(const DpcFile& dpc, const std::string& vehicle, int index);
+std::array<uint32_t, 3> findLiveryTextures(const DpcFile& dpc, uint32_t vehicleCrc, int index);
 
 // Name CRC of the bodywork materials that take livery LOD `lod` (1..3).
 uint32_t liveryMaterialName(int lod);

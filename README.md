@@ -12,15 +12,18 @@ Windows; the programs here read its data at run time.
 
 Early. What works today:
 
-- **`fuelview`**, a Metal model viewer. It opens any of the game's `.DPC`
-  archives and shows each vehicle part with its textures, materials, paint and
-  liveries. This is the first native program in the port.
+- **`fuelview`**, a Metal viewer. It assembles any of the game's vehicles from
+  its `.DPC` archive (`--assemble QUAD_ROAD_2`) or shows single parts, with the
+  game's textures, materials, paint, liveries and dirt, lit by a modern renderer
+  (physically based shading, sun shadows, sky light and reflections). This is
+  the first native program in the port.
+- **`fuelscene`** lists the vehicle variants in an archive and prints how each
+  one is assembled.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: node hierarchy and assembled vehicles, skinning,
-the shader set translated to Metal, terrain and world streaming, then game
+Next steps, roughly in order: the rider and skinning, terrain and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
@@ -55,14 +58,20 @@ this step later.
 ```sh
 cmake -S . -B build
 cmake --build build
+./build/fuelview --assemble QUAD_ROAD_2             # a whole quad bike
+./build/fuelview --assemble TRUCK_OFF_1 CommonComponent/DATAS/TRUCK.DPC
+./build/fuelscene ~/Library/Application\ Support/FUEL/game/CommonComponent/DATAS/QUAD.DPC
 ./build/fuelview                                   # quad bike parts
 ./build/fuelview CommonComponent/DATAS/BUGGY.DPC   # any other archive
 ./build/fuelcheck ~/Library/Application\ Support/FUEL/game
 ```
 
 Viewer controls: drag to orbit, scroll or pinch to zoom, left/right arrows for
-the previous/next mesh (largest first), `C` back-face culling, `W` wireframe,
-`R` reset view, `Q` or Esc to quit.
+the previous/next variant (with `--assemble`) or mesh, `C` back-face culling,
+`W` wireframe, `D` dirt level, `G` ground, `R` reset view, `Q` or Esc to quit.
+
+The look need not match the original exactly: lighting and graphics use modern
+techniques driven by the game's own material data.
 
 Paint: `--vehicle NAME` (for example `QUAD_OFF_5`) paints the bodywork with
 that vehicle's palette and liveries, as set up in the game's `VehiclesDef.tsc`
