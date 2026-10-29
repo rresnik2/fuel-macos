@@ -301,6 +301,32 @@ struct AssemblyMode {
     }
 };
 
+// --drive: every drivable vehicle in the vehicle archives, for Tab switching.
+struct Garage {
+    std::vector<std::unique_ptr<AssemblyMode>> archives;  // one per vehicle DPC
+    std::vector<std::pair<size_t, size_t>> entries;       // (archive, variant)
+    size_t current = 0;
+    std::map<std::string, std::vector<float>> params;     // Param/VehiclesParam.tsc
+    const fuel::Heightfield* terrain = nullptr;
+
+    // Builds entry `i` at (x, z) facing `yaw`; nullptr (with a message) if it cannot drive.
+    std::unique_ptr<DriveSession> build(size_t i, double x, double z, float yaw) const {
+        AssemblyMode& am = *archives[entries[i].first];
+        am.index = entries[i].second;
+        const std::string name = am.variant().label;
+        try {
+            const auto it = params.find(name);
+            if (it == params.end()) throw std::runtime_error("no driving parameters");
+            const fuel::AssembledVehicle av = am.assembler->assemble(am.variant(), am.lod);
+            const fuel::VehicleSetup setup = fuel::makeVehicleSetup(am.assembler->dpc(), name, it->second, assembledHubs(av));
+            return std::make_unique<DriveSession>(av, setup, *terrain, x, z, yaw);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "fuelview: %s: %s\n", name.c_str(), e.what());
+            return nullptr;
+        }
+    }
+};
+
 MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
 
 void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> tex, const std::string& path) {
@@ -386,6 +412,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     AssemblyMode* _assembly;  // --assemble, else nullptr
     DriveSession* _drive;     // --drive, else nullptr
     WorldStreamer* _streamer; // --drive: the static world
+    Garage* _garage;          // --drive: vehicles to switch between
+    std::unique_ptr<DriveSession> _switched;  // a vehicle chosen with Tab
     std::set<unsigned short> _keys;
     double _lastTime;
     float _steer;             // smoothed keyboard steering
@@ -403,7 +431,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                         scene:(const SceneFile&)scene
                      assembly:(AssemblyMode*)assembly
                         drive:(DriveSession*)drive
-                     streamer:(WorldStreamer*)streamer {
+                     streamer:(WorldStreamer*)streamer
+                       garage:(Garage*)garage {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -416,6 +445,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _assembly = assembly;
         _drive = drive;
         _streamer = streamer;
+        _garage = garage;
         _lastTime = 0;
         _steer = 0;
         _camYawOffset = 0;
@@ -493,6 +523,29 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 - (void)keyUp:(NSEvent*)e { _keys.erase(e.keyCode); }
 
+// Swaps in the next drivable vehicle where the current one stands.
+- (void)switchVehicle:(int)dir {
+    const simd_float3 at = _drive->position();
+    const float heading = _drive->heading();
+    const size_t n = _garage->entries.size();
+    for (size_t tries = 0; tries < n; ++tries) {
+        _garage->current = (_garage->current + n + size_t(dir + int(n))) % n;
+        std::unique_ptr<DriveSession> next = _garage->build(_garage->current, at.x, at.z, heading);
+        if (!next) continue;
+        AssemblyMode& am = *_garage->archives[_garage->entries[_garage->current].first];
+        _switched = std::move(next);
+        _drive = _switched.get();
+        _scene.parts = _drive->parts();
+        _scene.variant = am.variant().label;
+        _look = am.look(_look);
+        _renderer->setPaint(_look.paint());
+        std::string err;
+        if (!_renderer->setScene(_scene.parts, &err) && !err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
+        if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics(), true);
+        return;
+    }
+}
+
 - (void)keyDown:(NSEvent*)e {
     if (_drive) {
         if ([self driveKey:e.keyCode]) {
@@ -501,6 +554,10 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         }
         if (e.keyCode == 15) {  // R
             _drive->reset();
+            return;
+        }
+        if (e.keyCode == 48 && _garage && !_garage->entries.empty()) {  // Tab / Shift-Tab: another vehicle
+            [self switchVehicle:(e.modifierFlags & NSEventModifierFlagShift) ? -1 : 1];
             return;
         }
     }
@@ -668,6 +725,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<AssemblyMode> assembly;
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<WorldStreamer> streamer;
+        std::unique_ptr<Garage> garage;
         if (opt.drive && opt.assemble.empty()) die("--drive needs --assemble VARIANT");
         if (!opt.assemble.empty()) {
             assembly = std::make_unique<AssemblyMode>();
@@ -726,6 +784,53 @@ int main(int argc, const char** argv) {
                 }
                 for (const auto& f : library.files()) lookup.push_back(f.get());
                 streamer = std::make_unique<WorldStreamer>(subs, lookup);
+                // Every vehicle archive's variants that have driving parameters.
+                garage = std::make_unique<Garage>();
+                garage->params = params;
+                garage->terrain = terrain.get();
+                for (const char* name : {"QUAD", "BIKE", "BUGGY", "MUSCLE", "SUV", "TRUCK", "VEH", "BONUS1"}) {
+                    const fs::path path = fs::path(opt.dataDir) / "CommonComponent/DATAS" / (std::string(name) + ".DPC");
+                    const fuel::DpcFile* dpc = nullptr;
+                    for (const auto& f : library.files())
+                        if (fs::equivalent(f->path(), path)) dpc = f.get();
+                    if (dpc == nullptr) {
+                        try {
+                            auto f = std::make_unique<fuel::DpcFile>(path.string());
+                            dpc = f.get();
+                            library.add(std::move(f));
+                        } catch (const std::exception&) {
+                            continue;
+                        }
+                    }
+                    auto am = std::make_unique<AssemblyMode>();
+                    am->assembler = std::make_unique<fuel::VehicleAssembler>(*dpc);
+                    am->palettes = assembly->palettes;
+                    am->lod = 1;
+                    for (size_t v = 0; v < am->assembler->variants().size(); ++v) {
+                        const std::string& label = am->assembler->variants()[v].label;
+                        if (params.count(label)) {
+                            if (dpc == &subject && label == assembly->variant().label) garage->current = garage->entries.size();
+                            garage->entries.push_back({garage->archives.size(), v});
+                        }
+                    }
+                    garage->archives.push_back(std::move(am));
+                }
+                std::printf("garage: %zu drivable variants (Tab to switch)\n", garage->entries.size());
+                if (std::getenv("FUEL_GARAGE_CHECK")) {  // build and drive every vehicle briefly
+                    int ok = 0;
+                    for (size_t i = 0; i < garage->entries.size(); ++i) {
+                        auto d = garage->build(i, -1000, -30000, 0);
+                        if (!d) continue;
+                        for (int k = 0; k < 180; ++k) d->update(1.0f / 60, {1.0f, 0, 0, false});
+                        const fuel::VehicleState st = d->state();
+                        const bool good = st.wheelsOnGround >= 2 && st.speedKmh > 15;
+                        ok += good;
+                        std::printf("  %-18s %5.1f km/h after 3 s, %d wheels down%s\n", garage->archives[garage->entries[i].first]->variant().label.c_str(),
+                                    st.speedKmh, st.wheelsOnGround, good ? "" : "  <-- check");
+                    }
+                    std::printf("garage check: %d of %zu drive\n", ok, garage->entries.size());
+                    return 0;
+                }
                 std::printf("world: %zu objects in %zu sub-worlds\n", streamer->placementCount(), subs.size());
             }
         } else {
@@ -809,7 +914,8 @@ int main(int argc, const char** argv) {
                                                    scene:scene
                                                 assembly:assembly.get()
                                                    drive:drive.get()
-                                                streamer:streamer.get()];
+                                                streamer:streamer.get()
+                                                  garage:garage.get()];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];

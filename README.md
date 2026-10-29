@@ -26,15 +26,17 @@ Early. What works today:
   gearbox, drive axles, collision shapes), plus arcade additions (air control,
   landing stabilisation, speed-sensitive steering, self-righting). Keys:
   W/S or Up/Down throttle and brake/reverse, A/D or Left/Right steer, Space
-  handbrake, R back on the wheels; gamepads work (stick, triggers, X handbrake,
-  Y reset). `fueldrive` runs a scripted drive without a window.
+  handbrake, R back on the wheels, Tab / Shift-Tab to switch to another of the
+  72 drivable vehicles (bikes, quads, buggies, cars, SUVs, trucks); gamepads
+  work (stick, triggers, X handbrake, Y reset). The world's 14,000 placed
+  objects stream in around you and are solid. `fueldrive` runs a scripted drive without a window.
 - **`fuelscene`** lists the vehicle variants in an archive and prints how each
   one is assembled.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: motorbikes, collisions with world objects, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
+Next steps, roughly in order: races and checkpoints, an on-screen HUD and sound, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
