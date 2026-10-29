@@ -1,16 +1,21 @@
 // fuelview: browse the meshes in a FUEL .DPC file with Metal.
 //
-//   fuelview [--data DIR] [--mesh ID | --scene FILE.json] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]
+//   fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json]
+//            [--vehicle NAME] [--livery N] [--color N | --paint R,G,B]
 //            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]
 //
 // DPC paths are relative to the game data directory (the folder that holds
 // CommonComponent/); the first one is browsed, the others only supply
 // textures and materials. Without --shot it opens a window:
-//   drag = orbit, scroll/pinch = zoom, left/right = previous/next mesh,
-//   C = back-face culling, W = wireframe, R = reset view, Q/Esc = quit,
-//   L = next livery, P = next palette colour (with --vehicle).
+//   drag = orbit, scroll/pinch = zoom, left/right = previous/next mesh
+//   (with --assemble: previous/next variant), C = back-face culling,
+//   W = wireframe, R = reset view, Q/Esc = quit,
+//   L = next livery, P = next palette colour (when a vehicle is painted).
+// --assemble VARIANT (for example QUAD_ROAD_2, or a GameObj_Z ID in hex)
+// builds that vehicle variant from the DPC (core/assembly.hpp) at LOD N
+// (default 1) and paints it with the variant's palette and liveries.
 // --vehicle NAME (for example QUAD_ALL_1) picks the vehicle whose palette and
-// liveries paint the bodywork; --livery 0 shows plain paint.
+// liveries paint the bodywork when browsing meshes; --livery 0 shows plain paint.
 // --scene loads an assembled vehicle exported by the reverse-engineering
 // tools (a JSON list of parts with mesh IDs and Direct3D row-major world
 // matrices); its variant name also selects the paint.
@@ -23,11 +28,15 @@
 
 #import "renderer.h"
 
+#include "core/assembly.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -46,6 +55,8 @@ struct Options {
     bool haveMeshId = false;
     std::string shot;
     std::string scene;
+    std::string assemble;
+    int lod = 1;
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
     bool cull = true;
@@ -113,6 +124,8 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--mesh") { o.meshId = uint32_t(std::stoul(next(), nullptr, 16)); o.haveMeshId = true; }
         else if (a == "--shot") o.shot = next();
         else if (a == "--scene") o.scene = next();
+        else if (a == "--assemble") o.assemble = next();
+        else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
         else if (a == "--yaw") o.yawDeg = std::stof(next());
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
@@ -121,11 +134,14 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--livery") o.livery = std::stoi(next());
         else if (a == "--color") o.color = std::stoi(next());
         else if (a == "--paint") { const std::string v = next(); if (std::sscanf(v.c_str(), "%d,%d,%d", &o.paint[0], &o.paint[1], &o.paint[2]) != 3) die("bad --paint"); o.havePaint = true; }
-        else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID | --scene FILE.json] [--vehicle NAME [--livery N] [--color N | --paint R,G,B]]\n"
+        else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json]\n"
+                                                         "                [--vehicle NAME] [--livery N] [--color N | --paint R,G,B]\n"
                                                          "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull]] [DPC ...]"); std::exit(0); }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.dpcs.push_back(a);
     }
+    if (!o.assemble.empty() && (!o.scene.empty() || o.haveMeshId)) die("--assemble cannot be combined with --scene or --mesh");
+    if (!o.assemble.empty() && !o.vehicle.empty()) die("with --assemble the paint follows the variant; drop --vehicle");
     if (o.dataDir.empty()) o.dataDir = defaultDataDir();
     if (o.dpcs.empty()) o.dpcs.push_back("CommonComponent/DATAS/QUAD.DPC");
     return o;
@@ -156,6 +172,26 @@ struct SceneFile {
     std::vector<fuel::MeshInstance> parts;
 };
 
+// Row-major row-vector (p * M) is the transpose of simd's column-vector form,
+// so the rows become simd columns.
+simd_float4x4 matrixFromRows(const float m[16]) {
+    return simd_matrix(simd_make_float4(m[0], m[1], m[2], m[3]), simd_make_float4(m[4], m[5], m[6], m[7]),
+                       simd_make_float4(m[8], m[9], m[10], m[11]), simd_make_float4(m[12], m[13], m[14], m[15]));
+}
+
+// The parts the game draws (placed meshes; not lights or unplaced group nodes).
+SceneFile sceneFromAssembly(const fuel::AssembledVehicle& v, const std::string& label) {
+    SceneFile sf;
+    sf.variant = label;
+    for (const fuel::PlacedPart& p : v.parts) {
+        if (!p.drawn()) continue;
+        float m[16];
+        for (int i = 0; i < 16; ++i) m[i] = float(p.world[size_t(i)]);
+        sf.parts.push_back({p.meshId, matrixFromRows(m)});
+    }
+    return sf;
+}
+
 SceneFile loadScene(const std::string& path) {
     NSData* data = [NSData dataWithContentsOfFile:@(path.c_str())];
     if (data == nil) die("cannot read " + path);
@@ -170,16 +206,69 @@ SceneFile loadScene(const std::string& path) {
         NSArray* m = part[@"world_matrix"];
         if (![meshId isKindOfClass:[NSString class]] || ![m isKindOfClass:[NSArray class]] || m.count != 16) continue;
         if ([kind hasSuffix:@"_unplaced"] || [kind hasPrefix:@"light"]) continue;
-        // Row-major row-vector (p * M) is the transpose of simd's column-vector
-        // form, so the file's rows become simd columns.
-        simd_float4 cols[4];
-        for (int r = 0; r < 4; ++r)
-            cols[r] = simd_make_float4([m[r * 4] floatValue], [m[r * 4 + 1] floatValue], [m[r * 4 + 2] floatValue], [m[r * 4 + 3] floatValue]);
-        sf.parts.push_back({uint32_t(std::stoul(meshId.UTF8String, nullptr, 16)), simd_matrix(cols[0], cols[1], cols[2], cols[3])});
+        float rows[16];
+        for (int i = 0; i < 16; ++i) rows[i] = [m[NSUInteger(i)] floatValue];
+        sf.parts.push_back({uint32_t(std::stoul(meshId.UTF8String, nullptr, 16)), matrixFromRows(rows)});
     }
     if (sf.parts.empty()) die("no drawable parts in " + path);
     return sf;
 }
+
+using Palettes = std::map<std::string, std::vector<fuel::Rgb8>>;
+
+Palettes loadPalettes(const std::string& dataDir) {
+    const fs::path tsc = fs::path(dataDir) / "LocalizedComponent/GameTsc/Story/VehiclesDef.tsc";
+    FILE* f = std::fopen(tsc.c_str(), "rb");
+    if (f == nullptr) return {};
+    std::string text;
+    char buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    std::fclose(f);
+    return fuel::parseVehicleColors(text);
+}
+
+// Palette and liveries of the vehicle whose name has CRC `nameCrc` (palette
+// names and livery tables are matched by CRC, so variants whose name the DPC
+// never spells out still find theirs). Livery and colour choices come from
+// `prefs`.
+VehicleLook makeLook(const std::string& label, uint32_t nameCrc, const Palettes& palettes, const fuel::DpcFile& subject,
+                     const VehicleLook& prefs) {
+    VehicleLook look = prefs;
+    look.name = label;
+    look.palette.clear();
+    for (const auto& [name, colors] : palettes)
+        if (fuel::asoboCrc(name) == nameCrc) {
+            look.palette = colors;
+            if (!label.empty() && label[0] == '?') look.name = name;
+            break;
+        }
+    if (look.palette.empty()) std::fprintf(stderr, "fuelview: warning: no palette for %s in VehiclesDef.tsc\n", label.c_str());
+    for (int i = 1; i <= 9; ++i) look.liveries[size_t(i)] = fuel::findLiveryTextures(subject, nameCrc, i);
+    if (look.liveries[1][0] == 0) std::fprintf(stderr, "fuelview: warning: no liveries for %s in %s\n", label.c_str(), subject.path().c_str());
+    return look;
+}
+
+// --assemble: the variants of the browsed DPC and the one shown.
+struct AssemblyMode {
+    std::unique_ptr<fuel::VehicleAssembler> assembler;
+    size_t index = 0;
+    int lod = 1;
+    Palettes palettes;
+
+    const fuel::VehicleVariant& variant() const { return assembler->variants()[index]; }
+    // Assembles the current variant; on failure the scene is empty and the reason is printed.
+    SceneFile scene() const {
+        try {
+            return sceneFromAssembly(assembler->assemble(variant(), lod), variant().label);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "fuelview: %s: %s\n", variant().label.c_str(), e.what());
+            return SceneFile{variant().label, {}};
+        }
+    }
+    VehicleLook look(const VehicleLook& prefs) const {
+        return makeLook(variant().label, variant().name, palettes, assembler->dpc(), prefs);
+    }
+};
 
 MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
 
@@ -261,6 +350,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     size_t _index;
     VehicleLook _look;
     SceneFile _scene;
+    bool _sceneMode;          // showing a scene file or an assembled variant
+    AssemblyMode* _assembly;  // --assemble, else nullptr
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -271,7 +362,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
                         start:(size_t)start
                        camera:(fuel::OrbitCamera)cam
                          look:(const VehicleLook&)look
-                        scene:(const SceneFile&)scene {
+                        scene:(const SceneFile&)scene
+                     assembly:(AssemblyMode*)assembly {
     if ((self = [super initWithFrame:frame device:device])) {
         _renderer = renderer;
         _meshes = meshes;
@@ -281,6 +373,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _index = start;
         _look = look;
         _scene = scene;
+        _assembly = assembly;
+        _sceneMode = assembly != nullptr || !scene.parts.empty();
         self.colorPixelFormat = kColorFormat;
         self.depthStencilPixelFormat = kDepthFormat;
         self.sampleCount = kSamples;
@@ -293,10 +387,14 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 - (BOOL)acceptsFirstResponder { return YES; }
 
 - (void)updateTitle {
-    if (!_scene.parts.empty()) {
-        self.window.title = [NSString stringWithFormat:@"FUEL viewer — %s — %zu parts — %u triangles%s",
-                                                       _scene.variant.c_str(), _scene.parts.size(), _renderer->triangleCount(),
-                                                       _look.describe().c_str()];
+    if (_sceneMode) {
+        std::string where;
+        if (_assembly)
+            where = _fileName + " — variant " + std::to_string(_assembly->index + 1) + "/" +
+                    std::to_string(_assembly->assembler->variants().size()) + " LOD" + std::to_string(_assembly->lod) + " — ";
+        self.window.title = [NSString stringWithFormat:@"FUEL viewer — %s%s — %zu parts — %u triangles%s",
+                                                       where.c_str(), _scene.variant.c_str(), _scene.parts.size(),
+                                                       _renderer->triangleCount(), _look.describe().c_str()];
         return;
     }
     const MeshEntry& m = (*_meshes)[_index];
@@ -310,8 +408,8 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 - (void)showMesh:(size_t)index {
     _index = index;
     std::string err;
-    if (!_scene.parts.empty()) {
-        if (!_renderer->setScene(_scene.parts, &err) || !err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
+    if (_sceneMode) {
+        if (!_renderer->setScene(_scene.parts, &err) || !err.empty()) std::fprintf(stderr, "fuelview: %s: %s\n", _scene.variant.c_str(), err.c_str());
         [self updateTitle];
         return;
     }
@@ -319,11 +417,30 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     [self updateTitle];
 }
 
+// Assembles another variant of the DPC and paints it with its own palette
+// and liveries (keeping the chosen livery and colour numbers).
+- (void)showVariant:(size_t)index {
+    _assembly->index = index;
+    _scene = _assembly->scene();
+    _look = _assembly->look(_look);
+    _renderer->setPaint(_look.paint());
+    [self showMesh:0];
+}
+
+- (void)step:(bool)forward {
+    if (_assembly) {
+        const size_t n = _assembly->assembler->variants().size();
+        [self showVariant:forward ? (_assembly->index + 1) % n : (_assembly->index + n - 1) % n];
+    } else if (!_sceneMode) {
+        const size_t n = _meshes->size();
+        [self showMesh:forward ? (_index + 1) % n : (_index + n - 1) % n];
+    }
+}
+
 - (void)keyDown:(NSEvent*)e {
-    const size_t n = _scene.parts.empty() ? _meshes->size() : 1;
     switch (e.keyCode) {
-        case 123: [self showMesh:(_index + n - 1) % n]; return;  // left
-        case 124: [self showMesh:(_index + 1) % n]; return;      // right
+        case 123: [self step:false]; return;  // left
+        case 124: [self step:true]; return;   // right
         case 126: _cam.distance = std::max(0.4f, _cam.distance / 1.15f); return;  // up
         case 125: _cam.distance = std::min(20.0f, _cam.distance * 1.15f); return; // down
         case 53: [NSApp terminate:nil]; return;                   // esc
@@ -397,14 +514,17 @@ int main(int argc, const char** argv) {
             }
         }
         const fuel::DpcFile& subject = *library.files().front();
-        std::vector<MeshEntry> meshes = listMeshes(subject);
-        if (meshes.empty()) die("no drawable meshes in " + subject.path());
-
+        // Browsing meshes needs the list of drawable meshes; an assembled vehicle does not.
+        std::vector<MeshEntry> meshes;
         size_t start = 0;
-        if (opt.haveMeshId) {
-            auto it = std::find_if(meshes.begin(), meshes.end(), [&](const MeshEntry& m) { return m.id == opt.meshId; });
-            if (it == meshes.end()) die("mesh not found or not drawable");
-            start = size_t(it - meshes.begin());
+        if (opt.assemble.empty()) {
+            meshes = listMeshes(subject);
+            if (meshes.empty()) die("no drawable meshes in " + subject.path());
+            if (opt.haveMeshId) {
+                auto it = std::find_if(meshes.begin(), meshes.end(), [&](const MeshEntry& m) { return m.id == opt.meshId; });
+                if (it == meshes.end()) die("mesh not found or not drawable");
+                start = size_t(it - meshes.begin());
+            }
         }
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -413,33 +533,50 @@ int main(int argc, const char** argv) {
         fuel::MeshRenderer renderer(device, kColorFormat, kDepthFormat, kSamples, library);
         renderer.cullBackFaces = opt.cull;
 
-        SceneFile scene;
-        if (!opt.scene.empty()) scene = loadScene(opt.scene);
-        const std::string vehicle = !opt.vehicle.empty() ? opt.vehicle : scene.variant;
-
-        VehicleLook look;
-        if (!vehicle.empty()) {
-            look.name = vehicle;
-            const fs::path tsc = fs::path(opt.dataDir) / "LocalizedComponent/GameTsc/Story/VehiclesDef.tsc";
-            if (FILE* f = std::fopen(tsc.c_str(), "rb")) {
-                std::string text;
-                char buf[65536];
-                for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
-                std::fclose(f);
-                const auto colors = fuel::parseVehicleColors(text);
-                if (auto it = colors.find(vehicle); it != colors.end()) look.palette = it->second;
-            }
-            if (look.palette.empty()) std::fprintf(stderr, "fuelview: warning: no palette for %s in VehiclesDef.tsc\n", vehicle.c_str());
-            for (int i = 1; i <= 9; ++i) look.liveries[size_t(i)] = fuel::findLiveryTextures(subject, vehicle, i);
-            if (look.liveries[1][0] == 0) std::fprintf(stderr, "fuelview: warning: no liveries for %s in %s\n", vehicle.c_str(), subject.path().c_str());
-            look.livery = std::clamp(opt.livery, 0, 9);
-            look.color = std::max(0, opt.color);
-            if (opt.havePaint) {
-                look.custom = true;
-                look.customColor = simd_make_float3(opt.paint[0], opt.paint[1], opt.paint[2]) / 255.0f;
-            }
-            renderer.setPaint(look.paint());
+        VehicleLook prefs;
+        prefs.livery = std::clamp(opt.livery, 0, 9);
+        prefs.color = std::max(0, opt.color);
+        if (opt.havePaint) {
+            prefs.custom = true;
+            prefs.customColor = simd_make_float3(opt.paint[0], opt.paint[1], opt.paint[2]) / 255.0f;
         }
+
+        SceneFile scene;
+        VehicleLook look;
+        std::unique_ptr<AssemblyMode> assembly;
+        if (!opt.assemble.empty()) {
+            assembly = std::make_unique<AssemblyMode>();
+            try {
+                assembly->assembler = std::make_unique<fuel::VehicleAssembler>(subject);
+            } catch (const std::exception& e) {
+                die(e.what());
+            }
+            const auto& variants = assembly->assembler->variants();
+            const fuel::VehicleVariant* v = assembly->assembler->find(opt.assemble);
+            if (v == nullptr) {
+                std::string list;
+                for (const fuel::VehicleVariant& x : variants) list += " " + x.label;
+                die("no variant '" + opt.assemble + "' in " + subject.path() + (variants.empty() ? std::string(" (it has none)") : "; it has:" + list));
+            }
+            assembly->index = size_t(v - variants.data());
+            assembly->lod = opt.lod;
+            assembly->palettes = loadPalettes(opt.dataDir);
+            scene = assembly->scene();
+            look = assembly->look(prefs);
+            renderer.setPaint(look.paint());
+        } else {
+            if (!opt.scene.empty()) scene = loadScene(opt.scene);
+            const std::string vehicle = !opt.vehicle.empty() ? opt.vehicle : scene.variant;
+            if (!vehicle.empty()) {
+                // Unknown names appear as "?<crc>" in scene files.
+                uint32_t crc = fuel::asoboCrc(vehicle);
+                if (vehicle.size() == 9 && vehicle[0] == '?' && vehicle.find_first_not_of("0123456789abcdef", 1) == std::string::npos)
+                    crc = uint32_t(std::stoul(vehicle.substr(1), nullptr, 16));
+                look = makeLook(vehicle, crc, loadPalettes(opt.dataDir), subject, prefs);
+                renderer.setPaint(look.paint());
+            }
+        }
+        const bool sceneMode = assembly != nullptr || !scene.parts.empty();
 
         fuel::OrbitCamera cam;
         cam.yaw = opt.yawDeg * float(M_PI) / 180.0f;
@@ -447,8 +584,8 @@ int main(int argc, const char** argv) {
 
         if (!opt.shot.empty()) {
             std::string err;
-            if (!scene.parts.empty()) {
-                if (!renderer.setScene(scene.parts, &err)) die(err);
+            if (sceneMode) {
+                if (!renderer.setScene(scene.parts, &err)) die(scene.variant + ": " + err);
                 if (!err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
                 renderShot(device, renderer, opt, cam);
                 std::printf("wrote %s: %s, %zu parts, %u triangles\n", opt.shot.c_str(), scene.variant.c_str(), scene.parts.size(), renderer.triangleCount());
@@ -479,7 +616,8 @@ int main(int argc, const char** argv) {
                                                    start:start
                                                   camera:cam
                                                     look:look
-                                                   scene:scene];
+                                                   scene:scene
+                                                assembly:assembly.get()];
         window.contentView = view;
         [window center];
         [window makeKeyAndOrderFront:nil];

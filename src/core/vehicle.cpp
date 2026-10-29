@@ -41,8 +41,11 @@ std::map<std::string, std::vector<Rgb8>> parseVehicleColors(const std::string& t
 uint32_t liveryMaterialName(int lod) { return asoboCrc("LIVERY_XX_LOD" + std::to_string(lod)); }
 
 std::array<uint32_t, 3> findLiveryTextures(const DpcFile& dpc, const std::string& vehicle, int index) {
+    return findLiveryTextures(dpc, asoboCrc(vehicle), index);
+}
+
+std::array<uint32_t, 3> findLiveryTextures(const DpcFile& dpc, uint32_t key, int index) {
     std::array<uint32_t, 3> tex{};
-    const uint32_t key = asoboCrc(vehicle);
     // MaterialObj_Z body: u32 groupCount; per group {u32 key = CRC(vehicle); u32 n; u32 MaterialAnim_Z[n]}.
     for (uint32_t libId : dpc.ids(cls::MaterialObj)) {
         try {
