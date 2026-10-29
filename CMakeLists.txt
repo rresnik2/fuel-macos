@@ -18,6 +18,7 @@ add_library(fuelcore STATIC
   src/core/resources.cpp
   src/core/vehicle.cpp
   src/core/world.cpp
+  src/core/terrain.cpp
   src/core/assembly.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
@@ -40,3 +41,7 @@ target_link_libraries(fuelview PRIVATE fuelcore
   "-framework Cocoa" "-framework Metal" "-framework MetalKit"
   "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics"
   "-framework UniformTypeIdentifiers")
+
+# Decodes the world heightfield and checks it against a reference export.
+add_executable(fuelterrain src/tools/fuelterrain.cpp)
+target_link_libraries(fuelterrain PRIVATE fuelcore)

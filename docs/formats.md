@@ -114,3 +114,21 @@ uv1 at 28.
 Right-handed, y up, metres. With right-handed view and projection matrices
 (clip z in 0..1), text on textures reads correctly and front faces wind
 clockwise on screen, which is Direct3D 9's default culling.
+
+## World and terrain
+
+`WORLD/USA1.DPC` is the world: metres, y up, about 140 km square centred on
+the origin. Its GenWorld_Z body starts `u32, u32, u32 road graph, u32 n,
+u32 Binary_Z map[n]`; map 0 is the heightfield: 4668x4668 12-bit samples
+about 30 m apart (`x = (col - 2334) * 140000 / 4668`, same for rows and z),
+10000 m for the full value range (2.44 m per step). The Binary_Z body is
+`u32 size`, a header (`u32 width, u32 height, f32, i32, f32 maxValue`), then
+`u32 nA, u32 K`, block data and one u32 per 4x4 block: bits 0-11 a base
+value, bits 12-31 a block index. Blocks below nA store sixteen 4-bit offsets
+(8 bytes at 8 + 8*index from the start of `nA`), the others sixteen byte
+offsets (16 bytes at 16*index + 8 - 8*nA). The engine smooths heights with a
+cubic B-spline and adds procedural detail at run time.
+
+The 82 `USA1_*.DPC` sub-worlds (courses, hubs, dressing sets) hold only
+Node_Z placements whose world matrices are final; their meshes live in
+USA1.DPC. WorldRef_Z objects in USA1 give each sub-world's bounds.

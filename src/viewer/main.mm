@@ -2,7 +2,7 @@
 //
 //   fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json | --world]
 //            [--vehicle NAME] [--livery N] [--color N | --paint R,G,B]
-//            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull] [--dirt 0..1]] [DPC ...]
+//            [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--distance RADII] [--no-cull] [--dirt 0..1]] [DPC ...]
 //
 // DPC paths are relative to the game data directory (the folder that holds
 // CommonComponent/); the first one is browsed, the others only supply
@@ -11,7 +11,8 @@
 //   (with --assemble: previous/next variant), C = back-face culling,
 //   W = wireframe, R = reset view, Q/Esc = quit,
 //   L = next livery, P = next palette colour (when a vehicle is painted),
-//   D = dirt level, G = ground.
+//   D = dirt level, G = ground or terrain.
+// --terrain draws the world heightfield; --at X,Z (metres) stands the vehicle on it there.
 // --assemble VARIANT (for example QUAD_ROAD_2, or a GameObj_Z ID in hex)
 // builds that vehicle variant from the DPC (core/assembly.hpp) at LOD N
 // (default 1) and paints it with the variant's palette and liveries.
@@ -28,6 +29,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #import "renderer.h"
+#include "core/terrain.hpp"
 #include "core/world.hpp"
 
 #include "core/assembly.hpp"
@@ -46,6 +48,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
+simd_float4x4 matrix_from_translation(float x, float y, float z) {
+    simd_float4x4 m = matrix_identity_float4x4;
+    m.columns[3] = simd_make_float4(x, y, z, 1);
+    return m;
+}
+
 constexpr MTLPixelFormat kColorFormat = fuel::kRenderColorFormat;
 constexpr MTLPixelFormat kDepthFormat = fuel::kRenderDepthFormat;
 constexpr NSUInteger kSamples = 4;
@@ -58,10 +66,14 @@ struct Options {
     std::string shot;
     std::string scene;
     bool world = false;
+    bool terrain = false;
+    bool haveAt = false;
+    float atX = 0, atZ = 0;
     std::string assemble;
     int lod = 1;
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
+    float distance = 0;
     bool cull = true;
     float dirt = 0.0f;
     std::string vehicle;
@@ -129,11 +141,14 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--shot") o.shot = next();
         else if (a == "--scene") o.scene = next();
         else if (a == "--world") o.world = true;
+        else if (a == "--terrain") o.terrain = true;
+        else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
         else if (a == "--yaw") o.yawDeg = std::stof(next());
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
+        else if (a == "--distance") o.distance = std::stof(next());
         else if (a == "--no-cull") o.cull = false;
         else if (a == "--dirt") o.dirt = std::stof(next());
         else if (a == "--vehicle") o.vehicle = next();
@@ -142,7 +157,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--paint") { const std::string v = next(); if (std::sscanf(v.c_str(), "%d,%d,%d", &o.paint[0], &o.paint[1], &o.paint[2]) != 3) die("bad --paint"); o.havePaint = true; }
         else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json]\n"
                                                          "                [--vehicle NAME] [--livery N] [--color N | --paint R,G,B]\n"
-                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--no-cull] [--dirt 0..1]] [DPC ...]"); std::exit(0); }
+                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--distance RADII] [--no-cull] [--dirt 0..1]] [DPC ...]"); std::exit(0); }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.dpcs.push_back(a);
     }
@@ -449,7 +464,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         case 123: [self step:false]; return;  // left
         case 124: [self step:true]; return;   // right
         case 126: _cam.distance = std::max(0.4f, _cam.distance / 1.15f); return;  // up
-        case 125: _cam.distance = std::min(20.0f, _cam.distance * 1.15f); return; // down
+        case 125: _cam.distance = std::min(3000.0f, _cam.distance * 1.15f); return; // down
         case 53: [NSApp terminate:nil]; return;                   // esc
         default: break;
     }
@@ -458,7 +473,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     else if ([ch isEqualToString:@"w"]) _renderer->wireframe = !_renderer->wireframe;
     else if ([ch isEqualToString:@"r"]) _cam = fuel::OrbitCamera{};
     else if ([ch isEqualToString:@"d"]) _renderer->dirt = _renderer->dirt >= 1.0f ? 0.0f : _renderer->dirt + 0.5f;
-    else if ([ch isEqualToString:@"g"]) _renderer->showGround = !_renderer->showGround;
+    else if ([ch isEqualToString:@"g"]) { _renderer->showGround = !_renderer->showGround; _renderer->showTerrain = !_renderer->showTerrain; }
     else if ([ch isEqualToString:@"q"]) [NSApp terminate:nil];
     else if (!_look.name.empty() && ([ch isEqualToString:@"l"] || [ch isEqualToString:@"p"])) {
         if ([ch isEqualToString:@"l"]) _look.livery = (_look.livery + 1) % 10;
@@ -476,11 +491,11 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 }
 
 - (void)scrollWheel:(NSEvent*)e {
-    _cam.distance = std::clamp(_cam.distance * std::exp(-float(e.scrollingDeltaY) * (e.hasPreciseScrollingDeltas ? 0.01f : 0.1f)), 0.4f, 20.0f);
+    _cam.distance = std::clamp(_cam.distance * std::exp(-float(e.scrollingDeltaY) * (e.hasPreciseScrollingDeltas ? 0.01f : 0.1f)), 0.4f, 3000.0f);
 }
 
 - (void)magnifyWithEvent:(NSEvent*)e {
-    _cam.distance = std::clamp(_cam.distance / (1.0f + float(e.magnification)), 0.4f, 20.0f);
+    _cam.distance = std::clamp(_cam.distance / (1.0f + float(e.magnification)), 0.4f, 3000.0f);
 }
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
@@ -546,6 +561,18 @@ int main(int argc, const char** argv) {
         fuel::MeshRenderer renderer(device, kSamples, library);
         renderer.cullBackFaces = opt.cull;
         renderer.dirt = std::clamp(opt.dirt, 0.0f, 1.0f);
+        if (opt.terrain) {
+            const fs::path world = fs::path(opt.dataDir) / "CommonComponent/WORLD/USA1.DPC";
+            try {
+                fuel::DpcFile usa1(world.string());
+                const fuel::Heightfield hf = fuel::loadWorldHeightfield(usa1);
+                renderer.setTerrain(hf);
+                if (opt.haveAt && !opt.world)
+                    renderer.placement = matrix_from_translation(opt.atX, hf.heightAt(opt.atX, opt.atZ), opt.atZ);
+            } catch (const std::exception& e) {
+                die(std::string("terrain: ") + e.what());
+            }
+        }
 
         VehicleLook prefs;
         prefs.livery = std::clamp(opt.livery, 0, 9);
@@ -608,6 +635,7 @@ int main(int argc, const char** argv) {
         fuel::OrbitCamera cam;
         cam.yaw = opt.yawDeg * float(M_PI) / 180.0f;
         cam.pitch = opt.pitchDeg * float(M_PI) / 180.0f;
+        if (opt.distance > 0) cam.distance = opt.distance;
 
         if (!opt.shot.empty()) {
             std::string err;

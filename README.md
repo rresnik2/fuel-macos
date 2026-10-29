@@ -17,13 +17,17 @@ Early. What works today:
   game's textures, materials, paint, liveries and dirt, lit by a modern renderer
   (physically based shading, sun shadows, sky light and reflections). This is
   the first native program in the port.
+- **Terrain**: `--terrain` draws FUEL's 140 km world heightfield (decoded from
+  the game's data) with a modern GPU terrain renderer, sky and haze;
+  `--at X,Z` stands the vehicle on it. `--world` draws a world archive's
+  placed objects. `fuelterrain` decodes and checks the heightfield.
 - **`fuelscene`** lists the vehicle variants in an archive and prints how each
   one is assembled.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: the rider and skinning, terrain and world streaming, then game
+Next steps, roughly in order: ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
@@ -61,6 +65,7 @@ cmake --build build
 ./build/fuelview --assemble QUAD_ROAD_2             # a whole quad bike
 ./build/fuelview --assemble TRUCK_OFF_1 CommonComponent/DATAS/TRUCK.DPC
 ./build/fuelscene ~/Library/Application\ Support/FUEL/game/CommonComponent/DATAS/QUAD.DPC
+./build/fuelview --assemble QUAD_ROAD_2 --at -1000,-30000   # on the terrain
 ./build/fuelview                                   # quad bike parts
 ./build/fuelview CommonComponent/DATAS/BUGGY.DPC   # any other archive
 ./build/fuelcheck ~/Library/Application\ Support/FUEL/game

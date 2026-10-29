@@ -30,11 +30,15 @@ struct VertexIn {
 struct FrameUniforms {
     float4x4 viewProj;
     float4x4 sunViewProj;
+    float4x4 invViewProj;
     float4 sunDir;        // xyz towards the sun, w intensity
     float4 paint;         // linear rgb
     float4 eye;           // camera position
     float4 params;        // x dirt, y exposure, z ground height, w ground radius
     float4 footprint;     // xy scene centre (x, z), zw half extents
+    float4 terrain;       // origin x, origin z, sample spacing, metres per texel value 1.0
+    float4 terrainGrid;   // grid centre x, z, radius, vertices per side
+    float4 fog;           // x haze density per metre (0 = none)
 };
 
 struct MaterialUniforms {
@@ -81,6 +85,13 @@ float3 skyColor(float3 d) {
 
 float3 tonemap(float3 x) {  // ACES fit (Narkowicz)
     return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+}
+
+float3 haze(float3 rgb, float3 world, constant FrameUniforms& f) {
+    if (f.fog.x <= 0.0) return rgb;
+    float3 d = world - f.eye.xyz;
+    float k = 1.0 - exp(-length(d) * f.fog.x);
+    return mix(rgb, skyColor(normalize(float3(d.x, max(d.y, 0.0) * 0.3, d.z))) * 1.4, k);
 }
 
 // Sun (GGX highlight, shadowed), hemispheric sky light and sky reflections.
@@ -179,7 +190,7 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     float shadow = shadowFactor(shadowMap, in.sunPos);
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(c.rgb, N, V, ao, shadow, specStrength, rough, m.fresnel, (m.features & Reflective) != 0, f);
-    return float4(tonemap((rgb + m.emissive.rgb) * f.params.y), alpha);
+    return float4(tonemap(haze(rgb + m.emissive.rgb, in.world, f) * f.params.y), alpha);
 }
 
 struct GroundOut {
@@ -209,17 +220,118 @@ fragment float4 fsGround(GroundOut in [[stage_in]], constant FrameUniforms& f [[
     float fade = smoothstep(1.0, 0.55, length(rel) / f.params.w);
     return float4(tonemap(rgb * f.params.y), fade);
 }
+
+constexpr sampler heightSampler(coord::normalized, filter::linear, address::clamp_to_edge);
+
+// Heights are 12-bit (2.4 m steps) on a 30 m grid; like the original engine,
+// smooth them with a cubic B-spline (four bilinear taps).
+float terrainHeight(texture2d<float> hm, float2 xz, constant FrameUniforms& f) {
+    float2 size = float2(hm.get_width(), hm.get_height());
+    float2 t = (xz - f.terrain.xy) / f.terrain.z;
+    float2 i = floor(t), a = t - i;
+    float2 w0 = (1.0 - a) * (1.0 - a) * (1.0 - a) / 6.0;
+    float2 w1 = (4.0 - 6.0 * a * a + 3.0 * a * a * a) / 6.0;
+    float2 w3 = a * a * a / 6.0;
+    float2 w2 = 1.0 - w0 - w1 - w3;
+    float2 g0 = w0 + w1, g1 = w2 + w3;
+    float2 p0 = (i - 1.0 + w1 / g0 + 0.5) / size, p1 = (i + 1.0 + w3 / g1 + 0.5) / size;
+    float h = g0.y * (g0.x * hm.sample(heightSampler, float2(p0.x, p0.y), level(0)).r +
+                      g1.x * hm.sample(heightSampler, float2(p1.x, p0.y), level(0)).r) +
+              g1.y * (g0.x * hm.sample(heightSampler, float2(p0.x, p1.y), level(0)).r +
+                      g1.x * hm.sample(heightSampler, float2(p1.x, p1.y), level(0)).r);
+    return h * f.terrain.w;
+}
+
+float hash12(float2 p) {
+    float3 p3 = fract(float3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float valueNoise(float2 p) {
+    float2 i = floor(p), u = fract(p);
+    u = u * u * (3.0 - 2.0 * u);
+    return mix(mix(hash12(i), hash12(i + float2(1, 0)), u.x), mix(hash12(i + float2(0, 1)), hash12(i + float2(1, 1)), u.x), u.y);
+}
+
+struct TerrainOut {
+    float4 position [[position]];
+    float3 world;
+    float4 sunPos;
+};
+
+// One grid around the camera target whose spacing grows with the square of
+// the distance from the centre: dense up close, coarse at the horizon.
+vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[buffer(1)]],
+                            texture2d<float> hm [[texture(0)]]) {
+    uint n = uint(f.terrainGrid.w);
+    float2 q = float2(vid % n, vid / n) / float(n - 1) * 2.0 - 1.0;
+    float2 xz = f.terrainGrid.xy + q * abs(q) * f.terrainGrid.z;
+    float3 w = float3(xz.x, terrainHeight(hm, xz, f), xz.y);
+    TerrainOut o;
+    o.position = f.viewProj * float4(w, 1.0);
+    o.world = w;
+    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    return o;
+}
+
+fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
+                          texture2d<float> hm [[texture(0)]], depth2d<float> shadowMap [[texture(7)]]) {
+    float e = f.terrain.z;
+    float2 xz = in.world.xz;
+    float hl = terrainHeight(hm, xz - float2(e, 0), f), hr = terrainHeight(hm, xz + float2(e, 0), f);
+    float hd = terrainHeight(hm, xz - float2(0, e), f), hu = terrainHeight(hm, xz + float2(0, e), f);
+    float3 N = normalize(float3(hl - hr, 2.0 * e, hd - hu));
+    float slope = 1.0 - N.y;
+    float n = valueNoise(xz * 0.004) * 0.6 + valueNoise(xz * 0.03) * 0.3 + valueNoise(xz * 0.25) * 0.1;
+    // Procedural surface: grass and dry ground by altitude, rock on steep slopes, snow up high.
+    float3 grass = float3(0.035, 0.060, 0.018), dry = float3(0.11, 0.085, 0.045);
+    float3 rock = float3(0.10, 0.092, 0.085), snow = float3(0.80, 0.82, 0.86);
+    float3 c = mix(grass, dry, saturate(n * 0.9 + (in.world.y - 1500.0) / 1800.0));
+    c = mix(c, rock, smoothstep(0.16, 0.32, slope + (n - 0.5) * 0.08));
+    c = mix(c, snow, smoothstep(3100.0, 3500.0, in.world.y + n * 300.0) * (1.0 - smoothstep(0.35, 0.6, slope)));
+    float shadow = shadowFactor(shadowMap, in.sunPos);
+    float3 V = normalize(f.eye.xyz - in.world);
+    float3 rgb = lighting(c, N, V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
+    return float4(tonemap(haze(rgb, in.world, f) * f.params.y), 1.0);
+}
+
+struct SkyOut {
+    float4 position [[position]];
+    float2 ndc;
+};
+
+vertex SkyOut vsSky(uint vid [[vertex_id]]) {
+    const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    SkyOut o;
+    o.position = float4(p[vid], 1.0, 1.0);
+    o.ndc = p[vid];
+    return o;
+}
+
+fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]]) {
+    float4 w = f.invViewProj * float4(in.ndc, 1.0, 1.0);
+    float3 dir = normalize(w.xyz / w.w - f.eye.xyz);
+    float3 c = skyColor(dir) * 1.4 + float3(1.0, 0.9, 0.7) * pow(saturate(dot(dir, normalize(f.sunDir.xyz))), 800.0) * 30.0;
+    return float4(tonemap(c * f.params.y), 1.0);
+}
 )METAL";
 
 struct FrameUniforms {
     simd_float4x4 viewProj;
     simd_float4x4 sunViewProj;
+    simd_float4x4 invViewProj;
     simd_float4 sunDir;
     simd_float4 paint;
     simd_float4 eye;
     simd_float4 params;
     simd_float4 footprint;
+    simd_float4 terrain;
+    simd_float4 terrainGrid;
+    simd_float4 fog;
 };
+
+constexpr uint32_t kTerrainGridSize = 512;  // vertices per side
 
 struct MaterialUniforms {
     simd_float4 diffuse;
@@ -368,7 +480,48 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     groundPipeline_ = [device newRenderPipelineStateWithDescriptor:gd error:&err];
     if (groundPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", err];
 
+    auto makeSimple = [&](NSString* vs, NSString* fs) {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [shaders_ newFunctionWithName:vs];
+        d.fragmentFunction = [shaders_ newFunctionWithName:fs];
+        d.rasterSampleCount = sampleCount_;
+        d.colorAttachments[0].pixelFormat = kRenderColorFormat;
+        d.depthAttachmentPixelFormat = kRenderDepthFormat;
+        NSError* e = nil;
+        id<MTLRenderPipelineState> ps = [device newRenderPipelineStateWithDescriptor:d error:&e];
+        if (ps == nil) [NSException raise:@"pipeline" format:@"%@", e];
+        return ps;
+    };
+    terrainPipeline_ = makeSimple(@"vsTerrain", @"fsTerrain");
+    skyPipeline_ = makeSimple(@"vsSky", @"fsSky");
+    ds.depthCompareFunction = MTLCompareFunctionAlways;
+    ds.depthWriteEnabled = NO;
+    depthAlways_ = [device newDepthStencilStateWithDescriptor:ds];
+
     sunDir_ = simd_normalize(simd_make_float3(0.55f, 0.80f, 0.45f));
+}
+
+void MeshRenderer::setTerrain(const Heightfield& hf) {
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Unorm
+                                                                                    width:hf.width
+                                                                                   height:hf.height
+                                                                                mipmapped:NO];
+    heightTex_ = [device_ newTextureWithDescriptor:td];
+    [heightTex_ replaceRegion:MTLRegionMake2D(0, 0, hf.width, hf.height) mipmapLevel:0 withBytes:hf.raw.data() bytesPerRow:hf.width * 2];
+    terrainData_ = hf;
+    terrainInfo_ = simd_make_float4(hf.originX, hf.originZ, hf.spacing, hf.metresPerUnit * 65535.0f);
+    if (terrainIndices_ == nil) {
+        std::vector<uint32_t> idx;
+        const uint32_t n = kTerrainGridSize;
+        idx.reserve(size_t(n - 1) * (n - 1) * 6);
+        for (uint32_t r = 0; r + 1 < n; ++r)
+            for (uint32_t c = 0; c + 1 < n; ++c) {
+                const uint32_t a = r * n + c, b = a + 1, d = a + n, e = d + 1;
+                idx.insert(idx.end(), {a, b, d, b, e, d});
+            }
+        terrainIndices_ = [device_ newBufferWithBytes:idx.data() length:idx.size() * 4 options:MTLResourceStorageModeShared];
+        terrainIndexCount_ = uint32_t(idx.size());
+    }
 }
 
 id<MTLRenderPipelineState> MeshRenderer::pipeline(uint32_t stride, AlphaMode mode) {
@@ -615,13 +768,14 @@ bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::str
             continue;
         }
         if (gm->indices == nil) continue;
-        instances_.push_back({gm, in.world});
+        const simd_float4x4 world = simd_mul(placement, in.world);
+        instances_.push_back({gm, world});
         triangles_ += gm->triangles;
         for (int c = 0; c < 8; ++c) {
             const simd_float3 corner = simd_make_float3((c & 1) ? gm->boundsMax.x : gm->boundsMin.x,
                                                         (c & 2) ? gm->boundsMax.y : gm->boundsMin.y,
                                                         (c & 4) ? gm->boundsMax.z : gm->boundsMin.z);
-            const simd_float4 w = simd_mul(in.world, simd_make_float4(corner, 1.0f));
+            const simd_float4 w = simd_mul(world, simd_make_float4(corner, 1.0f));
             lo = simd_min(lo, w.xyz);
             hi = simd_max(hi, w.xyz);
         }
@@ -677,12 +831,20 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
 void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam) {
     if (instances_.empty()) return;
     const float dist = cam.distance * radius_;
-    const simd_float3 eye = center_ + dist * simd_make_float3(std::cos(cam.pitch) * std::sin(cam.yaw), std::sin(cam.pitch),
-                                                              std::cos(cam.pitch) * std::cos(cam.yaw));
+    simd_float3 eye = center_ + dist * simd_make_float3(std::cos(cam.pitch) * std::sin(cam.yaw), std::sin(cam.pitch),
+                                                        std::cos(cam.pitch) * std::cos(cam.yaw));
+    if (showTerrain && !terrainData_.raw.empty())  // keep the camera above the ground
+        eye.y = std::max(eye.y, terrainData_.heightAt(eye.x, eye.z) + std::max(1.5f, radius_ * 0.3f));
     FrameUniforms fu;
-    fu.viewProj = simd_mul(perspectiveRH(0.70f, aspect, radius_ * 0.02f, radius_ * 40.0f),
-                           lookAtRH(eye, center_, simd_make_float3(0, 1, 0)));
+    const bool terrain = showTerrain && heightTex_ != nil;
+    const float zn = terrain ? std::max(0.05f, dist * 0.02f) : radius_ * 0.02f;
+    const float zf = terrain ? std::max(120000.0f, dist * 4.0f) : radius_ * 40.0f;
+    fu.viewProj = simd_mul(perspectiveRH(0.70f, aspect, zn, zf), lookAtRH(eye, center_, simd_make_float3(0, 1, 0)));
+    fu.invViewProj = simd_inverse(fu.viewProj);
     fu.sunViewProj = sunViewProj();
+    fu.terrain = terrainInfo_;
+    fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
+    fu.fog = simd_make_float4(terrain ? 1.0f / 16000.0f : 0.0f, 0, 0, 0);
     fu.sunDir = simd_make_float4(sunDir_, 3.0f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
     fu.eye = simd_make_float4(eye, 1);
@@ -693,6 +855,13 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     [enc setFragmentBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentTexture:shadowMap_ atIndex:7];
     [enc setFrontFacingWinding:MTLWindingClockwise];
+
+    if (terrain) {
+        [enc setRenderPipelineState:skyPipeline_];
+        [enc setDepthStencilState:depthAlways_];
+        [enc setCullMode:MTLCullModeNone];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
 
     auto drawPass = [&](uint32_t pass) {
         const AlphaMode mode = AlphaMode(pass);
@@ -723,7 +892,19 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     };
     drawPass(0);
     drawPass(1);
-    if (showGround) {
+    if (terrain) {
+        [enc setRenderPipelineState:terrainPipeline_];
+        [enc setDepthStencilState:depthWrite_];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+        [enc setVertexTexture:heightTex_ atIndex:0];
+        [enc setFragmentTexture:heightTex_ atIndex:0];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:terrainIndexCount_
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:terrainIndices_
+                 indexBufferOffset:0];
+    } else if (showGround) {
         [enc setRenderPipelineState:groundPipeline_];
         [enc setDepthStencilState:depthWrite_];
         [enc setCullMode:MTLCullModeNone];

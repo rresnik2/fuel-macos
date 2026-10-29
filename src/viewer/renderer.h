@@ -11,6 +11,7 @@
 
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
+#include "core/terrain.hpp"
 #include "core/vehicle.hpp"
 
 #include <array>
@@ -76,10 +77,19 @@ public:
     // Takes effect for meshes loaded afterwards (the colour applies at once).
     void setPaint(const Paint& paint);
 
+    // Applied to every instance of the next setScene/setMesh (e.g. to stand a
+    // vehicle on the terrain).
+    simd_float4x4 placement = matrix_identity_float4x4;
+
     bool cullBackFaces = true;
     bool wireframe = false;
     bool showGround = true;
     float dirt = 0.0f;  // 0 clean .. 1 fully dirty (vehicles with dirt maps)
+
+    // Draws the world heightfield under the scene (with sky and haze) instead
+    // of the ground plane.
+    void setTerrain(const Heightfield& hf);
+    bool showTerrain = true;
 
     // Call before the main pass each frame: renders the sun's shadow map.
     void encodeShadows(id<MTLCommandBuffer> cb);
@@ -147,7 +157,13 @@ private:
     id<MTLDepthStencilState> depthWrite_, depthNoWrite_;
     id<MTLSamplerState> samplers_[4];
     id<MTLTexture> white_, shadowMap_;
-    id<MTLRenderPipelineState> groundPipeline_;
+    id<MTLRenderPipelineState> groundPipeline_, terrainPipeline_, skyPipeline_;
+    id<MTLDepthStencilState> depthAlways_;
+    id<MTLTexture> heightTex_;
+    id<MTLBuffer> terrainIndices_;
+    uint32_t terrainIndexCount_ = 0;
+    Heightfield terrainData_;
+    simd_float4 terrainInfo_ = {0, 0, 1, 0};  // origin x, origin z, spacing, metres for a texel value of 1.0
     std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
     std::unordered_map<uint32_t, id<MTLRenderPipelineState>> shadowPipelines_;
     std::unordered_map<uint64_t, id<MTLTexture>> textures_;  // key: id << 1 | srgb

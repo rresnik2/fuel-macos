@@ -1,0 +1,32 @@
+// The world's base heightfield, stored in USA1.DPC.
+//
+// GenWorld_Z lists Binary_Z maps; the first is a 4668x4668 grid of 12-bit
+// heights covering a 140 km square centred on the origin (about 30 m
+// spacing, 10000 m for the full 12-bit range). The original engine adds
+// procedural detail on top at run time; the port renders it its own way.
+#pragma once
+
+#include "dpc.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace fuel {
+
+struct Heightfield {
+    uint32_t width = 0, height = 0;  // samples; column = x, row = z
+    float spacing = 0;               // metres between samples
+    float originX = 0, originZ = 0;  // world position of sample (0, 0)
+    float metresPerUnit = 0;         // height of one raw step
+    std::vector<uint16_t> raw;       // row-major
+
+    float sampleHeight(uint32_t col, uint32_t row) const { return float(raw[size_t(row) * width + col]) * metresPerUnit; }
+    // Bilinear height at a world position (clamped to the edges).
+    float heightAt(float x, float z) const;
+};
+
+// Decodes the heightfield of a world DPC (WORLD/USA1.DPC). Throws when the
+// file has no GenWorld_Z or the map does not decode.
+Heightfield loadWorldHeightfield(const DpcFile& world);
+
+}  // namespace fuel
