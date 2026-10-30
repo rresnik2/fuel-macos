@@ -154,12 +154,12 @@ public:
 private:
     static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f;
     // Decor draw distances follow FUEL's decor quadtree (see decorChunkSize in drive.mm):
-    // trees end with the 384 m chunks (camera within 2.0625 x 768 m of the 768 m chunk
-    // centre, so at most ~2130 m away), bushes with the 96 m chunks, full meshes with the
-    // 48 m chunks (~200 m). kPlantRadius only bounds the scatter.
-    static constexpr float kPlantRadius = 1150.0f;  // the 192 m chunks reach ~1100 m (FUEL's 384 m card chunks: ~2130 m)
+    // FUEL's trees end with the 384 m chunks (camera within 2.0625 x 768 m of the 768 m
+    // chunk centre, so at most ~2130 m away), bushes with the 96 m chunks, full meshes
+    // with the 48 m chunks (~200 m). kPlantRadius only bounds the scatter.
+    static constexpr float kPlantRadius = 600.0f;  // the 96 m chunks end within ~540 m (FUEL's card chunks reach ~2130 m)
     static constexpr double kTreeChunkMax = 600.0, kBushChunkMax = 100.0, kFullMeshChunk = 60.0;
-    static constexpr double kTreeCardStandIn = 300.0;  // see buildBackground: full trees stand in for the cards below this
+    static constexpr double kTreeCardStandIn = 150.0;  // full trees stand in for cards in chunks below this (buildBackground)
     static constexpr float kPropRadius = 120.0f, kPropForget = 300.0f;  // dynamic within, state reset beyond
     const fuel::Vegetation* vegetation_ = nullptr;
     fuel::SurfaceQuery surfaces_;

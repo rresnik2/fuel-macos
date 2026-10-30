@@ -463,8 +463,8 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         // engine also queues the card next to the full mesh; the port draws the mesh.
         // Port limitation: the renderer does not draw the tree cards correctly yet
         // (they come out invisible or as dark rectangles; bush cards are fine), so
-        // trees keep their full mesh out to the 192 m chunks (~800 m) and the 384 m
-        // chunks, where FUEL draws only cards, stay empty.
+        // trees keep their full mesh in the 96 m chunks (to ~200-540 m) and the
+        // 192 / 384 m chunks, where FUEL draws only cards, stay empty.
         for (fuel::Plant& p : scattered) {
             const bool tree = trees.count(p.meshId) != 0;
             const double chunk = decorChunkSize(p.position[0], p.position[2], player.x, player.z);
