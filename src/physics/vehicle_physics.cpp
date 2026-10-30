@@ -502,6 +502,16 @@ VehicleState DriveWorld::state() const {
     st.rpm = controller->GetEngine().GetCurrentRPM();
     st.gear = controller->GetTransmission().GetCurrentGear();
     st.wheelsOnGround = impl_->wheelsOnGround();
+    // Slip proxy: sideways slip angle (rad) or wheelspin/lock-up ratio beyond what grips normally.
+    float skid = 0;
+    int touching = 0;
+    for (const Wheel* w : impl_->vehicle->GetWheels()) {
+        if (!w->HasContact()) continue;
+        const auto* wv = static_cast<const WheelWV*>(w);
+        ++touching;
+        skid += std::clamp(std::max((std::fabs(wv->mLateralSlip) - 0.12f) / 0.3f, (std::fabs(wv->mLongitudinalSlip) - 0.35f) / 0.5f), 0.0f, 1.0f);
+    }
+    st.skid = touching ? skid / float(touching) : 0.0f;
     return st;
 }
 

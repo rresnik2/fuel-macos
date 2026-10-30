@@ -30,6 +30,13 @@ Early. What works today:
   72 drivable vehicles (bikes, quads, buggies, cars, SUVs, trucks); gamepads
   work (stick, triggers, X handbrake, Y reset). The world's 14,000 placed
   objects stream in around you and are solid. `fueldrive` runs a scripted drive without a window.
+- **Driving sounds**: in the window, `--drive` plays FUEL's own samples,
+  decoded at start-up from the vehicle archive (no extracted files): the engine
+  as rpm-crossfaded idle and on/off-load layers, tyre rolling and skid loops,
+  wind, and impact one-shots on hard braking or landings. M mutes.
+  `fuelview --drive --audio-check` prints the sound layers of a few vehicles
+  without opening audio. Ground-surface sounds are not mapped yet (one gravel
+  class is used everywhere).
 - **Races**: `--race NAME` (for example `CR2-Yell-CP`) loads one of FUEL's 250
   races from the game's mission scripts: start line, ordered checkpoints shown
   as glowing beacons, laps, finish and a timer. N / Shift-N picks the next or
@@ -40,7 +47,7 @@ Early. What works today:
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: knock-aside props, sound, AI opponents, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
+Next steps, roughly in order: knock-aside props, AI opponents, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 

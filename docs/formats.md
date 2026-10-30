@@ -143,3 +143,27 @@ USA1.DPC. WorldRef_Z objects in USA1 give each sub-world's bounds.
 `EMD_SetCheckpoint x y z rx ry rz 1.0 flag` per checkpoint, in order.
 Rotations are Euler angles in radians; ry is roughly the heading. The
 scripts give no checkpoint width.
+
+## Sound_Z (sounds)
+
+Each sound has a 14-byte link record: `u32` name CRC, `u32` sample rate (always
+44100), `u32` size in bytes, `u16` flags. Flag bit 1 (value 2) means the sound
+loops (the whole buffer; there are no loop points), bit 2 (value 4) means
+stereo. The body is raw signed 16-bit little-endian PCM, LZ-compressed like
+other pool bodies when the object says so, so `DpcFile::body` already returns
+the samples. Looping roles all have bit 1 set and one-shots do not.
+
+A vehicle's sound bank is in the Lod_Z named `<VARIANT>_SKEL`. After its points,
+object list and two header words come two optional pair lists; the second holds
+`(symbol, Sound_Z ID)` pairs (78 for bikes, 86 for four-wheelers). Symbols are
+the game's sound slots: 2 engine idle, 3..7 engine layers when off the throttle,
+9..13 the same layers on the throttle, 0x0e..0x1e skids, 0x20..0x39 rolling
+(a slow and a fast loop per ground class), 0x40 wind, 0x42..0x4b impacts.
+
+Engine mixing uses VehiclesParam values: x = (rpm - P325) / (P324 - P325),
+clamped to 0.001..0.99. The idle sample fades out over x < 0.15; layers 1..5
+are Hann windows overlapping by half, spread by P644, with pitch running
+piecewise-linear through the neighbouring layers' recorded rpm (P636..P642), so
+the x axis is a virtual rpm rather than the real one. Weights at each x are
+normalised to P649. On-throttle layers play at weight times load, off-throttle
+at weight times (1 - load).

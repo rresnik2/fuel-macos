@@ -25,6 +25,7 @@ add_library(fuelcore STATIC
   src/core/vehicle_params.cpp
   src/core/races.cpp
   src/core/assembly.cpp
+  src/core/sound.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 
@@ -41,10 +42,11 @@ add_executable(fuelview
   src/viewer/main.mm
   src/viewer/renderer.mm
   src/viewer/drive.mm
+  src/audio/drive_audio.mm
 )
 target_compile_options(fuelview PRIVATE -fobjc-arc)
 target_link_libraries(fuelview PRIVATE fuelphysics "-framework GameController"
-  "-framework Cocoa" "-framework Metal" "-framework MetalKit"
+  "-framework Cocoa" "-framework AVFoundation" "-framework Metal" "-framework MetalKit"
   "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics"
   "-framework UniformTypeIdentifiers")
 
