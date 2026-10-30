@@ -93,6 +93,7 @@ struct Options {
     int lod = 1;
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
+    bool haveYaw = false;  // --yaw given: with --film, the chase camera looks from that angle (0 = behind)
     float distance = 0;
     bool cull = true;
     float dirt = 0.0f;
@@ -176,7 +177,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
-        else if (a == "--yaw") o.yawDeg = std::stof(next());
+        else if (a == "--yaw") o.yawDeg = std::stof(next()), o.haveYaw = true;
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
         else if (a == "--distance") o.distance = std::stof(next());
         else if (a == "--no-cull") o.cull = false;
@@ -1414,7 +1415,7 @@ int main(int argc, const char** argv) {
                         drive->update(1.0f / 60, in);
                         const double tp1 = CACurrentMediaTime();
                         if (opt.film > 0) {
-                            chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius());
+                            chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius(), opt.haveYaw ? opt.yawDeg * float(M_PI) / 180.0f : 0.0f);
                             dust.update(1.0f / 60, *drive, drive->position());
                         }
                         if (streamer && (opt.propCheck || opt.film > 0 || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());

@@ -195,9 +195,9 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
     };
     static const Kind kKinds[int(G::Count)] = {
         {0.6f, {0.30f, 0.28f, 0.26f}},   // tarmac: a little grit
-        {22.0f, {0.36f, 0.27f, 0.18f}},  // dirt
+        {34.0f, {0.36f, 0.27f, 0.18f}},  // dirt
         {3.0f, {0.30f, 0.27f, 0.18f}},   // grass
-        {26.0f, {0.50f, 0.40f, 0.28f}},  // sand
+        {40.0f, {0.50f, 0.40f, 0.28f}},  // sand
         {18.0f, {0.80f, 0.83f, 0.88f}},  // snow
         {7.0f, {0.22f, 0.17f, 0.11f}},   // mud
         {10.0f, {0.38f, 0.34f, 0.29f}},  // rock and gravel
@@ -226,7 +226,7 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
                 }
                 const Kind& kind = kKinds[int(fuel::gripCategory(surface))];
                 const float skid = w < st.wheelSkid.size() ? st.wheelSkid[w] : st.skid;
-                const float push = smoothstep(4.0f, 80.0f, speed) + skid * (0.4f + 1.1f * smoothstep(2.0f, 25.0f, speed));
+                const float push = smoothstep(4.0f, 80.0f, speed) + skid * (0.15f + 1.35f * smoothstep(2.0f, 25.0f, speed));
                 owed += kind.rate * push * dt;
                 const float radius = w < setup.wheels.size() ? setup.wheels[w].radius : 0.3f;
                 const auto& wp = st.wheels[w].position;
@@ -236,7 +236,7 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
                     Particle p;
                     p.position = contact + simd_make_float3(random() - 0.5f, random() * 0.2f, random() - 0.5f) * 0.4f;
                     // Thrown up and out, keeping some of the vehicle's speed; drag soon stops it.
-                    p.velocity = velocity * (0.25f + 0.2f * random()) +
+                    p.velocity = velocity * (0.1f + 0.15f * random()) +
                                  simd_make_float3((random() - 0.5f) * 2.4f, 0.6f + random() * 1.6f + skid * 1.5f, (random() - 0.5f) * 2.4f);
                     p.colour = kind.colour * (0.85f + 0.3f * random());
                     p.age = 0;
@@ -245,7 +245,7 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
                     p.grow = 1.0f + random() * 1.2f + 0.01f * speed;
                     p.rotation = random() * 6.2832f;
                     p.spin = (random() - 0.5f) * 1.2f;
-                    p.opacity = (0.22f + 0.18f * random()) * std::min(1.0f, 0.5f + 0.5f * push);
+                    p.opacity = (0.45f + 0.3f * random()) * std::min(1.0f, 0.4f + 0.6f * push);
                     p.seed = random();
                     particles_.push_back(p);
                 }

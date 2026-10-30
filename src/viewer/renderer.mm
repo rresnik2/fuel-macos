@@ -109,7 +109,7 @@ float3 groundGrade(float3 c) {
 float3 haze(float3 rgb, float3 world, constant FrameUniforms& f) {
     if (f.fog.x <= 0.0) return rgb;
     float3 d = world - f.eye.xyz;
-    float k = (1.0 - exp(-length(d) * f.fog.x)) * 0.92;
+    float k = (1.0 - exp(-length(d) * f.fog.x)) * 0.85;
     return mix(rgb, skyColor(normalize(float3(d.x, max(d.y, 0.0) * 0.15, d.z)), normalize(f.sunDir.xyz)), k);
 }
 
@@ -407,7 +407,7 @@ fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer
     float4 w = f.invViewProj * float4(in.ndc, 1.0, 1.0);
     float3 dir = normalize(w.xyz / w.w - f.eye.xyz);
     const float3 sun = normalize(f.sunDir.xyz);
-    float3 c = skyColor(dir, sun) * 1.3 + float3(1.0, 0.85, 0.6) * smoothstep(0.99975, 0.99990, dot(dir, sun)) * 40.0;
+    float3 c = skyColor(dir, sun) * 1.05 + float3(1.0, 0.85, 0.6) * smoothstep(0.99975, 0.99990, dot(dir, sun)) * 40.0;
     return float4(c, 1.0);
 }
 
@@ -507,13 +507,14 @@ vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const de
     o.depth = dot(p.position.xyz - f.eye.xyz, fwd);
     o.radius = p.position.w;
     o.seed = p.extra.y;
-    // Lit by the sun through the cloud: strong forward scattering (Henyey-Greenstein,
-    // g = 0.55) makes plumes glow when the camera looks towards the low sun.
+    // Lit by the sun through the cloud (no normal: a thin cloud scatters light from
+    // every side); strong forward scattering (Henyey-Greenstein, g = 0.55) makes
+    // plumes glow when the camera looks towards the low sun.
     const float3 L = normalize(f.sunDir.xyz);
     const float mu = dot(normalize(p.position.xyz - f.eye.xyz), L);
     const float g = 0.55;
     const float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5) / (4.0 * M_PI_F);
-    float3 light = kSunColour * f.sunDir.w * (0.18 + hg * 1.6) + float3(0.28, 0.27, 0.27);
+    float3 light = kSunColour * f.sunDir.w * (0.4 + hg * 2.5) + float3(0.30, 0.29, 0.29);
     o.rgb = haze(p.colour.rgb * light, p.position.xyz, f);
     o.alpha = p.colour.a;
     return o;
@@ -524,12 +525,12 @@ fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0
     if (r2 >= 1.0) discard_fragment();
     // Lumpy edges: a little value noise over the round falloff.
     float n = valueNoise(in.uv * 2.3 + in.seed * 17.0) * 0.6 + valueNoise(in.uv * 5.1 - in.seed * 9.0) * 0.4;
-    float blob = pow(1.0 - r2, 1.5) * mix(0.55, 1.25, n);
+    float blob = saturate(pow(1.0 - r2, 1.2) * mix(0.3, 1.7, n));
     // Soft particles: fade out where the sprite meets the scene, and near the camera.
     // The resolved depth turns back into a view distance with zn and q (fog.zw).
     float d = depth.read(uint2(in.position.xy));
     float scene = f.fog.z * f.fog.w / (d + f.fog.w);
-    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 1.0) / 3.0);
+    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 0.3) / max(0.8, in.radius * 0.7));
     float a = saturate(in.alpha * blob * fade);
     return float4(in.rgb, a);
 }
@@ -646,7 +647,7 @@ fragment float4 fsComposite(FullOut in [[stage_in]], texture2d<float> hdr [[text
     }
     c *= u.params.x;
     if (u.grade.w > 0.0) {
-        c *= float3(1.07, 1.0, 0.86);  // warm white balance
+        c *= float3(1.05, 1.0, 0.90);  // warm white balance
         c = acesFitted(c);
         // Grade in display space: contrast around mid grey, lift the blacks a touch
         // towards brown, golden highlights, then saturation.
@@ -1658,7 +1659,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             for (const auto& [tex, b] : roadBatches_) {
                 const uint32_t textured = tex != nil ? 1u : 0u;
                 [enc setFragmentBytes:&textured length:sizeof textured atIndex:2];
-                const simd_float4 tint = b.dirt ? simd_make_float4(0.42f, 0.30f, 0.20f, 1) : simd_make_float4(1, 1, 1, 1);
+                const simd_float4 tint = b.dirt ? simd_make_float4(0.33f, 0.24f, 0.16f, 1) : simd_make_float4(1, 1, 1, 1);
                 [enc setFragmentBytes:&tint length:sizeof tint atIndex:3];
                 [enc setFragmentTexture:tex != nil ? tex : white_ atIndex:0];
                 [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -1775,7 +1776,7 @@ void MeshRenderer::encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target) {
     PostUniforms pu{};
     pu.texel = simd_make_float4(1.0f / w, 1.0f / h, w / h, float(frame_ % 1024));
     pu.params = postEffects ? simd_make_float4(1.0f, std::clamp(speedBlur, 0.0f, 1.0f) * 0.11f, 0.10f, 0.55f) : simd_make_float4(1, 0, 0, 0);
-    pu.grade = simd_make_float4(0.86f, 1.12f, 0.75f, postEffects ? 1.0f : 0.0f);
+    pu.grade = simd_make_float4(1.0f, 1.22f, 0.8f, postEffects ? 1.0f : 0.0f);
     if (postEffects && lastFrame_ && lastFrame_->fog.x > 0) {
         // Where the sun is on screen; glare and shafts fade out as it leaves the frame.
         const simd_float4 clip = simd_mul(lastFrame_->viewProj, simd_make_float4(lastFrame_->eye.xyz + sunDir_ * 1000.0f, 1.0f));
