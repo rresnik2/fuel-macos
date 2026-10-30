@@ -528,7 +528,7 @@ struct RaceSession {
         s.upY = 1 - 2 * (q[0] * q[0] + q[2] * q[2]);  // y of the rotated up axis
         s.topSpeedKmh = d.setup(i).topSpeedKmh;
         fuel::DriveWorld& world = d.physics();
-        s.clearance = [&world, x = s.x, z = s.z](float yaw, float length) { return world.clearance(x, z, yaw, length); };
+        s.clearance = [&world, x = s.x, z = s.z](float yaw, float length, bool slopes) { return world.clearance(x, z, yaw, length, slopes ? 0.55f : 0.0f, 0.5f); };
         const fuel::DriveInput in = racer.ai.drive(line, racer.next, s, dt, rubber);
         if (racer.ai.wantsReset()) {
             // Back on the line, a few metres to the side for each racer so they do not land on each other.

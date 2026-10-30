@@ -697,7 +697,19 @@ public:
 
 }  // namespace
 
-float DriveWorld::clearance(double x, double z, float yaw, float length, float height) const {
+float DriveWorld::clearance(double x, double z, float yaw, float length, float maxSlope, float height) const {
+    if (maxSlope > 0) {
+        constexpr float kStepLength = 4.0f;
+        float prev = impl_->terrain.smoothHeightAt(x, z);
+        for (float d = kStepLength; d <= length; d += kStepLength) {
+            const float h = impl_->terrain.smoothHeightAt(x + std::sin(yaw) * d, z + std::cos(yaw) * d);
+            if (h - prev > maxSlope * kStepLength || prev - h > 1.6f * maxSlope * kStepLength) {  // steeper down is fine
+                length = d - kStepLength;
+                break;
+            }
+            prev = h;
+        }
+    }
     const double x1 = x + std::sin(yaw) * length, z1 = z + std::cos(yaw) * length;
     const RVec3 from(x, impl_->terrain.smoothHeightAt(x, z) + height, z);
     const RVec3 to(x1, impl_->terrain.smoothHeightAt(x1, z1) + height, z1);

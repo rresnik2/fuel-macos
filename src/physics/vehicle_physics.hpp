@@ -120,10 +120,12 @@ public:
     void update(float dt, const DriveInput& input);
     VehicleState state() const { return state(0); }
 
-    // Free distance (metres, up to `length`) from (x, z) along heading `yaw` (0 = +z),
-    // `height` metres above the terrain at both ends, against static objects only (not
-    // the terrain, vehicles or props): what a driver sees ahead.
-    float clearance(double x, double z, float yaw, float length, float height = 1.0f) const;
+    // Free distance (metres, up to `length`) from (x, z) along heading `yaw` (0 = +z):
+    // what a driver sees ahead. A ray `height` metres above the terrain at both ends
+    // against static objects (not vehicles or props); with `maxSlope` > 0 the terrain
+    // also blocks where it climbs more steeply than that (rise over run, in 4 m steps) or
+    // falls more than 1.6 times as steeply.
+    float clearance(double x, double z, float yaw, float length, float maxSlope = 0, float height = 1.0f) const;
 
     // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
     // surface counts as dirt. The default applies to worlds created afterwards.

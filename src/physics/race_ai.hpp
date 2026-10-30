@@ -7,8 +7,10 @@
 // ahead along it, slows for each upcoming corner to a speed set by the corner's
 // angle (braking distance from an assumed deceleration), and caps its speed at
 // a per-driver share of the vehicle's top speed, scaled by rubber-banding.
-// Static obstacles on the way (buildings, rocks, log piles) are seen with a fan
-// of rays: it steers for the free heading nearest the line and slows if boxed in.
+// Static obstacles on the way (buildings, rocks, log piles) and terrain too steep
+// to climb are seen with a fan of rays: it steers for the free heading nearest
+// the line and slows if boxed in. Each reset that does not lead to the next
+// checkpoint puts it further along the line.
 #pragma once
 
 #include "physics/vehicle_physics.hpp"
@@ -45,8 +47,9 @@ public:
         float speedKmh = 0;    // signed, along the vehicle's forward axis
         float upY = 1;         // vehicle up vector's y (upside down < 0)
         float topSpeedKmh = 150;
-        // Free distance ahead along a heading, up to a length (DriveWorld::clearance); none = open ground.
-        std::function<float(float yaw, float length)> clearance;
+        // Free distance ahead along a heading, up to a length (DriveWorld::clearance), counting
+        // steep terrain as blocked when `slopes`; none = open ground.
+        std::function<float(float yaw, float length, bool slopes)> clearance;
     };
     // One control step (call at a steady rate with `dt` seconds). `next` is the target
     // the racer heads for; `rubber` scales the speed cap (1 = none).
@@ -70,6 +73,7 @@ private:
     std::array<float, 3> resetAt_{};
     float resetHeading_ = 0;
     int resets_ = 0;
+    int failedResets_ = 0;  // resets since the last checkpoint
 };
 
 }  // namespace fuel

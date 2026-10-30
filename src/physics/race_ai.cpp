@@ -72,6 +72,7 @@ void RaceDriver::didReset() {
     stuckTime_ = reverseTime_ = upsideDown_ = sinceProgress_ = stuckTotal_ = 0;
     bestRemaining_ = 1e30f;
     ++resets_;
+    ++failedResets_;
 }
 
 void RaceDriver::restart() {
@@ -79,7 +80,7 @@ void RaceDriver::restart() {
     stuckTime_ = reverseTime_ = upsideDown_ = sinceProgress_ = stuckTotal_ = 0;
     bestRemaining_ = 1e30f;
     lastNext_ = size_t(-1);
-    resets_ = 0;
+    resets_ = failedResets_ = 0;
 }
 
 DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, float dt, float rubber) {
@@ -102,18 +103,22 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
         float best = -1, bestOffset = 0;
         bool found = false;
         const float side = dodge_ >= 0 ? 1.0f : -1.0f;
-        for (int k = 0; k <= 8 && !found; ++k)
-            for (float sign : {side, -side}) {
-                const float offset = sign * float(k) * 0.13f;
-                const float free = s.clearance(want + offset, need);
-                if (free > best) best = free, bestOffset = offset;
-                if (free >= need) {
-                    found = true;
-                    bestOffset = offset;
-                    break;
+        for (bool slopes : {true, false}) {  // a slope everywhere ahead: take it anyway, minding only objects
+            best = -1;
+            for (int k = 0; k <= 8 && !found; ++k)
+                for (float sign : {side, -side}) {
+                    const float offset = sign * float(k) * 0.13f;
+                    const float free = s.clearance(want + offset, need, slopes);
+                    if (free > best) best = free, bestOffset = offset;
+                    if (free >= need) {
+                        found = true;
+                        bestOffset = offset;
+                        break;
+                    }
+                    if (k == 0) break;
                 }
-                if (k == 0) break;
-            }
+            if (found) break;
+        }
         dodge_ = found && bestOffset == 0 ? dodge_ * 0.9f : bestOffset;
         want += bestOffset;
         if (!found) blockedSpeed = std::sqrt(2.0f * kDecel * std::max(0.0f, best - 4.0f)) * 3.6f;
@@ -153,6 +158,7 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
     const float remaining = float(std::hypot(s.x - line.points[next + 1][0], s.z - line.points[next + 1][2]));
     if (next != lastNext_) {
         lastNext_ = next;
+        failedResets_ = 0;
         bestRemaining_ = remaining;
         sinceProgress_ = 0;
     } else if (remaining < bestRemaining_ - 5.0f) {
@@ -179,7 +185,9 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
     // ahead of where it is.
     if (!resetWanted_ && (stuckTotal_ > 4.0f || upsideDown_ > 4.0f || sinceProgress_ > 12.0f)) {
         resetWanted_ = true;
-        resetAt_ = line.pointAhead(next, s.x, s.z, 6.0f, &resetHeading_);
+        // 6 m ahead, then 30 m more for each reset that did not help; never past the target.
+        const float ahead = std::min(6.0f + 30.0f * float(failedResets_), std::max(0.0f, remaining - 30.0f));
+        resetAt_ = line.pointAhead(next, s.x, s.z, ahead, &resetHeading_);
     }
     return in;
 }
