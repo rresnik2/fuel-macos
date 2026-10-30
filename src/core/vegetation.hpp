@@ -4,6 +4,7 @@
 // above the treeline. The species prototypes are the GenWorld_Z TREES and
 // BUSHES groups (Node_Z -> Lod_Z -> [full mesh, impostor]). The game's jitter
 // table and species weights are not decoded; a hash stands in for them.
+// Foliage textures are grey: the renderer tints them with the local ground colour.
 #pragma once
 
 #include "dpc.hpp"
@@ -15,9 +16,14 @@
 
 namespace fuel {
 
+struct Species {
+    uint32_t full = 0;      // 3-D mesh
+    uint32_t impostor = 0;  // distant camera-facing card (0 = none)
+};
+
 struct Vegetation {
-    std::vector<uint32_t> trees, bushes;  // full-detail Mesh_Z per species
-    Raster forest, humidity;              // GenWorld maps 7 and 2
+    std::vector<Species> trees, bushes;
+    Raster forest, humidity;  // GenWorld maps 7 and 2
 };
 
 struct Plant {
@@ -28,7 +34,9 @@ struct Plant {
 
 Vegetation loadVegetation(const DpcFile& world);  // throws if the world has no GenWorld_Z
 
-// Plants within `radius` of (x, z), appended to `out`.
-void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, float z, float radius, std::vector<Plant>& out);
+// Plants between `inner` and `radius` metres of (x, z), appended to `out`;
+// with `impostors` they use the species' distant cards (bushes are skipped).
+void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, float z, float radius, std::vector<Plant>& out,
+                   bool impostors = false, float inner = 0);
 
 }  // namespace fuel

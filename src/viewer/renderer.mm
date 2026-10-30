@@ -66,6 +66,7 @@ struct VertexOut {
     float2 uv;
     float4 sunPos;
     float3 m0, m1, m2;  // the instance's rotation (for object-space normal maps)
+    float3 tint;        // foliage: local ground colour (leaf textures are grey)
 };
 
 constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
@@ -130,9 +131,16 @@ float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float
 // Instanced: one world matrix per instance in buffer 2.
 vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
                         const device float4x4* models [[buffer(2)]], constant uint& sprite [[buffer(3)]],
-                        uint iid [[instance_id]]) {
+                        texture2d<float> groundColour [[texture(0)]], uint iid [[instance_id]]) {
     const float4x4 model = models[iid];
     VertexOut o;
+    o.tint = float3(1.0);
+    if (sprite != 0 && f.fog.y > 0.0) {
+        // Like FUEL's ground, foliage is a grey detail map coloured by the palette: use the
+        // ground colour under the plant, times 2.
+        constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
+        o.tint = groundColour.sample(lin, (model[3].xz + 70000.0) / 140000.0, level(0)).rgb * 2.0;
+    }
     o.m0 = model[0].xyz;
     o.m1 = model[1].xyz;
     o.m2 = model[2].xyz;
@@ -172,6 +180,7 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     // right half the damaged one; draw the intact half.
     float2 uvHalf = (m.code == 17 || m.code == 20) ? float2(in.uv.x * 0.5, in.uv.y) : in.uv;
     float4 d = tDiffuse.sample(smp, uvHalf);
+    d.rgb *= in.tint;
     if (m.code == 17 || m.code == 19) {
         // Car paint shows where the livery's alpha is 0.
         d.rgb = mix(f.paint.rgb, d.rgb, (m.features & PaintOnly) ? 0.0 : d.a);
@@ -966,7 +975,7 @@ const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string
         const std::vector<uint32_t> tris = batchTriangles(mesh, b);
         Draw d{b.vb, uint32_t(indices.size()), uint32_t(tris.size()), mat, false};
         // Sprite batches (leaves, impostors): vertex type 7 whose triangle corners share a position.
-        if (b.vertexType == 7 && tris.size() >= 3) {
+        if ((b.vertexType == 7 || mesh.vbs[b.vb].count <= 8) && tris.size() >= 3) {
             const VertexBuffer& vb = mesh.vbs[b.vb];
             d.sprite = std::memcmp(&vb.data[size_t(tris[0]) * vb.stride], &vb.data[size_t(tris[1]) * vb.stride], 12) == 0;
         }
@@ -1190,6 +1199,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                 [enc setVertexBuffer:gm.vbs[d.vb] offset:0 atIndex:0];
                 const uint32_t sprite = d.sprite ? 1u : 0u;
                 [enc setVertexBytes:&sprite length:sizeof sprite atIndex:3];
+                [enc setVertexTexture:groundColour_ != nil ? groundColour_ : white_ atIndex:0];
                 MaterialUniforms mu{m.diffuse, m.specular, m.emissive, m.fresnel, uint32_t(m.alpha), m.lit ? 1u : 0u, m.code,
                                     m.features};
                 [enc setFragmentBytes:&mu length:sizeof mu atIndex:2];

@@ -85,7 +85,7 @@ Vegetation loadVegetation(const DpcFile& world) {
         p += 4 + len + 4;
         const uint32_t n = rd32(b, p);
         p += 4;
-        std::vector<uint32_t>* list = name == "TREES" ? &v.trees : name == "BUSHES" ? &v.bushes : nullptr;
+        std::vector<Species>* list = name == "TREES" ? &v.trees : name == "BUSHES" ? &v.bushes : nullptr;
         for (uint32_t i = 0; i < n; ++i) {
             const uint32_t nodeId = rd32(b, p + size_t(i) * 4);
             if (list == nullptr) continue;
@@ -97,7 +97,11 @@ Vegetation loadVegetation(const DpcFile& world) {
                 const auto lb = le ? world.body(*le) : std::nullopt;
                 if (!lb) continue;
                 const Lod lod = parseLodBody(*lb);
-                if (!lod.objects.empty() && world.find(lod.objects[0]) != nullptr) list->push_back(lod.objects[0]);
+                if (lod.objects.empty() || world.find(lod.objects[0]) == nullptr) continue;
+                Species sp;
+                sp.full = lod.objects[0];
+                if (lod.objects.size() > 1 && world.find(lod.objects[1]) != nullptr) sp.impostor = lod.objects[1];
+                list->push_back(sp);
             } catch (const std::exception&) {
             }
         }
@@ -115,19 +119,21 @@ Vegetation loadVegetation(const DpcFile& world) {
     return v;
 }
 
-void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, float z, float radius, std::vector<Plant>& out) {
+void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, float z, float radius, std::vector<Plant>& out,
+                   bool impostors, float inner) {
     if (v.trees.empty() && v.bushes.empty()) return;
     const int32_t c0x = int32_t(std::floor((x - radius) / kCell)), c1x = int32_t(std::floor((x + radius) / kCell));
     const int32_t c0z = int32_t(std::floor((z - radius) / kCell)), c1z = int32_t(std::floor((z + radius) / kCell));
     for (int32_t cz = c0z; cz <= c1z; ++cz) {
         for (int32_t cx = c0x; cx <= c1x; ++cx) {
             for (int kind = 0; kind < 2; ++kind) {  // a tree candidate, then a bush candidate offset by half a cell
-                const std::vector<uint32_t>& species = kind == 0 ? v.trees : v.bushes;
-                if (species.empty()) continue;
+                const std::vector<Species>& species = kind == 0 ? v.trees : v.bushes;
+                if (species.empty() || (impostors && kind == 1)) continue;
                 const uint32_t h = hash(cx, cz, 17u + uint32_t(kind));
                 const float px = cx * kCell + kind * 10.0f + float(h & 15) * 1.2f;
                 const float pz = cz * kCell + kind * 10.0f + float((h >> 4) & 15) * 1.2f;
-                if (std::hypot(px - x, pz - z) > radius) continue;
+                const float dist = std::hypot(px - x, pz - z);
+                if (dist > radius || dist < inner) continue;
                 // Density: sharpened forest cover minus clearing noise.
                 const float forest = sampleMap(v.forest, px, pz);
                 const float noise = std::clamp(0.65f * valueNoise(px / 400, pz / 400, 3) + 0.35f * valueNoise(px / 90, pz / 90, 4), 0.0f, 1.0f);
@@ -140,8 +146,15 @@ void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, flo
                 const float dx = (terrain.heightAt(px + 4, pz) - terrain.heightAt(px - 4, pz)) / 8;
                 const float dz = (terrain.heightAt(px, pz + 4) - terrain.heightAt(px, pz - 4)) / 8;
                 if (1.0f / std::sqrt(1 + dx * dx + dz * dz) < 0.866f) continue;  // steeper than 30 degrees
+                const uint32_t pick = hash(cx, cz, 33u + uint32_t(kind));
+                const Species* sp = nullptr;
+                for (size_t tries = 0; tries < species.size() && sp == nullptr; ++tries) {
+                    const Species& cand = species[(pick + tries * 7919u) % species.size()];
+                    if (!impostors || cand.impostor != 0) sp = &cand;
+                }
+                if (sp == nullptr) continue;
                 Plant p;
-                p.meshId = species[hash(cx, cz, 33u + uint32_t(kind)) % species.size()];
+                p.meshId = impostors ? sp->impostor : sp->full;
                 p.position = {px, y - 0.1f, pz};
                 p.yaw = unit(hash(cx, cz, 57u)) * 6.2831853f;
                 p.scale = 0.85f + 0.3f * unit(hash(cx, cz, 71u));

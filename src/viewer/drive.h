@@ -59,7 +59,7 @@ public:
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
 
 private:
-    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f, kPlantRadius = 700.0f;
+    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f, kPlantRadius = 700.0f, kImpostorRadius = 2500.0f;
     const fuel::Vegetation* vegetation_ = nullptr;
     const fuel::RoadNetwork* roads_ = nullptr;
     static constexpr float kRoadRadius = 1200.0f;
