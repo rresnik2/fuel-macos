@@ -74,7 +74,8 @@ Early. What works today:
 - **The rider**: every vehicle in `--assemble` and `--drive` carries FUEL's
   rider (default livery), skinned on the CPU into the seated pose of the
   vehicle's archetype from the game's own animations and drawn with the
-  vehicle. The pose is static for now. `--no-rider` hides it. `fuelrider DATA
+  vehicle. On quads, buggies and trucks the rider leans into turns and pitches
+  with throttle and brake (bikes lean as a whole). `--no-rider` hides it. `fuelrider DATA
   VARIANT [REF.obj]` bakes it and compares vertices with a reference export.
 - **`fuelscene`** lists the vehicle variants in an archive and prints how each
   one is assembled.
@@ -82,8 +83,10 @@ Early. What works today:
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: knock-aside props, AI opponents, flattened building platforms, rider animation, distant tree impostors, per-surface grip, then game
-logic, audio, video and input. See `docs/formats.md` for the file formats
+Next steps, roughly in order: racing lines that follow roads instead of
+straight lines between checkpoints (raids and some circuits still lean on AI
+resets), bails and full rider animation, then game logic (career, unlocks,
+menus), video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
 ## Requirements
