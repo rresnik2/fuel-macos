@@ -315,6 +315,10 @@ struct AssemblyMode {
 };
 
 // --drive: every drivable vehicle in the vehicle archives, for Tab switching.
+// The ground maps and roads behind the physics' per-wheel surface query (drive mode).
+static fuel::GroundMaps gGround;
+static fuel::SurfaceMap gSurfaces;
+
 struct Garage {
     std::vector<std::unique_ptr<AssemblyMode>> archives;  // one per vehicle DPC
     std::vector<std::pair<size_t, size_t>> entries;       // (archive, variant)
@@ -866,7 +870,10 @@ int main(int argc, const char** argv) {
                 fuel::DpcFile usa1(world.string());
                 terrain = std::make_unique<fuel::Heightfield>(fuel::loadWorldHeightfield(usa1));
                 renderer.setTerrain(*terrain);
-                renderer.setGround(fuel::buildGroundMaps(usa1, *terrain, 2334), usa1);
+                gGround = fuel::buildGroundMaps(usa1, *terrain, 2334);
+                renderer.setGround(gGround, usa1);
+                gSurfaces.ground = &gGround;
+                fuel::DriveWorld::setDefaultSurfaceQuery([](double x, double z) { return gSurfaces.at(x, z); });
                 if (opt.haveAt && !opt.world && !opt.drive)
                     renderer.placement = matrix_from_translation(opt.atX, terrain->heightAt(opt.atX, opt.atZ), opt.atZ);
             } catch (const std::exception& e) {
@@ -971,6 +978,7 @@ int main(int argc, const char** argv) {
                             streamer->setVegetation(vegetation.get(), terrain.get());
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
                             streamer->setRoads(roads.get());
+                            gSurfaces.roads = roads.get();
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
                             std::printf("vegetation: %zu tree and %zu bush species\n", vegetation->trees.size(), vegetation->bushes.size());
                         } catch (const std::exception& e) {

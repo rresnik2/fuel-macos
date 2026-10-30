@@ -167,6 +167,40 @@ piecewise-linear through the neighbouring layers' recorded rpm (P636..P642), so
 the x axis is a virtual rpm rather than the real one. Weights at each x are
 normalised to P649. On-throttle layers play at weight times load, off-throttle
 at weight times (1 - load).
+
+Other driving sounds (agent Q's decode of the game's sound updaters): a ground
+class table gives each of 18 classes a slow and a fast rolling loop and a skid
+loop (class: slow/fast/skid symbols; 0: 20/21/0e, 1: 2c/2d/10, 2: 2e/2f/11,
+3: 22/23/0f, 4: 30/31/12, 5: 32/33/13, 6: 34/35/14, 7: 36/37/15, 8: 38/39/16,
+9, 10: 29/-/1a, 11, 12: 27/28/19, 13..17: 26/-/18). Rolling fades slow to fast
+over 4..40 m/s. 0x47 is the scrape loop (body sliding against something),
+0x54..0x59 suspension thumps plus 0x5a a big one (P651 = compression speed
+threshold, P652 = scale), 0x5e..0x61 backfire pops (P645 interval, P646 rpm drop
+rate threshold, P653 throttle ceiling, P654 normalised rpm floor).
+
+## Surfaces under the wheels
+
+Port behaviour (`core/surface.cpp`); the engine's own 18 sound classes and its
+per-class drive multipliers (P246..P263) are not named in the data, so the
+mapping below is chosen by the classes' gravel rate and sound character.
+The surface type is the ground map's (40 types) overridden by roads: within
+half a road's drawn width of a tarmac line (types 10, 11, 12, 15, 18, 19) it is
+ASPHALT (11), of a dirt road or trail DIRT_FLAT (13).
+
+| category | tyre friction x | rolling resistance | surface types | sound class |
+|---|---|---|---|---|
+| tarmac | 1.15 | 0 | ASPHALT, ASPHALT2 | 0 |
+| dirt | 1.00 | 0.01 | EARTH(2), DIRT_*(3 flat, 4 rough), PEBBLE(5), CRACKED, STEEP_EARTH, ROUGHEARTH(4) | 2, 3, 4, 5 |
+| grass | 0.90 | 0.03 | GRASS, GRASS2, STEPPENL, HILLSNL, PLAINNL | 7 |
+| sand | 0.75 | 0.08 | SAND, SAND2, DESERTNL, ROUGHSAND* | 8 |
+| snow | 0.60 | 0.05 | SNOW, SNOW2 | 9 |
+| mud / wet | 0.65 | 0.07 | PLOUGH(4), HUMIDEARTH*, WETSAND* | 11 (PLOUGH 4) |
+| rock | 0.95 | 0.01 | STONE*, ROCK*, ROCKNL, BIG_STONE*(6), STEEP_STONE(6), ROUGHROCK*(6) | 1 (big stone and rough rock 6) |
+
+Each wheel scales both friction impulses of Jolt's tyre model by its own
+smoothed multiplier (looked up at the wheel's contact point every 1/60 s).
+Unknown types count as dirt. A bank without a class falls back to class 2.
+
 ## Skinning and the rider
 
 Every vehicle carries the same pilot, `IT_PILOT_SKIN` in

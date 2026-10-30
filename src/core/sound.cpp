@@ -80,6 +80,14 @@ EngineModel EngineModel::fromParams(const std::vector<float>& p) {
     if (!(m.maxRpm > m.idleRpm) || !(m.gain > 0)) throw std::runtime_error("implausible engine parameters");
     for (float v : m.nativeRpm)
         if (!(v > 0)) throw std::runtime_error("implausible engine sample rpm");
+    if (p.size() > 654) {
+        m.popInterval = p[645];
+        m.popRateThreshold = p[646];
+        m.absorberThreshold = p[651];
+        m.absorberScale = p[652];
+        m.popThrottleMax = p[653];
+        m.popRpmMin = p[654];
+    }
     m.build(p[644]);
     return m;
 }
