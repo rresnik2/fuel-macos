@@ -90,10 +90,10 @@ float shadowFactor(depth2d<float> map, float4 sunPos) {
 constant float3 kSunColour = float3(1.0, 0.74, 0.46);
 
 float3 skyColor(float3 d, float3 sun) {
-    float3 zenith = float3(0.16, 0.24, 0.40), horizon = float3(0.92, 0.70, 0.46), ground = float3(0.20, 0.15, 0.10);
+    float3 zenith = float3(0.14, 0.21, 0.36), horizon = float3(0.74, 0.57, 0.39), ground = float3(0.20, 0.15, 0.10);
     float3 c = d.y >= 0.0 ? mix(horizon, zenith, pow(d.y, 0.5)) : mix(horizon * 0.75, ground, saturate(-d.y * 4.0));
     float mu = saturate(dot(d, sun));
-    return c + float3(1.0, 0.62, 0.30) * (pow(mu, 6.0) * 0.55 + pow(mu, 48.0) * 1.2);
+    return c + float3(1.0, 0.62, 0.30) * (pow(mu, 6.0) * 0.40 + pow(mu, 48.0) * 0.9);
 }
 
 // The world palette is a bright spring green; FUEL's evening ground reads olive
@@ -529,7 +529,7 @@ fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0
     // The resolved depth turns back into a view distance with zn and q (fog.zw).
     float d = depth.read(uint2(in.position.xy));
     float scene = f.fog.z * f.fog.w / (d + f.fog.w);
-    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 0.6) / 1.5);
+    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 1.0) / 3.0);
     float a = saturate(in.alpha * blob * fade);
     return float4(in.rgb, a);
 }
@@ -571,7 +571,7 @@ fragment float4 fsBright(FullOut in [[stage_in]], texture2d<float> src [[texture
         sky += depth.sample(postLin, in.uv + o) >= 1.0 ? 0.25 : 0.0;
     }
     c *= 0.25;
-    const float threshold = 0.9, knee = 0.6;
+    const float threshold = 1.4, knee = 0.7;
     float lum = max(c.r, max(c.g, c.b));
     float soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
     soft = soft * soft / (4.0 * knee + 1e-4);
@@ -642,7 +642,7 @@ fragment float4 fsComposite(FullOut in [[stage_in]], texture2d<float> hdr [[text
         // Glare around the sun, as strong as there is open sky round it.
         float vis = skyShare.sample(postLin, u.sun.xy).a;
         float d = length((uv - u.sun.xy) * float2(u.texel.z, 1.0));
-        c += kSunColour * vis * u.sun.z * u.sun.w * (exp(-d * 5.0) * 0.5 + exp(-d * 22.0) * 1.5);
+        c += kSunColour * vis * u.sun.z * u.sun.w * (exp(-d * 6.0) * 0.3 + exp(-d * 24.0) * 1.2);
     }
     c *= u.params.x;
     if (u.grade.w > 0.0) {
@@ -1558,7 +1558,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.sunViewProj = sunViewProj();
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
-    fu.fog = simd_make_float4(terrain ? 1.0f / 2600.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, zn, zf / (zn - zf));
+    fu.fog = simd_make_float4(terrain ? 1.0f / 3600.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, zn, zf / (zn - zf));
     fu.sunDir = simd_make_float4(sunDir_, 4.2f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
     fu.eye = simd_make_float4(eye, 1);

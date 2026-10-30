@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 
+#include "core/surface.hpp"
 #include "core/world.hpp"
 
 namespace {
@@ -132,6 +133,142 @@ float DriveSession::heading(int i) const {
     const auto q = world_.state(i).chassis.rotation;
     const simd_float3 f = simd_act(simd_quaternion(q[0], q[1], q[2], q[3]), simd_make_float3(0, 0, 1));
     return std::atan2(f.x, f.z);
+}
+
+namespace {
+
+float smoothstep(float a, float b, float x) {
+    const float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3 - 2 * t);
+}
+
+}  // namespace
+
+fuel::OrbitCamera ChaseCamera::update(float dt, const DriveSession& drive, float sceneRadius, float yawOffset, float pitchOffset,
+                                      float zoom) {
+    const float speed = std::fabs(drive.state().speedKmh);
+    const simd_float3 at = drive.position();
+    const float behind = drive.heading() + float(M_PI) + yawOffset;
+    if (!started_ || simd_distance(at, focus_) > 30.0f) {  // first frame, or a reset/teleport
+        started_ = true;
+        yaw_ = behind;
+        speedFast_ = speedSlow_ = speed;
+        surge_ = 0;
+        focus_ = at;
+    }
+    speedFast_ += (speed - speedFast_) * std::min(1.0f, dt * 6.0f);
+    speedSlow_ += (speed - speedSlow_) * std::min(1.0f, dt * 1.2f);
+    // Accelerating leaves the camera behind for a moment; braking lets it catch up.
+    surge_ += (std::clamp((speedFast_ - speedSlow_) * 0.025f, -0.5f, 0.6f) - surge_) * std::min(1.0f, dt * 4.0f);
+    const float fast = smoothstep(20.0f, 160.0f, speedSlow_);
+    yaw_ += std::remainder(behind - yaw_, 2.0f * float(M_PI)) * std::min(1.0f, dt * (2.5f + 2.5f * fast));
+    // Follow the body exactly across the ground, but smooth its bumps.
+    focus_.x = at.x, focus_.z = at.z;
+    focus_.y += (at.y - focus_.y) * std::min(1.0f, dt * 9.0f);
+
+    const float base = std::clamp(sceneRadius * 2.4f, 3.4f, 10.0f);  // metres behind at rest
+    const float back = std::max(1.5f, (base * (1.0f + 0.08f * fast) + surge_) * zoom);
+    const float up = std::max(0.3f, base * 0.36f * zoom + pitchOffset * back);
+    fuel::OrbitCamera cam;
+    cam.yaw = yaw_;
+    cam.pitch = std::atan2(up, back);
+    cam.distance = std::hypot(back, up) / std::max(sceneRadius, 0.05f);
+    if (std::getenv("FUEL_CAM_TRACE")) std::printf("chase: radius %.2f back %.2f up %.2f fov %.0f\n", sceneRadius, back, up, cam.fovY * 57.3f);
+    cam.fovY = (56.0f + 12.0f * fast) * float(M_PI) / 180.0f;
+    cam.aim = base * 0.2f;
+    return cam;
+}
+
+float ChaseCamera::speedEffect() const { return smoothstep(40.0f, 170.0f, speedSlow_); }
+
+float DustSystem::random() {
+    rng_ ^= rng_ << 13, rng_ ^= rng_ >> 17, rng_ ^= rng_ << 5;
+    return float(rng_ >> 8) / float(1u << 24);
+}
+
+void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
+    using G = fuel::GripCategory;
+    // Per grip category: particles per second per wheel at speed, and the dust colour (linear).
+    struct Kind {
+        float rate;
+        simd_float3 colour;
+    };
+    static const Kind kKinds[int(G::Count)] = {
+        {0.6f, {0.30f, 0.28f, 0.26f}},   // tarmac: a little grit
+        {22.0f, {0.36f, 0.27f, 0.18f}},  // dirt
+        {3.0f, {0.30f, 0.27f, 0.18f}},   // grass
+        {26.0f, {0.50f, 0.40f, 0.28f}},  // sand
+        {18.0f, {0.80f, 0.83f, 0.88f}},  // snow
+        {7.0f, {0.22f, 0.17f, 0.11f}},   // mud
+        {10.0f, {0.38f, 0.34f, 0.29f}},  // rock and gravel
+    };
+    constexpr size_t kMaxParticles = 3000;
+    constexpr int kWheelSlots = 8;
+    const int vehicles = drive.vehicleCount();
+    if (dt > 0) {
+        lastChassis_.resize(size_t(vehicles), simd_make_float3(NAN, NAN, NAN));
+        carry_.resize(size_t(vehicles) * kWheelSlots, 0.0f);
+        for (int v = 0; v < vehicles; ++v) {
+            const fuel::VehicleState st = drive.state(v);
+            const simd_float3 body = simd_make_float3(float(st.chassis.position[0]), float(st.chassis.position[1]), float(st.chassis.position[2]));
+            simd_float3 velocity = (body - lastChassis_[size_t(v)]) / dt;
+            lastChassis_[size_t(v)] = body;
+            if (!simd_all(velocity == velocity) || simd_length(velocity) > 120.0f) velocity = 0;  // first frame or a teleport
+            if (simd_distance(body, eye) > 250.0f) continue;
+            const float speed = std::fabs(st.speedKmh);
+            const fuel::VehicleSetup& setup = drive.setup(v);
+            for (size_t w = 0; w < st.wheels.size() && w < size_t(kWheelSlots); ++w) {
+                float& owed = carry_[size_t(v) * kWheelSlots + w];
+                const int surface = w < st.wheelSurface.size() ? st.wheelSurface[w] : -1;
+                if (surface < 0) {
+                    owed = 0;
+                    continue;
+                }
+                const Kind& kind = kKinds[int(fuel::gripCategory(surface))];
+                const float skid = w < st.wheelSkid.size() ? st.wheelSkid[w] : st.skid;
+                const float push = smoothstep(4.0f, 80.0f, speed) + skid * (0.4f + 1.1f * smoothstep(2.0f, 25.0f, speed));
+                owed += kind.rate * push * dt;
+                const float radius = w < setup.wheels.size() ? setup.wheels[w].radius : 0.3f;
+                const auto& wp = st.wheels[w].position;
+                const simd_float3 contact = simd_make_float3(float(wp[0]), float(wp[1]) - radius * 0.8f, float(wp[2]));
+                for (; owed >= 1.0f; owed -= 1.0f) {
+                    if (particles_.size() >= kMaxParticles) particles_.erase(particles_.begin());
+                    Particle p;
+                    p.position = contact + simd_make_float3(random() - 0.5f, random() * 0.2f, random() - 0.5f) * 0.4f;
+                    // Thrown up and out, keeping some of the vehicle's speed; drag soon stops it.
+                    p.velocity = velocity * (0.25f + 0.2f * random()) +
+                                 simd_make_float3((random() - 0.5f) * 2.4f, 0.6f + random() * 1.6f + skid * 1.5f, (random() - 0.5f) * 2.4f);
+                    p.colour = kind.colour * (0.85f + 0.3f * random());
+                    p.age = 0;
+                    p.life = 1.4f + random() * 1.6f;
+                    p.size = 0.35f + random() * 0.3f;
+                    p.grow = 1.0f + random() * 1.2f + 0.01f * speed;
+                    p.rotation = random() * 6.2832f;
+                    p.spin = (random() - 0.5f) * 1.2f;
+                    p.opacity = (0.22f + 0.18f * random()) * std::min(1.0f, 0.5f + 0.5f * push);
+                    p.seed = random();
+                    particles_.push_back(p);
+                }
+            }
+        }
+        const float drag = std::exp(-1.8f * dt);
+        for (Particle& p : particles_) {
+            p.age += dt;
+            p.velocity = p.velocity * drag + simd_make_float3(0, 0.3f * dt, 0);  // warm dust drifts up
+            p.position += p.velocity * dt;
+            p.size += p.grow * dt * std::max(0.2f, 1.0f - p.age / p.life);
+            p.rotation += p.spin * dt;
+        }
+        particles_.erase(std::remove_if(particles_.begin(), particles_.end(), [](const Particle& p) { return p.age >= p.life; }),
+                         particles_.end());
+    }
+    drawn_.clear();
+    drawn_.reserve(particles_.size());
+    for (const Particle& p : particles_) {
+        const float t = p.age / p.life;
+        const float a = p.opacity * smoothstep(0.0f, 0.12f, t) * std::pow(1.0f - t, 1.5f);
+        drawn_.push_back({simd_make_float4(p.position, p.size), simd_make_float4(p.colour, a), simd_make_float4(p.rotation, p.seed, 0, 0)});
+    }
 }
 
 namespace {
