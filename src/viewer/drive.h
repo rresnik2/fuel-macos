@@ -57,9 +57,21 @@ public:
     void setRoads(const fuel::RoadNetwork* roads) { roads_ = roads; }
     // Call every frame; refreshes after the player has moved a little.
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
+    // Knock-aside props: small objects near the player are dynamic bodies.
+    struct PropStats {
+        size_t tracked = 0;  // props with state (a body near the player, or knocked away)
+        size_t bodies = 0;   // props currently simulated
+        size_t moved = 0;    // props displaced from where they were placed
+        float maxDisplacement = 0;  // metres, the furthest of them
+        simd_float3 where = {0, 0, 0};  // current position of that one
+    };
+    PropStats propStats() const;
+    // Position of the movable prop nearest to `from` (diagnostics); false when there is none.
+    bool nearestProp(simd_float3 from, const std::vector<simd_float3>& skip, simd_float3& out) const;
 
 private:
     static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f, kPlantRadius = 700.0f;
+    static constexpr float kPropRadius = 120.0f, kPropForget = 300.0f;  // dynamic within, state reset beyond
     const fuel::Vegetation* vegetation_ = nullptr;
     const fuel::RoadNetwork* roads_ = nullptr;
     static constexpr float kRoadRadius = 1200.0f;
@@ -69,6 +81,15 @@ private:
         uint32_t meshId;
         std::array<float, 16> world;  // row-vector convention
     };
+    // Movable props, keyed by placement index. A prop keeps its state until it is far away.
+    struct Prop {
+        std::array<float, 16> world;  // current transform (row-vector convention)
+        float scale[3];
+        bool moved = false, body = false;
+    };
+    std::unordered_map<uint32_t, Prop> props_;
+    std::unordered_map<uint32_t, float> meshRadius_;  // collision radius per mesh (-1: none)
+    void updateProps(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool dirty);
     std::vector<const fuel::DpcFile*> lookup_;
     std::vector<Placed> placed_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cells_;

@@ -87,6 +87,8 @@ public:
     // World objects drawn with the scene (not part of its bounds); meshes
     // load on first use. Returns the number of instances that could be shown.
     size_t setWorldInstances(const std::vector<MeshInstance>& instances);
+    // A small second list for props the physics moves; cheap to call every frame.
+    size_t setPropInstances(const std::vector<MeshInstance>& instances);
     // Race beacons: xyz = ground position, w = kind (0 next checkpoint,
     // 1 the one after, 2 finish). Drawn as tall glowing columns.
     void setMarkers(const std::vector<simd_float4>& markers) { markers_ = markers; }
@@ -218,6 +220,8 @@ private:
         uint32_t count;
     };
     std::vector<WorldGroup> worldGroups_;   // instanced draws
+    std::vector<Instance> propInstances_;   // movable props (shadow casters)
+    std::vector<WorldGroup> propGroups_;
     std::vector<int> inputToInstance_;  // setScene input index -> instance, or -1
     simd_float3 center_ = {0, 0, 0};
     simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};

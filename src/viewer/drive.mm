@@ -107,8 +107,66 @@ WorldStreamer::WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds,
         }
 }
 
+namespace {
+
+simd_float4x4 rowsToMatrix(const std::array<float, 16>& w) {
+    return simd_matrix(simd_make_float4(w[0], w[1], w[2], w[3]), simd_make_float4(w[4], w[5], w[6], w[7]),
+                       simd_make_float4(w[8], w[9], w[10], w[11]), simd_make_float4(w[12], w[13], w[14], w[15]));
+}
+
+}  // namespace
+
+WorldStreamer::PropStats WorldStreamer::propStats() const {
+    PropStats s;
+    s.tracked = props_.size();
+    for (const auto& [i, p] : props_) {
+        s.bodies += p.body, s.moved += p.moved;
+        if (!p.moved) continue;
+        const float d = std::hypot(p.world[12] - placed_[i].world[12], p.world[13] - placed_[i].world[13], p.world[14] - placed_[i].world[14]);
+        if (d > s.maxDisplacement) s.maxDisplacement = d, s.where = simd_make_float3(p.world[12], p.world[13], p.world[14]);
+    }
+    return s;
+}
+
+bool WorldStreamer::nearestProp(simd_float3 from, const std::vector<simd_float3>& skip, simd_float3& out) const {
+    float best = 1e30f;
+    for (const auto& [i, p] : props_) {
+        if (p.moved) continue;
+        const simd_float3 c = simd_make_float3(p.world[12], p.world[13], p.world[14]);
+        if (std::any_of(skip.begin(), skip.end(), [&](simd_float3 t) { return simd_distance(t, c) < 3.0f; })) continue;
+        if (terrain_ && std::fabs(c.y - terrain_->smoothHeightAt(c.x, c.z)) > 1.0f) continue;  // on a deck, not on the ground
+        if (simd_distance(c, from) < best) best = simd_distance(c, from), out = c;
+    }
+    return best < 1e30f;
+}
+
+// Cheap per-frame path: pull the poses of props that moved and redraw the (small) prop list.
+void WorldStreamer::updateProps(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool dirty) {
+    for (const fuel::PropPose& pp : physics.changedProps()) {
+        auto it = props_.find(pp.id);
+        if (it == props_.end()) continue;
+        Prop& p = it->second;
+        if (pp.displacement > 0.05f || pp.awake) p.moved = true;
+        const simd_quatf q = simd_quaternion(pp.pose.rotation[0], pp.pose.rotation[1], pp.pose.rotation[2], pp.pose.rotation[3]);
+        for (int r = 0; r < 3; ++r) {
+            const simd_float3 axis = simd_act(q, simd_make_float3(r == 0, r == 1, r == 2)) * p.scale[r];
+            p.world[size_t(r * 4)] = axis.x, p.world[size_t(r * 4 + 1)] = axis.y, p.world[size_t(r * 4 + 2)] = axis.z;
+        }
+        p.world[12] = float(pp.pose.position[0]), p.world[13] = float(pp.pose.position[1]), p.world[14] = float(pp.pose.position[2]);
+        dirty = true;
+    }
+    if (!dirty) return;
+    std::vector<fuel::MeshInstance> list;
+    list.reserve(props_.size());
+    for (const auto& [i, p] : props_) list.push_back({placed_[i].meshId, rowsToMatrix(p.world)});
+    renderer.setPropInstances(list);
+}
+
 void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force) {
-    if (!force && simd_distance(player, last_) < 40.0f) return;
+    if (!force && simd_distance(player, last_) < 40.0f) {
+        updateProps(renderer, physics, false);
+        return;
+    }
     last_ = player;
     std::vector<fuel::MeshInstance> draw;
     std::vector<std::pair<uint32_t, std::array<double, 16>>> solid;
@@ -122,10 +180,36 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
                 const Placed& p = placed_[i];
                 const float d = std::hypot(p.world[12] - player.x, p.world[14] - player.z);
                 if (d > kDrawRadius) continue;
+                if (props_.count(i)) continue;  // drawn from the prop list
+                if (d <= kPropRadius) {
+                    // Small objects become movable props (cached radius per mesh).
+                    auto mr = meshRadius_.find(p.meshId);
+                    if (mr == meshRadius_.end()) {
+                        fuel::CollisionMesh cm;
+                        try {
+                            cm = fuel::loadCollisionMesh(lookup_, p.meshId);
+                        } catch (const std::exception&) {
+                        }
+                        float radius = cm.indices.empty() ? -1.0f : cm.radius;
+                        if (radius >= 0.4f && radius < 3.0f) {
+                            physics.addPropShape(p.meshId, cm.positions);
+                            if (!physics.hasPropShape(p.meshId)) radius = -1.0f;
+                        }
+                        mr = meshRadius_.emplace(p.meshId, radius).first;
+                    }
+                    if (mr->second >= 0.4f && mr->second < 3.0f) {
+                        Prop prop;
+                        prop.world = p.world;
+                        for (int r = 0; r < 3; ++r) prop.scale[r] = std::max(1e-4f, std::hypot(p.world[size_t(r * 4)], p.world[size_t(r * 4 + 1)], p.world[size_t(r * 4 + 2)]));
+                        props_[i] = prop;
+                        continue;
+                    }
+                }
                 simd_float4 cols[4];
                 for (size_t c = 0; c < 4; ++c) cols[c] = simd_make_float4(p.world[c * 4], p.world[c * 4 + 1], p.world[c * 4 + 2], p.world[c * 4 + 3]);
                 draw.push_back({p.meshId, simd_matrix(cols[0], cols[1], cols[2], cols[3])});
                 if (d > kCollideRadius) continue;
+                if (auto mr = meshRadius_.find(p.meshId); mr != meshRadius_.end() && mr->second >= 0.4f && mr->second < 3.0f) continue;  // a prop
                 if (!physics.hasStaticShape(p.meshId)) {
                     fuel::CollisionMesh cm;
                     try {
@@ -154,6 +238,28 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
         }
     }
     renderer.setWorldInstances(draw);
+    // Props: simulate those near the player (and not knocked far off), forget distant ones.
+    for (auto it = props_.begin(); it != props_.end();) {
+        Prop& p = it->second;
+        const float d = std::hypot(p.world[12] - player.x, p.world[14] - player.z);
+        const bool keep = d <= kPropForget && (p.moved || d <= kPropRadius * 1.25f);
+        const bool want = keep && d <= kPropRadius * 1.25f;
+        if (!keep) {
+            if (p.body) physics.removeProp(it->first);
+            it = props_.erase(it);
+            continue;
+        }
+        if (want && !p.body) {
+            std::array<double, 16> m;
+            for (size_t k = 0; k < 16; ++k) m[k] = p.world[k];
+            p.body = physics.addProp(it->first, placed_[it->first].meshId, m);
+        } else if (!want && p.body) {
+            physics.removeProp(it->first);
+            p.body = false;
+        }
+        ++it;
+    }
+    updateProps(renderer, physics, true);
     if (roads_ && terrain_) buildRoads(player, renderer);
     physics.setStaticObjects(solid);
 }

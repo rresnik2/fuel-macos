@@ -17,6 +17,7 @@
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -41,7 +42,7 @@ using namespace JPH;
 
 namespace {
 
-constexpr ObjectLayer kStatic = 0, kMoving = 1;
+constexpr ObjectLayer kStatic = 0, kMoving = 1, kProp = 2, kWheel = 3;  // kWheel: tyre casts, which see only static ground
 constexpr float kStep = 1.0f / 60.0f;  // FUEL's own physics rate
 constexpr float kGravity = 9.81f;
 constexpr uint32_t kPatchSamples = 512;  // terrain collision patch, samples per side
@@ -141,8 +142,8 @@ struct DriveWorld::Impl {
     const Heightfield& terrain;
     TempAllocatorImpl temp{16 * 1024 * 1024};
     JobSystemThreadPool jobs{cMaxPhysicsJobs, cMaxPhysicsBarriers, int(std::max(1u, std::thread::hardware_concurrency() - 1))};
-    ObjectLayerPairFilterTable layerPairs{2};
-    BroadPhaseLayerInterfaceTable broadPhaseLayers{2, 2};
+    ObjectLayerPairFilterTable layerPairs{4};
+    BroadPhaseLayerInterfaceTable broadPhaseLayers{4, 2};
     std::unique_ptr<ObjectVsBroadPhaseLayerFilterTable> objectVsBroadPhase;
     PhysicsSystem physics;
 
@@ -151,6 +152,21 @@ struct DriveWorld::Impl {
 
     std::unordered_map<uint32_t, RefConst<Shape>> staticShapes;
     std::map<std::pair<uint32_t, std::array<double, 16>>, BodyID> staticBodies;
+
+    // Dynamic props: shapes by key (with their mass), bodies by prop id.
+    struct PropShape {
+        RefConst<Shape> shape;
+        float mass = 5;
+    };
+    std::unordered_map<uint32_t, PropShape> propShapes;
+    struct Prop {
+        BodyID body;
+        Vec3 scale = Vec3::sReplicate(1.0f);
+        RVec3 lastPos;
+        Quat lastRot;
+        RVec3 startPos;
+    };
+    std::unordered_map<uint32_t, Prop> props;
 
     VehicleSetup setup;
     BodyID car;
@@ -163,10 +179,16 @@ struct DriveWorld::Impl {
     explicit Impl(const Heightfield& hf) : terrain(hf) {
         layerPairs.EnableCollision(kMoving, kStatic);
         layerPairs.EnableCollision(kMoving, kMoving);
+        layerPairs.EnableCollision(kProp, kStatic);
+        layerPairs.EnableCollision(kProp, kMoving);
+        layerPairs.EnableCollision(kProp, kProp);
+        layerPairs.EnableCollision(kWheel, kStatic);
         broadPhaseLayers.MapObjectToBroadPhaseLayer(kStatic, BroadPhaseLayer(0));
         broadPhaseLayers.MapObjectToBroadPhaseLayer(kMoving, BroadPhaseLayer(1));
-        objectVsBroadPhase = std::make_unique<ObjectVsBroadPhaseLayerFilterTable>(broadPhaseLayers, 2, layerPairs, 2);
-        physics.Init(4096, 0, 4096, 4096, broadPhaseLayers, *objectVsBroadPhase, layerPairs);
+        broadPhaseLayers.MapObjectToBroadPhaseLayer(kProp, BroadPhaseLayer(1));
+        broadPhaseLayers.MapObjectToBroadPhaseLayer(kWheel, BroadPhaseLayer(1));
+        objectVsBroadPhase = std::make_unique<ObjectVsBroadPhaseLayerFilterTable>(broadPhaseLayers, 2, layerPairs, 4);
+        physics.Init(8192, 0, 8192, 8192, broadPhaseLayers, *objectVsBroadPhase, layerPairs);
         physics.SetGravity(Vec3(0, -kGravity, 0));
     }
 
@@ -305,7 +327,7 @@ struct DriveWorld::Impl {
         vs.mController = cs;
 
         vehicle = new VehicleConstraint(*physics.GetBodyLockInterface().TryGetBody(car), vs);
-        tester = new VehicleCollisionTesterCastCylinder(kMoving, s.bike ? 1.0f : 0.1f);  // bikes: rounded tyres
+        tester = new VehicleCollisionTesterCastCylinder(kWheel, s.bike ? 1.0f : 0.1f);  // bikes: rounded tyres
         vehicle->SetVehicleCollisionTester(tester);
         physics.AddConstraint(vehicle);
         physics.AddStepListener(vehicle);
@@ -479,6 +501,109 @@ void DriveWorld::setStaticObjects(const std::vector<std::pair<uint32_t, std::arr
         bi.DestroyBody(id);
     }
     impl_->staticBodies = std::move(keep);
+}
+
+bool DriveWorld::hasPropShape(uint32_t key) const { return impl_->propShapes.count(key) != 0; }
+
+void DriveWorld::addPropShape(uint32_t key, const std::vector<float>& positions) {
+    Impl::PropShape ps;
+    Array<Vec3> points;
+    Vec3 lo = Vec3::sReplicate(1e9f), hi = Vec3::sReplicate(-1e9f);
+    for (size_t k = 0; k + 2 < positions.size(); k += 3) {
+        const Vec3 v(positions[k], positions[k + 1], positions[k + 2]);
+        points.push_back(v);
+        lo = Vec3::sMin(lo, v);
+        hi = Vec3::sMax(hi, v);
+    }
+    if (points.size() >= 4) {
+        ConvexHullShapeSettings hs(points, 0.02f);
+        auto r = hs.Create();
+        if (!r.HasError()) ps.shape = r.Get();
+    }
+    if (ps.shape == nullptr && points.size() >= 3) {  // flat or degenerate: a thin box around the bounds
+        const Vec3 half = Vec3::sMax((hi - lo) * 0.5f, Vec3::sReplicate(0.03f));
+        ps.shape = RotatedTranslatedShapeSettings((lo + hi) * 0.5f, Quat::sIdentity(), new BoxShape(half, 0.0f)).Create().Get();
+    }
+    if (ps.shape != nullptr) ps.mass = std::clamp(ps.shape->GetMassProperties().mMass * (150.0f / 1000.0f), 5.0f, 400.0f);
+    impl_->propShapes[key] = ps;
+}
+
+bool DriveWorld::addProp(uint32_t id, uint32_t shapeKey, const std::array<double, 16>& m) {
+    auto s = impl_->propShapes.find(shapeKey);
+    if (s == impl_->propShapes.end() || s->second.shape == nullptr || impl_->props.count(id)) return false;
+    Vec3 axes[3], scale;
+    for (int r = 0; r < 3; ++r) {
+        axes[r] = Vec3(float(m[size_t(r * 4)]), float(m[size_t(r * 4 + 1)]), float(m[size_t(r * 4 + 2)]));
+        scale.SetComponent(uint(r), std::max(1e-4f, axes[r].Length()));
+        axes[r] /= scale[r];
+    }
+    const Mat44 rot(Vec4(axes[0], 0), Vec4(axes[1], 0), Vec4(axes[2], 0), Vec4(0, 0, 0, 1));
+    RefConst<Shape> shape = s->second.shape;
+    float mass = s->second.mass;
+    if (!scale.IsClose(Vec3::sReplicate(1.0f), 1e-4f)) {
+        shape = new ScaledShape(shape, scale);
+        mass = std::clamp(mass * scale.GetX() * scale.GetY() * scale.GetZ(), 5.0f, 400.0f);
+    }
+    // Stay light next to the vehicle so it pushes through (hulls overstate the volume of hollow props).
+    if (impl_->setup.mass > 10) mass = std::max(5.0f, std::min(mass, impl_->setup.mass * 0.2f));
+    const Quat q = rot.GetQuaternion().Normalized();
+    BodyCreationSettings bs(shape, RVec3(m[12], m[13], m[14]), q, EMotionType::Dynamic, kProp);
+    bs.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
+    bs.mMassPropertiesOverride.mMass = mass;
+    bs.mFriction = 0.6f;
+    bs.mRestitution = 0.15f;
+    bs.mLinearDamping = 0.05f;
+    bs.mAngularDamping = 0.2f;
+    bs.mAllowSleeping = true;
+    bs.mMotionQuality = EMotionQuality::LinearCast;  // a shove into the ground must not tunnel
+    Impl::Prop p;
+    p.body = impl_->bodies().CreateAndAddBody(bs, EActivation::DontActivate);
+    if (p.body.IsInvalid()) return false;
+    p.scale = scale;
+    p.lastPos = p.startPos = RVec3(m[12], m[13], m[14]);
+    p.lastRot = q;
+    impl_->props[id] = p;
+    return true;
+}
+
+bool DriveWorld::hasProp(uint32_t id) const { return impl_->props.count(id) != 0; }
+
+void DriveWorld::removeProp(uint32_t id) {
+    auto it = impl_->props.find(id);
+    if (it == impl_->props.end()) return;
+    impl_->bodies().RemoveBody(it->second.body);
+    impl_->bodies().DestroyBody(it->second.body);
+    impl_->props.erase(it);
+}
+
+std::vector<PropPose> DriveWorld::changedProps() {
+    std::vector<PropPose> out;
+    BodyInterface& bi = impl_->bodies();
+    for (auto& [id, p] : impl_->props) {
+        RVec3 pos;
+        Quat rot;
+        bi.GetPositionAndRotation(p.body, pos, rot);
+        if (bi.IsActive(p.body)) {
+            // Rescue a prop that still sank through the ground (terrain patch edge, deep embedding).
+            const float ground = impl_->terrain.smoothHeightAt(float(pos.GetX()), float(pos.GetZ()));
+            if (std::fabs(pos.GetX() - impl_->patchX) < 1000 && std::fabs(pos.GetZ() - impl_->patchZ) < 1000 && pos.GetY() < ground - 1.0f) {
+                pos = RVec3(pos.GetX(), ground + 0.3f, pos.GetZ());
+                bi.SetPositionAndRotation(p.body, pos, rot, EActivation::Activate);
+                bi.SetLinearAndAngularVelocity(p.body, Vec3::sZero(), Vec3::sZero());
+            }
+        }
+        if ((pos - p.lastPos).LengthSq() < 1e-8f && rot.IsClose(p.lastRot, 1e-8f)) continue;
+        p.lastPos = pos;
+        p.lastRot = rot;
+        PropPose pp;
+        pp.id = id;
+        pp.pose.position = {double(pos.GetX()), double(pos.GetY()), double(pos.GetZ())};
+        pp.pose.rotation = {rot.GetX(), rot.GetY(), rot.GetZ(), rot.GetW()};
+        pp.awake = bi.IsActive(p.body);
+        pp.displacement = float((pos - p.startPos).Length());
+        out.push_back(pp);
+    }
+    return out;
 }
 
 VehicleState DriveWorld::state() const {
