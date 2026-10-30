@@ -225,7 +225,8 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
                 }
                 const Kind& kind = kKinds[int(fuel::gripCategory(surface))];
                 const float skid = w < st.wheelSkid.size() ? st.wheelSkid[w] : st.skid;
-                const float push = smoothstep(4.0f, 80.0f, speed) + skid * (0.15f + 1.35f * smoothstep(2.0f, 25.0f, speed));
+                // Wheelspin on the spot (a start line full of revving opponents) throws little.
+                const float push = smoothstep(4.0f, 80.0f, speed) + skid * 1.5f * smoothstep(3.0f, 25.0f, speed);
                 owed += kind.rate * push * dt;
                 const float radius = w < setup.wheels.size() ? setup.wheels[w].radius : 0.3f;
                 const auto& wp = st.wheels[w].position;
@@ -239,12 +240,12 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
                                  simd_make_float3((random() - 0.5f) * 2.4f, 0.6f + random() * 1.6f + skid * 1.5f, (random() - 0.5f) * 2.4f);
                     p.colour = kind.colour * (0.85f + 0.3f * random());
                     p.age = 0;
-                    p.life = 1.4f + random() * 1.6f;
+                    p.life = 1.2f + random() * 1.2f;
                     p.size = 0.35f + random() * 0.3f;
                     p.grow = 1.0f + random() * 1.2f + 0.01f * speed;
                     p.rotation = random() * 6.2832f;
                     p.spin = (random() - 0.5f) * 1.2f;
-                    p.opacity = (0.45f + 0.3f * random()) * std::min(1.0f, 0.4f + 0.6f * push);
+                    p.opacity = (0.3f + 0.2f * random()) * std::min(1.0f, 0.4f + 0.6f * push);
                     p.seed = random();
                     particles_.push_back(p);
                 }

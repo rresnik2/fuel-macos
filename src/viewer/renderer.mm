@@ -514,7 +514,7 @@ vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const de
     const float mu = dot(normalize(p.position.xyz - f.eye.xyz), L);
     const float g = 0.55;
     const float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5) / (4.0 * M_PI_F);
-    float3 light = kSunColour * f.sunDir.w * (0.35 + hg * 1.8) + float3(0.28, 0.28, 0.29);
+    float3 light = kSunColour * f.sunDir.w * (0.35 + hg * 1.2) + float3(0.28, 0.28, 0.29);
     o.rgb = haze(p.colour.rgb * light, p.position.xyz, f);
     o.alpha = p.colour.a;
     return o;
@@ -530,7 +530,7 @@ fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0
     // The resolved depth turns back into a view distance with zn and q (fog.zw).
     float d = depth.read(uint2(in.position.xy));
     float scene = f.fog.z * f.fog.w / (d + f.fog.w);
-    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 0.3) / max(0.8, in.radius * 0.7));
+    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 0.4) / max(1.2, in.radius * 1.2));
     float a = saturate(in.alpha * blob * fade);
     return float4(in.rgb, a);
 }
