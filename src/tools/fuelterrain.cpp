@@ -8,6 +8,8 @@
 
 #include "core/dpc.hpp"
 #include "core/ground.hpp"
+#include "core/ground_point.hpp"
+#include "core/roads.hpp"
 #include "core/terrain.hpp"
 #include "core/world.hpp"
 
@@ -67,6 +69,63 @@ int main(int argc, char** argv) {
                     }
                 std::printf("flat surfaces used: %zu; placements: %zu fixed + %zu FITTOGROUND\n", used, total, fit);
                 std::printf("within 0.5 m: raw %zu, levelled %zu; within 2 m: raw %zu, levelled %zu\n", onRaw, onLevelled, nearRaw, nearLevelled);
+            } else if (a == "--grass" && i + 3 < argc) {
+                // --grass X Z R: the decoded ground generator (grass, rock, fields) around (X, Z),
+                // with timing and statistics; also a map of the area as grass.ppm (R/G/B = grass/rock/field).
+                const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
+                const int r = std::atoi(argv[i + 3]);
+                i += 3;
+                fuel::Heightfield levelled = hf;
+                fuel::applyFlatSurfaces(levelled, dpc);
+                std::unique_ptr<fuel::RoadNetwork> roads;
+                try {
+                    roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(dpc));
+                } catch (const std::exception&) {
+                }
+                const fuel::GroundGenerator gen(dpc, levelled, roads.get());
+                if (std::getenv("FUEL_GPOINT")) {  // a line of points eastwards, one per 5 m
+                    for (int k = 0; k < r; k += 5) {
+                        const fuel::GroundPoint p = gen.at(x + k, z);
+                        std::printf("  %+5d: y %7.1f n.y %.3f hum %.2f/%.2f road %.2f cover %.2f high %.2f rock %.2f field %d grass %.2f/%.2f size %.2f\n", k,
+                                    p.height, p.normal[1], p.humidity, p.surfaceHumidity, p.road, p.cover, p.highGround, p.rock, p.field, p.grass,
+                                    p.groundGrass, p.grassSize);
+                    }
+                }
+                const auto g0 = std::chrono::steady_clock::now();
+                std::vector<fuel::GrassTuft> tufts;
+                gen.grass(int32_t(x) - r, int32_t(z) - r, int32_t(x) + r, int32_t(z) + r, tufts);
+                const double gs = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count();
+                std::printf("grass: %zu tufts over %d x %d m in %.1f ms (%.2f us per point)\n", tufts.size(), 2 * r, 2 * r, gs * 1e3,
+                            gs * 1e6 / (4.0 * r * r));
+                double sumSize = 0;
+                int tiles[16] = {};
+                for (const auto& t : tufts) sumSize += t.size, tiles[t.tile & 15]++;
+                if (!tufts.empty()) std::printf("  mean size %.2f m; tiles", sumSize / double(tufts.size()));
+                for (int k = 0; k < 9; ++k) std::printf(" %d", tiles[k]);
+                std::printf("\n");
+                // Coarse map: one point per 4 m.
+                const int n = r / 2;
+                std::ofstream out("grass.ppm", std::ios::binary);
+                out << "P6\n" << n << " " << n << "\n255\n";
+                double sum[6] = {};
+                int fields[3] = {}, excluded = 0;
+                for (int j = 0; j < n; ++j)
+                    for (int k = 0; k < n; ++k) {
+                        const double px = x - r + k * 4.0, pz = z - r + j * 4.0;
+                        const fuel::GroundPoint p = gen.at(px, pz);
+                        sum[0] += p.groundGrass, sum[1] += p.rock, sum[2] += p.road, sum[3] += p.surfaceHumidity, sum[4] += p.grassSize,
+                            sum[5] += p.cover;
+                        fields[std::clamp(p.field, 0, 2)]++;
+                        excluded += gen.excludesPlants(px, pz);
+                        const unsigned char px3[3] = {(unsigned char)(p.groundGrass * 255), (unsigned char)(p.rock * 255),
+                                                      (unsigned char)(p.field * 120)};
+                        out.write(reinterpret_cast<const char*>(px3), 3);
+                    }
+                const double cnt = double(n) * n;
+                std::printf("  means: groundGrass %.3f rock %.3f road %.3f surfHumidity %.3f size %.3f cover %.3f\n", sum[0] / cnt,
+                            sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, sum[4] / cnt, sum[5] / cnt);
+                std::printf("  fields: none %d ploughed %d crops %d; in no-plant flat surfaces: %d (of %d)\n", fields[0], fields[1], fields[2],
+                            excluded, n * n);
             } else if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
                 std::printf("height at (%.1f, %.1f) = %.2f m\n", x, z, hf.heightAt(x, z));

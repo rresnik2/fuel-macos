@@ -14,6 +14,7 @@
 
 #include "dpc.hpp"
 #include "genworld_noise.hpp"
+#include "ground_point.hpp"
 #include "roads.hpp"
 #include "surface.hpp"
 #include "terrain.hpp"
@@ -42,9 +43,6 @@ struct Species {
 
 struct Vegetation {
     std::vector<Species> trees, bushes;
-    // Ground clutter prototypes: small plants for grassy ground, a rock cluster that,
-    // shrunk, makes stones on dirt and rock.
-    std::vector<uint32_t> tufts, stones;
     // GenWorld maps 7 (forest), 2 (humidity), 14 (stormed), 13 (incinerated),
     // 16 (sanded), 15 (flooded).
     Raster forest, humidity, stormed, incinerated, sanded, flooded;
@@ -63,17 +61,13 @@ Vegetation loadVegetation(const DpcFile& world);  // throws if the world has no 
 
 // Plants between `inner` and `radius` metres of (x, z), appended to `out`;
 // with `impostors` they use the species' distant cards (bushes are skipped).
-// `roads` (optional) keeps them off the road network; `blocked` (optional) says
-// whether placed objects come within 5 m of a spot (the engine's last test).
+// `roads` (optional) keeps them off the road network; `ground` (optional) applies the
+// engine's ground tests (no plants on rocky ground, in farm fields or in flat surfaces
+// that forbid them); `blocked` (optional) says whether placed objects come within 5 m
+// of a spot (the engine's last test).
+// Grass is not a Plant: see GroundGenerator::grass (ground_point.hpp).
 using BlockedQuery = std::function<bool(double x, double z)>;
 void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNetwork* roads, const BlockedQuery& blocked, float x, float z,
-                   float radius, std::vector<Plant>& out, bool impostors = false, float inner = 0);
-
-// Dense, small ground detail (grass tufts, scrub, stones) within `radius` of (x, z),
-// picked by the surface type under each spot; none on roads or tarmac. (FUEL draws
-// grass as 1 m-grid sprite tufts from its Grass atlas, driven by per-point ground
-// data the port does not have; this is an approximation.)
-void scatterClutter(const Vegetation& v, const Heightfield& terrain, const SurfaceQuery& surface, float x, float z, float radius,
-                    std::vector<Plant>& out);
+                   float radius, std::vector<Plant>& out, bool impostors = false, float inner = 0, const GroundGenerator* ground = nullptr);
 
 }  // namespace fuel
