@@ -46,6 +46,8 @@ struct FrameUniforms {
                           // z near plane, w projection q = far / (near - far) (for view distances from depth)
     float4 camRight;      // camera axes in world space, for sprites
     float4 camUp;
+    float4 groundFar;     // rgb: far-band forest colour (palette 57, linear); w = 1 when the colour map is
+                          // FUEL's decoded point colour (alpha = forest weight), 0 for the old heuristic map
 };
 
 struct MaterialUniforms {
@@ -376,7 +378,9 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
         float2 uv = (xz + 70000.0) / 140000.0;
-        c = groundGrade(groundColour.sample(lin, uv).rgb);
+        const float4 gc = groundColour.sample(lin, uv);
+        // Decoded map (p16): the point colour ctx+0x70 as is; the heuristic map gets the old grade.
+        c = f.groundFar.w > 0.0 ? gc.rgb : groundGrade(gc.rgb);
         const float2 warp = float2(xz.x + 5.0 * sin(0.02 * xz.y) + 2.0 * sin(0.2 * xz.y),
                                    xz.y + 5.0 * sin(0.02 * xz.x) + 2.0 * sin(0.2 * xz.x));
         // Surface types of the four nearest map samples: the near textures, and the
@@ -413,7 +417,15 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         };
         float4 d = bandDetail(chunk);
         if (tween > 0.0) d = mix(d, bandDetail(chunk * 2.0), tween);
-        c *= d.b * 2.0;
+        // Vertex colour by band (FUN_007f9b50): chunks >= 600 m use ctx+0x90, the colour with the
+        // forest floor (palette 57) by weight k (map alpha); nearer ones ctx+0x70/0x80 (equal on land).
+        if (f.groundFar.w > 0.0) {
+            const float farW = mix(chunk >= 600.0 ? 1.0 : 0.0, chunk * 2.0 >= 600.0 ? 1.0 : 0.0, tween);
+            c = mix(c, f.groundFar.rgb, gc.a * farW);
+        }
+        // ground.phl: colour x detail.B x 2, in gamma space for the decoded map (see vsGrass).
+        if (f.groundFar.w > 0.0) c = pow(pow(c, 1.0 / 2.2) * d.b * 2.0, 2.2);
+        else c *= d.b * 2.0;
         float3 nt = normalize(float3(d.r, d.g, d.a) * 2.0 - 1.0);
         // ground.vhl tangent frame: x = cross(z, N), y = N, z = cross(x, N).
         float3 T = normalize(cross(float3(0, 0, 1), N)), B = normalize(cross(T, N));
@@ -724,6 +736,7 @@ const char* kGrassShaderSource = R"METAL(
 struct GrassInstance {
     float4 posSize;  // base xyz, card height
     uchar4 info;     // atlas cell, wind amplitude x 100, road weight x 255, unused
+    uchar4 colour;   // the point's ground colour (sRGB) and sky occlusion (p16)
 };
 
 struct GrassParams {
@@ -735,6 +748,7 @@ struct GrassOut {
     float3 world;
     float2 uv;
     float3 tint;
+    float occlusion;
     float4 sunPos;
 };
 
@@ -767,13 +781,13 @@ vertex GrassOut vsGrass(uint vid [[vertex_id]], uint iid [[instance_id]], consta
     o.world = w;
     const uint tile = t.info.x;
     o.uv = float2(float(tile & 3u), float(tile >> 2u)) * 0.25 + kGrassUv[c];
-    o.tint = float3(1.0);
-    if (f.fog.y > 0.0) {
-        constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
-        o.tint = groundGrade(groundColour.sample(lin, (base.xz + 70000.0) / 140000.0, level(0)).rgb) * 2.0;
-    }
-    // The engine lerps two ground colours by the road weight; dirt tracks get drier grass.
-    o.tint = mix(o.tint, o.tint * float3(1.15, 1.0, 0.75), float(t.info.z) / 255.0);
+    // ground_rotshape.vhl: vcolor = colour x 2 (x the scattering extinction, which the port's haze
+    // applies later); the colour is the decoded point colour lerp(ctx+0x80, ctx+0x50, road) and its
+    // alpha the sky occlusion. The texel multiplies it in the pixel shader.
+    // FUEL multiplies in gamma space (DX9, no sRGB reads), so x2 is applied before linearising:
+    // linear(2 c x tex) = linear(2 c) x linear(tex) (power law).
+    o.tint = pow(2.0 * float3(t.colour.rgb) / 255.0, 2.2);
+    o.occlusion = float(t.colour.a) / 255.0;
     o.sunPos = f.sunViewProj * float4(w, 1.0);
     return o;
 }
@@ -783,11 +797,11 @@ fragment float4 fsGrass(GrassOut in [[stage_in]], constant FrameUniforms& f [[bu
     constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge, max_anisotropy(4));
     float4 d = atlas.sample(smp, in.uv);
     if (d.a < 0.4) discard_fragment();
-    const float lum = max(dot(in.tint, float3(0.3, 0.55, 0.15)), 1e-3);
-    d.rgb *= in.tint / lum * clamp(lum, 0.6, 1.0);
+    d.rgb *= in.tint;
     const float shadow = mix(0.55, 1.0, shadowFactor(shadowMap, in.sunPos));
     const float3 V = normalize(f.eye.xyz - in.world);
-    const float3 rgb = lighting(d.rgb, float3(0, 1, 0), V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
+    // The occlusion scales the sky light only (ground_rotshape.vhl: lerp(DSKY_AMBIENT, sky, occlusion)).
+    const float3 rgb = lighting(d.rgb, float3(0, 1, 0), V, in.occlusion, shadow, 0.0, 1.0, float2(0), false, f);
     return float4(haze(rgb, in.world, f), d.a);
 }
 )METAL";
@@ -808,6 +822,7 @@ struct FrameUniforms {
     simd_float4 fog;
     simd_float4 camRight;
     simd_float4 camUp;
+    simd_float4 groundFar;
 };
 
 namespace {
@@ -1058,6 +1073,8 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
                                                                                    height:maps.size
                                                                                 mipmapped:YES];
     groundColour_ = [device_ newTextureWithDescriptor:td];
+    groundFar_ = simd_make_float4(srgbToLinear(maps.farColour[0]), srgbToLinear(maps.farColour[1]), srgbToLinear(maps.farColour[2]),
+                                  maps.decoded ? 1.0f : 0.0f);
     [groundColour_ replaceRegion:MTLRegionMake2D(0, 0, maps.size, maps.size) mipmapLevel:0 withBytes:maps.colour.data() bytesPerRow:maps.size * 4];
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:maps.size height:maps.size mipmapped:NO];
     groundSurface_ = [device_ newTextureWithDescriptor:td];
@@ -1689,6 +1706,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
     fu.fog = simd_make_float4(terrain ? 1.0f / 3600.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, zn, zf / (zn - zf));
+    fu.groundFar = groundFar_;
     fu.sunDir = simd_make_float4(sunDir_, 4.2f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
     fu.eye = simd_make_float4(eye, 1);
@@ -1977,6 +1995,7 @@ void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
     struct Gpu {
         simd_float4 posSize;
         uint8_t info[4];
+        uint8_t colour[4];
     };
     static_assert(sizeof(Gpu) == 32, "matches GrassInstance");
     grassCount_ = tufts.size();
@@ -1985,7 +2004,7 @@ void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
     std::vector<Gpu> data(tufts.size());
     for (size_t i = 0; i < tufts.size(); ++i) {
         const GrassTuft& t = tufts[i];
-        data[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}};
+        data[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}, {t.rgb[0], t.rgb[1], t.rgb[2], t.occlusion}};
     }
     grassBuffer_ = [device_ newBufferWithBytes:data.data() length:data.size() * sizeof(Gpu) options:MTLResourceStorageModeShared];
 }

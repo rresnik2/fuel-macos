@@ -27,10 +27,23 @@ struct GroundPoint {
     float cover = 0;            // flat-surface coverage (ctx+0x2e0)
     float highGround = 0;       // snow line factor minus road (ctx+0x19c)
     float rock = 0;             // rock cover (ctx+0x1e0)
+    float rockSlope = 0;        // rock cover with steep slopes (ctx+0x1e4)
+    float tarmac = 0;           // tarmac share of the road (ctx+0x1f4; port approximation)
     int field = 0;              // farm field type: 0 none, 1 ploughed, 2 crops (ctx+0x2e8)
+    float fieldRandom = 0;      // the field cell's random byte / 255 (picks the crop colours)
     float grass = 0;            // Grass (ctx+0x1c8)
     float groundGrass = 0;      // GroundGrass (ctx+0x1cc): what the grass tufts use
     float grassSize = 0;        // ctx+0x234
+};
+
+// The point's ground colours (sRGB 0..1, as the palette stores them), decoded from the
+// point evaluator's colour bits (see ~/re-work/fuel/notes/p16-colours.md C1-C12).
+struct GroundColours {
+    float base[3] = {0, 0, 0};  // ctx+0x80 = ctx+0x70 on dry land: terrain near/mid bands, tufts off the road
+    float far[3] = {0, 0, 0};   // ctx+0x90: terrain beyond 600 m chunks (forest floor and snow tint)
+    float road[3] = {0, 0, 0};  // ctx+0x50: road colour (tufts on the road); base where road <= 0.025
+    float occlusion = 1;        // ctx+0x230 (map 9; the engine also shades it under near trees)
+    float forest = 0;           // k: weight of the far band's forest colour (palette 57)
 };
 
 // One grass tuft as Grass_EmitTuft (0x7dce50) builds it.
@@ -40,7 +53,9 @@ struct GrassTuft {
     uint8_t tile;       // cell of the 4x4 Grass atlas
     uint8_t windAmp;    // (r2/255 + 1) * 0.5 * 2.25, stored x 100
     uint8_t tint;       // road weight x 255 (the engine lerps two ground colours by it)
-    uint8_t pad = 0;
+    uint8_t occlusion;  // clamp(0.8 a + 0.2) x 255, a = ctx+0x230 (sky light occlusion in the shader)
+    uint8_t rgb[3];     // lerp(ctx+0x80, ctx+0x50, road), sRGB bytes
+    uint8_t pad2 = 0;
 };
 
 class GroundGenerator {
@@ -52,6 +67,15 @@ public:
 
     // Evaluates the point (x, z). With `full` false only what the tree filter needs.
     GroundPoint at(double x, double z, bool full = true) const;
+    // The point's colours (needs `p` from at(x, z) with full = true). `t0` overrides the
+    // palette-half noise T0 (>= 0: e.g. its mean over a map cell).
+    GroundColours colours(double x, double z, const GroundPoint& p, float t0 = -1) const;
+    // Mean of T0 over a square of side `size` centred on (x, z) (n x n samples).
+    float meanT0(double x, double z, double size, int n) const;
+    bool hasPalette() const { return palette_.size() >= 123; }
+    std::array<float, 3> paletteColour(int slot) const {
+        return {palette_[size_t(slot)][0], palette_[size_t(slot)][1], palette_[size_t(slot)][2]};
+    }
     // Trees_Excluded (0x7831e0), the part the port has: inside a flat surface that
     // allows no plants (byte +0x81 == 0). Lakes, rivers and zones are not tested.
     bool excludesPlants(double x, double z) const;
@@ -80,9 +104,9 @@ private:
     SurfaceWeights surfaceWeights(double x, double z) const;
     double insideDistance(const Surface& s, double x, double z) const;
     float edgeJitter(double x, double z) const;
-    float roadWeight(double x, double z, bool* nearRoad) const;
-    float rockCover(double x, double z, const GroundPoint& p, float coarseNy) const;
-    int fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover) const;
+    float roadWeight(double x, double z, bool* nearRoad, float* tarmac = nullptr) const;
+    void rockCover(double x, double z, GroundPoint& p, float coarseNy) const;
+    int fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover, float* random) const;
     float mapAt(int slot, double x, double z) const;
 
     const Heightfield* terrain_ = nullptr;
@@ -94,6 +118,8 @@ private:
     // Noise bank (genWorld+0x4498) and terrain-detail object T, by their offsets.
     Fractal f1fac_, ffd8_, f2f80_, ffd44_, f7ea4_, f6ed0_, edgeA_, edgeB_;
     Fractal t0c_, t18_, t24_, t28_;
+    Fractal f0004_, f9e4c_, fcdc8_;                 // colour noises (p16 C8, C11)
+    std::vector<std::array<float, 4>> palette_;    // GenWorld Colors by slot
     std::vector<float> tileWeight_, tileSize_;
     uint32_t grassAtlas_ = 0;  // FUEL.exe 0x9ff02c / 0x9ff04c
 };

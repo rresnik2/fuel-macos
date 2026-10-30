@@ -95,12 +95,17 @@ int main(int argc, char** argv) {
                     std::printf("fieldscan: none %ld ploughed %ld crops %ld; flat and low %ld\n", counts[0], counts[1], counts[2], flatLow);
                     (void)popOk;
                 }
+                if (std::getenv("FUEL_GPOINT")) std::printf("mean T0 over 1 km: %.3f\n", gen.meanT0(x, z, 1000, 40));
                 if (std::getenv("FUEL_GPOINT")) {  // a line of points eastwards, one per 5 m
                     for (int k = 0; k < r; k += 5) {
                         const fuel::GroundPoint p = gen.at(x + k, z);
                         std::printf("  %+5d: y %7.1f n.y %.3f hum %.2f/%.2f road %.2f cover %.2f high %.2f rock %.2f field %d grass %.2f/%.2f size %.2f\n", k,
                                     p.height, p.normal[1], p.humidity, p.surfaceHumidity, p.road, p.cover, p.highGround, p.rock, p.field, p.grass,
                                     p.groundGrass, p.grassSize);
+                        const fuel::GroundColours c = gen.colours(x + k, z, p);
+                        std::printf("         colour %.3f %.3f %.3f far %.3f %.3f %.3f road %.3f %.3f %.3f occ %.2f forest %.2f rockSlope %.2f tarmac %.0f\n",
+                                    c.base[0], c.base[1], c.base[2], c.far[0], c.far[1], c.far[2], c.road[0], c.road[1], c.road[2],
+                                    c.occlusion, c.forest, p.rockSlope, p.tarmac);
                     }
                 }
                 const auto g0 = std::chrono::steady_clock::now();
