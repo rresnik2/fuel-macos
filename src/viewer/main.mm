@@ -191,6 +191,7 @@ Options parseArgs(int argc, const char** argv) {
     if (!o.assemble.empty() && (!o.scene.empty() || o.haveMeshId)) die("--assemble cannot be combined with --scene or --mesh");
     if (!o.assemble.empty() && !o.vehicle.empty()) die("with --assemble the paint follows the variant; drop --vehicle");
     if (o.propCheck && o.shot.empty()) o.shot = "-";  // headless: drive and report, no picture
+    if (o.propCheck) o.opponents = 0;                  // the player alone among the props
     if (o.aiCheck) {
         if (o.race.empty()) die("--ai-check needs --race NAME");
         if (o.shot.empty()) o.shot = "-";
