@@ -444,7 +444,7 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
     if (vegetation_ && terrain_) {
         std::vector<fuel::Plant> scattered, plants;
         const fuel::BlockedQuery blocked = [this](double x, double z) { return nearObstacle(x, z, kPlantClearance); };
-        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kPlantRadius, scattered);
+        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kPlantRadius, scattered, false, 0, ground_);
         // Trees are solid near the player: a trunk cylinder sized with the tree.
         std::unordered_map<uint32_t, uint32_t> card;  // full mesh -> distant card (0 = none)
         std::unordered_set<uint32_t> trees;
@@ -478,7 +478,6 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         }
         if (std::getenv("FUEL_STREAM_TRACE"))
             std::printf("plants: %zu scattered, %zu drawn (%zu trunks)\n", scattered.size(), plants.size(), bg.trunks.size());
-        fuel::scatterClutter(*vegetation_, *terrain_, surfaces_, player.x, player.z, kClutterRadius, plants);
         bg.plants.reserve(plants.size());
         for (const fuel::Plant& p : plants) {
             auto col = [&](size_t i) { return simd_make_float4(p.axes[i][0], p.axes[i][1], p.axes[i][2], 0); };
@@ -534,6 +533,7 @@ void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorl
 }
 
 void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force) {
+    updateGrass(player, renderer, force);
     pollBackground(renderer, physics);
     if (!force && simd_distance(player, last_) < 40.0f) {
         updateProps(renderer, physics, false);
@@ -714,4 +714,58 @@ WorldStreamer::RoadMesh WorldStreamer::buildRoads(simd_float3 player) const {
         out.batches.push_back({roads_->styles[type].texture, first, uint32_t(vi.second.size()), !tarmac});
     }
     return out;
+}
+
+// ---- Grass (p14) ----
+
+WorldStreamer::GrassJob WorldStreamer::buildGrass(simd_float3 player, GrassCache cache) const {
+    GrassJob job;
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t built = 0;
+    const int32_t c0x = int32_t(std::floor((player.x - kGrassRadius) / kGrassChunk)), c1x = int32_t(std::floor((player.x + kGrassRadius) / kGrassChunk));
+    const int32_t c0z = int32_t(std::floor((player.z - kGrassRadius) / kGrassChunk)), c1z = int32_t(std::floor((player.z + kGrassRadius) / kGrassChunk));
+    // Forget chunks well outside the radius.
+    for (auto it = cache.begin(); it != cache.end();) {
+        const int32_t cx = int32_t(uint32_t(it->first >> 32)), cz = int32_t(uint32_t(it->first));
+        if (cx < c0x - 2 || cx > c1x + 2 || cz < c0z - 2 || cz > c1z + 2) it = cache.erase(it);
+        else ++it;
+    }
+    for (int32_t cz = c0z; cz <= c1z; ++cz)
+        for (int32_t cx = c0x; cx <= c1x; ++cx) {
+            // Chunk centre distance (to its nearest point) against the radius.
+            const float nx = std::clamp(player.x, float(cx * kGrassChunk), float((cx + 1) * kGrassChunk));
+            const float nz = std::clamp(player.z, float(cz * kGrassChunk), float((cz + 1) * kGrassChunk));
+            if (std::hypot(nx - player.x, nz - player.z) > kGrassRadius) continue;
+            const uint64_t key = (uint64_t(uint32_t(cx)) << 32) | uint32_t(cz);
+            auto it = cache.find(key);
+            if (it == cache.end()) {
+                std::vector<fuel::GrassTuft> tufts;
+                ground_->grass(cx * kGrassChunk, cz * kGrassChunk, (cx + 1) * kGrassChunk, (cz + 1) * kGrassChunk, tufts);
+                ++built;
+                it = cache.emplace(key, std::move(tufts)).first;
+            }
+            job.tufts.insert(job.tufts.end(), it->second.begin(), it->second.end());
+        }
+    job.cache = std::move(cache);
+    if (std::getenv("FUEL_STREAM_TRACE"))
+        std::printf("grass: %zu tufts, %zu new chunks in %.1f ms\n", job.tufts.size(), built, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return job;
+}
+
+void WorldStreamer::updateGrass(simd_float3 player, fuel::MeshRenderer& renderer, bool force) {
+    if (ground_ == nullptr) return;
+    auto apply = [&](GrassJob&& job) {
+        grassCache_ = std::move(job.cache);
+        renderer.grassRadius = kGrassRadius;
+        renderer.setGrass(job.tufts);
+    };
+    if (grassJob_.valid() && (force || grassJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) apply(grassJob_.get());
+    const float moved = std::hypot(player.x - grassAt_.x, player.z - grassAt_.z);
+    if (moved < kGrassStep || grassJob_.valid()) return;
+    grassAt_ = player;
+    if (force) {
+        apply(buildGrass(player, std::move(grassCache_)));
+        return;
+    }
+    grassJob_ = std::async(std::launch::async, [this, player, cache = std::move(grassCache_)]() mutable { return buildGrass(player, std::move(cache)); });
 }

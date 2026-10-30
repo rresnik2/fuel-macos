@@ -1192,6 +1192,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
+        std::unique_ptr<fuel::GroundGenerator> ground;  // p14: grass and the trees' ground tests
         std::unique_ptr<WorldStreamer> streamer;  // after what its worker reads, so it is destroyed (and waits) first
         std::unique_ptr<Garage> garage;
         std::unique_ptr<RaceSession> race;
@@ -1282,6 +1283,9 @@ int main(int argc, const char** argv) {
                             gSurfaces.roads = roads.get();
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
                             std::printf("vegetation: %zu tree and %zu bush species\n", vegetation->trees.size(), vegetation->bushes.size());
+                            ground = std::make_unique<fuel::GroundGenerator>(*f, *terrain, roads.get());  // p14
+                            streamer->setGround(ground.get());
+                            renderer.setGrassAtlas(ground->grassAtlas());
                         } catch (const std::exception& e) {
                             std::fprintf(stderr, "fuelview: vegetation: %s\n", e.what());
                         }

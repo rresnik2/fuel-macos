@@ -1,0 +1,101 @@
+// FUEL's per-point ground generator (GenWorld "point context", FUN_006bcfd0 and
+// its lazy property functions), as far as the port needs it: grass amount and
+// size for the grass tufts, rock cover and farm fields for the tree filter.
+// Decoded from FUEL.exe; see ~/re-work/fuel/notes/p14-grass-ground.md (G1-G12)
+// for addresses and for what is approximated (water, the road profile table,
+// the coarse normal sampler, humidity noise).
+#pragma once
+
+#include "dpc.hpp"
+#include "genworld_noise.hpp"
+#include "roads.hpp"
+#include "terrain.hpp"
+
+#include <array>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+namespace fuel {
+
+struct GroundPoint {
+    float height = 0;
+    float normal[3] = {0, 1, 0};
+    float humidity = 0;         // Underground Humidity (map 2)
+    float surfaceHumidity = 0;  // Surface Humidity: drier on slopes
+    float road = 0;             // road weight 0..1 (1 on the road surface)
+    float cover = 0;            // flat-surface coverage (ctx+0x2e0)
+    float highGround = 0;       // snow line factor minus road (ctx+0x19c)
+    float rock = 0;             // rock cover (ctx+0x1e0)
+    int field = 0;              // farm field type: 0 none, 1 ploughed, 2 crops (ctx+0x2e8)
+    float grass = 0;            // Grass (ctx+0x1c8)
+    float groundGrass = 0;      // GroundGrass (ctx+0x1cc): what the grass tufts use
+    float grassSize = 0;        // ctx+0x234
+};
+
+// One grass tuft as Grass_EmitTuft (0x7dce50) builds it.
+struct GrassTuft {
+    float x, y, z;      // base (sunk on slopes)
+    float size;         // card height in metres (width 1.5 x size)
+    uint8_t tile;       // cell of the 4x4 Grass atlas
+    uint8_t windAmp;    // (r2/255 + 1) * 0.5 * 2.25, stored x 100
+    uint8_t tint;       // road weight x 255 (the engine lerps two ground colours by it)
+    uint8_t pad = 0;
+};
+
+class GroundGenerator {
+public:
+    GroundGenerator() = default;
+    // `terrain` is the levelled heightfield; `roads` may be null.
+    GroundGenerator(const DpcFile& world, const Heightfield& terrain, const RoadNetwork* roads);
+    bool valid() const { return terrain_ != nullptr; }
+
+    // Evaluates the point (x, z). With `full` false only what the tree filter needs.
+    GroundPoint at(double x, double z, bool full = true) const;
+    // Trees_Excluded (0x7831e0), the part the port has: inside a flat surface that
+    // allows no plants (byte +0x81 == 0). Lakes, rivers and zones are not tested.
+    bool excludesPlants(double x, double z) const;
+    // Trees_Filter / Bushes_Filter tests that use the point: rock cover > 0.1, farm field.
+    bool rejectsPlant(double x, double z) const;
+
+    // Grass_Build + Grass_Decide + Grass_EmitTuft over the 1 m grid points with
+    // integer coordinates in [x0, x1) x [z0, z1); appends to `out`.
+    void grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std::vector<GrassTuft>& out) const;
+
+    const Permutation& permutation() const { return perm_; }
+    // Bitmap_Z of the Grass material's 4x4 tuft atlas (0 if not found).
+    uint32_t grassAtlas() const { return grassAtlas_; }
+
+private:
+    struct Surface {
+        double cx, cz, ax, az, lenX, bx, bz, lenZ;
+        float invMargin;
+        float grassCut, grassNoise, grassAdd, w300, w9c;  // file +0x54, +0x58, +0x5c, +0x60, ? (see notes G4)
+        bool ellipse, allowPlants;
+        double radius;
+    };
+    struct SurfaceWeights {
+        float cover = 0, cut = 0, noise = 0, add = 0, keep = 1;
+    };
+    SurfaceWeights surfaceWeights(double x, double z) const;
+    double insideDistance(const Surface& s, double x, double z) const;
+    float edgeJitter(double x, double z) const;
+    float roadWeight(double x, double z, bool* nearRoad) const;
+    float rockCover(double x, double z, const GroundPoint& p, float coarseNy) const;
+    int fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover) const;
+    float mapAt(int slot, double x, double z) const;
+
+    const Heightfield* terrain_ = nullptr;
+    const RoadNetwork* roads_ = nullptr;
+    Permutation perm_{};
+    std::array<Raster, 31> maps_{};
+    std::vector<Surface> surfaces_;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> surfaceCells_;  // 64 m cells
+    // Noise bank (genWorld+0x4498) and terrain-detail object T, by their offsets.
+    Fractal f1fac_, ffd8_, f2f80_, ffd44_, f7ea4_, f6ed0_, edgeA_, edgeB_;
+    Fractal t0c_, t18_, t24_, t28_;
+    std::vector<float> tileWeight_, tileSize_;
+    uint32_t grassAtlas_ = 0;  // FUEL.exe 0x9ff02c / 0x9ff04c
+};
+
+}  // namespace fuel

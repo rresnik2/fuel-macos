@@ -23,7 +23,8 @@ constexpr uint32_t kGenWorldClass = 0x31FA94AE;
 // found next to the world DPC (<data>/XFinalComponent/FUEL.exe).
 constexpr uint32_t kShuffleVa = 0xA01220;
 
-std::optional<std::array<uint8_t, 256>> readShuffle(const std::filesystem::path& exe) {
+// `n` bytes at virtual address `va` of a PE executable, or nothing.
+std::optional<std::vector<uint8_t>> readExe(const std::filesystem::path& exe, uint32_t va, size_t n) {
     std::ifstream f(exe, std::ios::binary);
     if (!f) return std::nullopt;
     const std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -32,31 +33,40 @@ std::optional<std::array<uint8_t, 256>> readShuffle(const std::filesystem::path&
     const size_t pe = u32(0x3c);
     if (u32(pe) != 0x00004550) return std::nullopt;  // "PE\0\0"
     const uint32_t sections = u16(pe + 6), optSize = u16(pe + 20), imageBase = u32(pe + 24 + 28);
-    const uint32_t rva = kShuffleVa - imageBase;
+    const uint32_t rva = va - imageBase;
     for (uint32_t k = 0; k < sections; ++k) {
         const size_t sh = pe + 24 + optSize + size_t(k) * 40;
-        const uint32_t va = u32(sh + 12), vsize = std::max(u32(sh + 8), u32(sh + 16)), raw = u32(sh + 20);
-        if (rva < va || rva + 256 > va + vsize) continue;
-        const size_t off = size_t(raw) + (rva - va);
-        if (off + 256 > b.size()) return std::nullopt;
-        std::array<uint8_t, 256> t{};
-        bool seen[256] = {};
-        for (size_t i = 0; i < 256; ++i) {
-            t[i] = b[off + i];
-            if (seen[t[i]]) return std::nullopt;  // not a permutation: another build of the exe
-            seen[t[i]] = true;
-        }
-        return t;
+        const uint32_t sva = u32(sh + 12), vsize = std::max(u32(sh + 8), u32(sh + 16)), raw = u32(sh + 20);
+        if (rva < sva || rva + n > sva + vsize) continue;
+        const size_t off = size_t(raw) + (rva - sva);
+        if (off + n > b.size()) return std::nullopt;
+        return std::vector<uint8_t>(b.begin() + std::ptrdiff_t(off), b.begin() + std::ptrdiff_t(off + n));
     }
     return std::nullopt;
+}
+
+std::filesystem::path exePath(const DpcFile& world) {
+    return std::filesystem::path(world.path()).parent_path().parent_path().parent_path() / "XFinalComponent" / "FUEL.exe";
+}
+
+std::optional<std::array<uint8_t, 256>> readShuffle(const std::filesystem::path& exe) {
+    const auto b = readExe(exe, kShuffleVa, 256);
+    if (!b) return std::nullopt;
+    std::array<uint8_t, 256> t{};
+    bool seen[256] = {};
+    for (size_t i = 0; i < 256; ++i) {
+        t[i] = (*b)[i];
+        if (seen[t[i]]) return std::nullopt;  // not a permutation: another build of the exe
+        seen[t[i]] = true;
+    }
+    return t;
 }
 
 const std::array<uint8_t, 256>& baseShuffle(const DpcFile& world) {
     static std::once_flag once;
     static std::array<uint8_t, 256> table;
     std::call_once(once, [&] {
-        const auto root = std::filesystem::path(world.path()).parent_path().parent_path().parent_path();
-        if (auto t = readShuffle(root / "XFinalComponent" / "FUEL.exe")) {
+        if (auto t = readShuffle(exePath(world))) {
             table = *t;
             return;
         }
@@ -100,6 +110,14 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed) {
         out[d] = uint8_t(v);
         avail[k] = -1;
     }
+    return out;
+}
+
+std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count) {
+    const auto b = readExe(exePath(world), va, count * 4);
+    if (!b) return {};
+    std::vector<float> out(count);
+    std::memcpy(out.data(), b->data(), count * 4);
     return out;
 }
 

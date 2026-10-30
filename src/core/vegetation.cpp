@@ -34,25 +34,6 @@ uint32_t rd32(const std::vector<uint8_t>& b, size_t o) {
     return v;
 }
 
-uint32_t hash(int32_t x, int32_t z, uint32_t salt) {
-    uint32_t h = uint32_t(x) * 0x8DA6B343u ^ uint32_t(z) * 0xD8163841u ^ salt * 0xCB1AB31Fu;
-    h ^= h >> 13;
-    h *= 0x5BD1E995u;
-    return h ^ (h >> 15);
-}
-float unit(uint32_t h) { return float(h & 0xFFFFFF) / float(0x1000000); }
-
-float valueNoise(float x, float z, uint32_t salt) {
-    const float fx = std::floor(x), fz = std::floor(z);
-    float tx = x - fx, tz = z - fz;
-    tx = tx * tx * (3 - 2 * tx);
-    tz = tz * tz * (3 - 2 * tz);
-    const int32_t ix = int32_t(fx), iz = int32_t(fz);
-    const float a = unit(hash(ix, iz, salt)), b = unit(hash(ix + 1, iz, salt));
-    const float c = unit(hash(ix, iz + 1, salt)), d = unit(hash(ix + 1, iz + 1, salt));
-    return (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * tz;
-}
-
 // FUEL's contrast curve on [-1, 1].
 float sharpen(float a) { return a <= 0 ? std::pow(a + 1, 8.0f) - 1 : 1 - std::pow(1 - a, 8.0f); }
 
@@ -326,24 +307,6 @@ Vegetation loadVegetation(const DpcFile& world) {
                 if (const auto mb = world.body(*e)) r = decodeRaster(*mb);
         return r;
     };
-    // Clutter: the low bushes and the grass clump among the trees, and FUEL's
-    // grey-detail rock cluster (it takes the ground colour, so it suits any terrain).
-    auto lowPlant = [&](uint32_t id) {
-        try {
-            const CollisionMesh cm = loadCollisionMesh({&world}, id);
-            float top = 0;
-            for (size_t k = 1; k < cm.positions.size(); k += 3) top = std::max(top, cm.positions[k]);
-            return !cm.positions.empty() && top < 2.5f;
-        } catch (const std::exception&) {
-            return false;
-        }
-    };
-    for (const Species& sp : v.bushes)
-        if (lowPlant(sp.full)) v.tufts.push_back(sp.full);
-    for (uint32_t id : {0x6C1D4E09u})
-        if (world.find(id) && lowPlant(id)) v.tufts.push_back(id);
-    for (uint32_t id : {0xD98608D9u})
-        if (world.find(id)) v.stones.push_back(id);
     v.forest = loadMap(7);
     v.humidity = loadMap(2);
     v.incinerated = loadMap(13);
@@ -354,7 +317,7 @@ Vegetation loadVegetation(const DpcFile& world) {
 }
 
 void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNetwork* roads, const BlockedQuery& blocked, float x, float z,
-                   float radius, std::vector<Plant>& out, bool impostors, float inner) {
+                   float radius, std::vector<Plant>& out, bool impostors, float inner, const GroundGenerator* ground) {
     if (v.trees.empty() && v.bushes.empty()) return;
     // Candidates sit at multiples of 20 m and only move +x/+z, so widen by a cell.
     const int32_t c0x = int32_t(std::floor((x - radius) / kCell)) - 1, c1x = int32_t(std::floor((x + radius) / kCell));
@@ -378,6 +341,9 @@ void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNe
                 if (tree && !(r < density)) continue;
                 if (roads != nullptr && nearRoad(*roads, px, pz)) continue;
                 if (g.y > kTreeline || g.n[1] < kMaxSlopeNy) continue;
+                // Trees_Filter / Bushes_Filter: Trees_Excluded (0x7831e0), farm fields (point bit 19)
+                // and rock cover > 0.1 (bit 11), decoded in ground_point.cpp.
+                if (ground != nullptr && ground->rejectsPlant(px, pz)) continue;
                 if (blocked && blocked(px, pz)) continue;
                 const int pick = pickSpecies(species, v, px, pz, g, density, r, impostors);
                 if (pick < 0) continue;
@@ -389,45 +355,6 @@ void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNe
             }
         }
     }
-}
-
-void scatterClutter(const Vegetation& v, const Heightfield& terrain, const SurfaceQuery& surface, float x, float z, float radius,
-                    std::vector<Plant>& out) {
-    if (!surface || (v.tufts.empty() && v.stones.empty())) return;
-    constexpr float kStep = 2.5f;  // one candidate per 2.5 m cell
-    const int32_t c0x = int32_t(std::floor((x - radius) / kStep)), c1x = int32_t(std::floor((x + radius) / kStep));
-    const int32_t c0z = int32_t(std::floor((z - radius) / kStep)), c1z = int32_t(std::floor((z + radius) / kStep));
-    for (int32_t cz = c0z; cz <= c1z; ++cz)
-        for (int32_t cx = c0x; cx <= c1x; ++cx) {
-            const uint32_t h = hash(cx, cz, 401u);
-            const float px = (float(cx) + unit(h)) * kStep, pz = (float(cz) + unit(hash(cx, cz, 403u))) * kStep;
-            if (std::hypot(px - x, pz - z) > radius) continue;
-            const int type = surface(px, pz);
-            if (type == 11 || type == 13) continue;  // roads (tarmac, dirt tracks)
-            const GripCategory gc = gripCategory(type);
-            // Patchy, not uniform: thin out by a noise field.
-            const float patch = valueNoise(px / 25, pz / 25, 7);  // 0..1
-            const float r = unit(hash(cx, cz, 409u));
-            const bool grassy = gc == GripCategory::Grass || gc == GripCategory::Mud;
-            const bool stony = gc == GripCategory::Rock || gc == GripCategory::Dirt || gc == GripCategory::Sand;
-            uint32_t mesh = 0;
-            float scale = 1;
-            if (grassy && !v.tufts.empty() && r < 0.25f + 0.45f * patch) {
-                mesh = v.tufts[hash(cx, cz, 411u) % v.tufts.size()];
-                scale = 0.45f + 0.5f * unit(hash(cx, cz, 413u));
-            } else if ((stony || grassy) && !v.stones.empty() && r > 1.0f - (stony ? 0.18f : 0.03f) * patch) {
-                mesh = v.stones[hash(cx, cz, 415u) % v.stones.size()];
-                scale = 0.03f + 0.07f * unit(hash(cx, cz, 417u)) * unit(hash(cx, cz, 419u));
-            } else {
-                continue;
-            }
-            Plant p;
-            p.meshId = mesh;
-            p.position = {px, terrain.smoothHeightAt(px, pz) - 0.05f, pz};
-            const float yaw = unit(hash(cx, cz, 421u)) * 6.2831853f, c = std::cos(yaw) * scale, s = std::sin(yaw) * scale;
-            p.axes = {{{c, 0, -s}, {0, scale, 0}, {s, 0, c}}};
-            out.push_back(p);
-        }
 }
 
 }  // namespace fuel
