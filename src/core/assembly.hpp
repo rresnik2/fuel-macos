@@ -84,6 +84,7 @@ struct Lod {
     std::vector<uint32_t> objects;  // [0] = LOD1, ...
     // (animation slot, Animation_Z id) pairs; the rider's Lod_Z lists its poses here.
     std::vector<std::pair<uint32_t, uint32_t>> animations;
+    uint32_t userDefine = 0;  // UserDefine_Z (e.g. a vegetation prototype's "GenWorld Arbre" script)
 };
 Lod parseLodBody(const std::vector<uint8_t>& body);  // throws
 

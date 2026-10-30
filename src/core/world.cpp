@@ -15,6 +15,7 @@ namespace {
 constexpr uint32_t kNodeClass = 0x85D02528;
 constexpr uint32_t kLodClass = 0x73DC6A13;
 constexpr uint32_t kSkinClass = 0x53415807;
+constexpr uint32_t kUserDefineClass = 0x52F79F96;
 
 struct Found {
     const DpcFile* file = nullptr;
@@ -25,6 +26,21 @@ Found find(const std::vector<const DpcFile*>& lookup, uint32_t id) {
     for (const DpcFile* f : lookup)
         if (const DpcFile::Entry* e = f->find(id); e != nullptr && e->header != nullptr) return {f, e};
     return {};
+}
+
+// FITTOGROUND / GROUNDNORMAL keywords of a node's UserDefine_Z (the engine also
+// accepts the misspelling FITOGROUND, which the data uses five times).
+void groundFlags(const std::vector<const DpcFile*>& lookup, uint32_t userDefine, bool& fit, bool& normal) {
+    fit = normal = false;
+    if (userDefine == 0) return;
+    const Found f = find(lookup, userDefine);
+    if (f.entry == nullptr || f.entry->classCrc != kUserDefineClass) return;
+    const auto body = f.file->body(*f.entry);
+    if (!body) return;
+    for (const std::string& line : parseUserDefineBody(*body)) {
+        if (line == "FITTOGROUND" || line == "FITOGROUND") fit = true;
+        if (line == "GROUNDNORMAL") normal = true;
+    }
 }
 
 }  // namespace
@@ -43,12 +59,14 @@ std::vector<PlacedMesh> collectPlacedMeshes(const DpcFile& dpc, const std::vecto
                 obj = lod.objects.empty() ? Found{} : find(lookup, lod.objects.front());
             }
             if (obj.entry == nullptr) continue;
+            bool fit = false, normal = false;
+            groundFlags(lookup, node.userDefine, fit, normal);
             if (obj.entry->classCrc == cls::Mesh) {
-                out.push_back({obj.entry->id, nodeId, node.world});
+                out.push_back({obj.entry->id, nodeId, node.world, fit, normal});
             } else if (obj.entry->classCrc == kSkinClass) {
                 const auto skinBody = obj.file->body(*obj.entry);
                 if (!skinBody) continue;
-                for (uint32_t mesh : parseSkinBody(*skinBody).meshes) out.push_back({mesh, nodeId, node.world});
+                for (uint32_t mesh : parseSkinBody(*skinBody).meshes) out.push_back({mesh, nodeId, node.world, fit, normal});
             }
         } catch (const std::exception&) {
             // Nodes that do not parse are skipped.

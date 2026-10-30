@@ -13,6 +13,9 @@ struct PlacedMesh {
     uint32_t meshId = 0;
     uint32_t nodeId = 0;
     std::array<float, 16> world{};  // row-vector convention (translation in 12..14)
+    // The node's UserDefine_Z says FITTOGROUND: the engine sets the object's height
+    // to the terrain's at load (GROUNDNORMAL: and tilts it to the terrain normal).
+    bool fitToGround = false, groundNormal = false;
 };
 
 // Meshes placed by the nodes of `dpc`, at the highest level of detail: a
