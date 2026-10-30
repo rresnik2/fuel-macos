@@ -502,6 +502,14 @@ struct RaceSession {
             const float rubber = ahead > 200 ? 1.0f - 0.12f * std::min(1.0f, (ahead - 200) / 400) :
                                  ahead < -200 ? 1.0f + 0.08f * std::min(1.0f, (-ahead - 200) / 400) : 1.0f;
             d.setInput(i, drive(racer, d, i, dt, rubber));
+            static const char* trace = std::getenv("FUEL_AI_TRACE");  // DEBUG
+            if (trace && std::atoi(trace) == i && int(clock * 60) % 30 == 0) {
+                const fuel::VehicleState st = d.state(i);
+                const simd_float3 p = d.position(i);
+                const auto& t = route[racer.next];
+                std::printf("    t=%5.1f #%d (%.0f, %.0f, %.0f) next %zu dist %.0f  %5.1f km/h hdg %4.0f  up %.2f wheels %d resets %d\n", clock, i, p.x, p.y, p.z, racer.next,
+                            std::hypot(p.x - t[0], p.z - t[2]), st.speedKmh, d.heading(i) * 57.3, 1 - 2 * (st.chassis.rotation[0] * st.chassis.rotation[0] + st.chassis.rotation[2] * st.chassis.rotation[2]), st.wheelsOnGround, racer.ai.resets());
+            }
         }
     }
     // Test driver for the player: the opponents' AI at full skill, no rubber-banding.
@@ -519,10 +527,13 @@ struct RaceSession {
         s.speedKmh = st.speedKmh;
         s.upY = 1 - 2 * (q[0] * q[0] + q[2] * q[2]);  // y of the rotated up axis
         s.topSpeedKmh = d.setup(i).topSpeedKmh;
+        fuel::DriveWorld& world = d.physics();
+        s.clearance = [&world, x = s.x, z = s.z](float yaw, float length) { return world.clearance(x, z, yaw, length); };
         const fuel::DriveInput in = racer.ai.drive(line, racer.next, s, dt, rubber);
         if (racer.ai.wantsReset()) {
             // Back on the line, a few metres to the side for each racer so they do not land on each other.
             const auto p = racer.ai.resetPoint();
+            if (std::getenv("FUEL_AI_TRACE")) std::printf("    reset #%d at t=%.1f from (%.0f, %.0f) next %zu speed %.1f up %.2f\n", i, clock, s.x, s.z, racer.next, s.speedKmh, s.upY);  // DEBUG
             const float yaw = racer.ai.resetHeading(), side = float(i % 3 - 1) * 4.0f;
             d.teleport(p[0] + std::cos(yaw) * side, p[2] - std::sin(yaw) * side, yaw, i);
             racer.ai.didReset();

@@ -11,7 +11,9 @@
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayerInterfaceTable.h>
 #include <Jolt/Physics/Collision/BroadPhase/ObjectVsBroadPhaseLayerFilterTable.h>
+#include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
+#include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/ObjectLayerPairFilterTable.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
@@ -683,6 +685,26 @@ void DriveWorld::setStaticObjects(const std::vector<std::pair<uint32_t, std::arr
         bi.DestroyBody(id);
     }
     impl_->staticBodies = std::move(keep);
+}
+
+namespace {
+
+// Static bodies other than the terrain patches.
+class NotTerrain : public BodyFilter {
+public:
+    bool ShouldCollideLocked(const Body& body) const override { return body.GetShape()->GetSubType() != EShapeSubType::HeightField; }
+};
+
+}  // namespace
+
+float DriveWorld::clearance(double x, double z, float yaw, float length, float height) const {
+    const double x1 = x + std::sin(yaw) * length, z1 = z + std::cos(yaw) * length;
+    const RVec3 from(x, impl_->terrain.smoothHeightAt(x, z) + height, z);
+    const RVec3 to(x1, impl_->terrain.smoothHeightAt(x1, z1) + height, z1);
+    RayCastResult hit;
+    const bool blocked = impl_->physics.GetNarrowPhaseQuery().CastRay(RRayCast(from, Vec3(to - from)), hit, SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)),
+                                                                      SpecifiedObjectLayerFilter(kStatic), NotTerrain());
+    return blocked ? hit.mFraction * length : length;
 }
 
 void DriveWorld::setSurfaceQuery(SurfaceQuery query) { impl_->surfaceQuery = std::move(query); }

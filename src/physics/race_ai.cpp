@@ -90,7 +90,34 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
     // Steer at a point ahead on the line (further at speed): pure pursuit.
     const float look = std::clamp(9.0f + std::fabs(speed) * 0.8f, 10.0f, 34.0f);
     const auto target = line.pointAhead(next, s.x, s.z, look);
-    const float want = std::atan2(target[0] - float(s.x), target[2] - float(s.z));
+    float want = std::atan2(target[0] - float(s.x), target[2] - float(s.z));
+
+    // Obstacles: try headings fanning out from the line (the side picked last time first)
+    // and take the first one free for the distance needed to react; boxed in, the clearest.
+    float blockedSpeed = 1e9f;
+    if (s.clearance) {
+        const float range = std::clamp(12.0f + std::fabs(speed) * 1.4f, 18.0f, 50.0f);
+        // Not past the target point when it is close (the gate itself may sit between obstacles).
+        const float need = std::min(range, std::max(8.0f, float(std::hypot(target[0] - s.x, target[2] - s.z)) + 4.0f));
+        float best = -1, bestOffset = 0;
+        bool found = false;
+        const float side = dodge_ >= 0 ? 1.0f : -1.0f;
+        for (int k = 0; k <= 8 && !found; ++k)
+            for (float sign : {side, -side}) {
+                const float offset = sign * float(k) * 0.13f;
+                const float free = s.clearance(want + offset, need);
+                if (free > best) best = free, bestOffset = offset;
+                if (free >= need) {
+                    found = true;
+                    bestOffset = offset;
+                    break;
+                }
+                if (k == 0) break;
+            }
+        dodge_ = found && bestOffset == 0 ? dodge_ * 0.9f : bestOffset;
+        want += bestOffset;
+        if (!found) blockedSpeed = std::sqrt(2.0f * kDecel * std::max(0.0f, best - 4.0f)) * 3.6f;
+    }
     const float err = wrap(want - s.heading);
     float steer = std::clamp(-err * 2.2f, -1.0f, 1.0f);  // positive steer turns right (decreasing heading)
 
@@ -109,7 +136,7 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
             allowed = std::min(allowed, std::sqrt(vc * vc + 2.0f * kDecel * (0.8f + 0.2f * skill_) * reach) * 3.6f);
             dist += line.along[k + 1] - line.along[k];
         }
-        allowed = std::min(allowed, cornerSpeed(err * 1.6f, vmax));
+        allowed = std::min({allowed, cornerSpeed(err * 1.6f, vmax), std::max(blockedSpeed, 12.0f)});
     }
     const float kmh = s.speedKmh;
     DriveInput in;

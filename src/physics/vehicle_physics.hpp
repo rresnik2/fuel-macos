@@ -120,6 +120,11 @@ public:
     void update(float dt, const DriveInput& input);
     VehicleState state() const { return state(0); }
 
+    // Free distance (metres, up to `length`) from (x, z) along heading `yaw` (0 = +z),
+    // `height` metres above the terrain at both ends, against static objects only (not
+    // the terrain, vehicles or props): what a driver sees ahead.
+    float clearance(double x, double z, float yaw, float length, float height = 1.0f) const;
+
     // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
     // surface counts as dirt. The default applies to worlds created afterwards.
     void setSurfaceQuery(SurfaceQuery query);
