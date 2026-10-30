@@ -83,6 +83,17 @@ public:
     // Race beacons: xyz = ground position, w = kind (0 next checkpoint,
     // 1 the one after, 2 finish). Drawn as tall glowing columns.
     void setMarkers(const std::vector<simd_float4>& markers) { markers_ = markers; }
+    // Road ribbons draped over the terrain: vertices (xyz, w = opacity; uv
+    // across/along) and batches of triangles sharing a Bitmap_Z (0 = dirt colour).
+    struct RoadVertex {
+        simd_float4 position;
+        simd_float4 uv;
+    };
+    struct RoadBatch {
+        uint32_t texture, firstIndex, indexCount;
+        bool dirt;  // tint the texture with the dirt colour
+    };
+    void setRoads(const std::vector<RoadVertex>& vertices, const std::vector<uint32_t>& indices, const std::vector<RoadBatch>& batches);
     // Points the camera at `centre` instead of the scene's centre.
     void setFocus(simd_float3 centre) { center_ = centre; }
 
@@ -174,6 +185,9 @@ private:
     id<MTLTexture> white_, shadowMap_;
     id<MTLRenderPipelineState> groundPipeline_, terrainPipeline_, skyPipeline_, markerPipeline_;
     std::vector<simd_float4> markers_;
+    id<MTLRenderPipelineState> roadPipeline_;
+    id<MTLBuffer> roadVertices_, roadIndices_;
+    std::vector<std::pair<id<MTLTexture>, RoadBatch>> roadBatches_;
     id<MTLDepthStencilState> depthAlways_;
     id<MTLTexture> heightTex_, groundColour_, groundSurface_, groundDetail_;
     id<MTLBuffer> terrainIndices_;

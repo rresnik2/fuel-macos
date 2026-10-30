@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <set>
 
 #include "core/world.hpp"
 
@@ -148,5 +150,68 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
         }
     }
     renderer.setWorldInstances(draw);
+    if (roads_ && terrain_) buildRoads(player, renderer);
     physics.setStaticObjects(solid);
+}
+
+void WorldStreamer::buildRoads(simd_float3 player, fuel::MeshRenderer& renderer) const {
+    // Nearby lines from the road grid.
+    std::set<uint32_t> lines;
+    const int32_t r = int32_t(std::ceil(kRoadRadius / fuel::RoadNetwork::kCell));
+    const int32_t cx = int32_t(std::floor(player.x / fuel::RoadNetwork::kCell)), cz = int32_t(std::floor(player.z / fuel::RoadNetwork::kCell));
+    for (int32_t dz = -r; dz <= r; ++dz)
+        for (int32_t dx = -r; dx <= r; ++dx)
+            if (auto it = roads_->cells.find(fuel::RoadNetwork::cellKey(cx + dx, cz + dz)); it != roads_->cells.end())
+                lines.insert(it->second.begin(), it->second.end());
+    // One vertex/index list per road type, then batches by type.
+    std::map<uint8_t, std::pair<std::vector<fuel::MeshRenderer::RoadVertex>, std::vector<uint32_t>>> byType;
+    for (uint32_t li : lines) {
+        const fuel::RoadNetwork::Line& line = roads_->lines[li];
+        const fuel::RoadStyle& st = roads_->styles[line.type];
+        auto& [verts, idx] = byType[line.type];
+        // Resample to at most 6 m between points so the ribbon follows the ground.
+        std::vector<simd_float2> pts;
+        for (size_t k = 0; k + 1 < line.points.size(); ++k) {
+            const simd_float2 a = simd_make_float2(line.points[k][0], line.points[k][1]);
+            const simd_float2 b = simd_make_float2(line.points[k + 1][0], line.points[k + 1][1]);
+            const int steps = std::max(1, int(std::ceil(simd_distance(a, b) / 6.0f)));
+            for (int s = 0; s < steps; ++s) pts.push_back(a + (b - a) * (float(s) / float(steps)));
+        }
+        pts.push_back(simd_make_float2(line.points.back()[0], line.points.back()[1]));
+        // Lines are stored in pieces; extend both ends by half the width so joints overlap.
+        if (pts.size() >= 2) {
+            const float ext = st.width * 0.5f;
+            const simd_float2 d0 = pts[0] - pts[1], d1 = pts.back() - pts[pts.size() - 2];
+            if (simd_length(d0) > 1e-3f) pts.front() += simd_normalize(d0) * ext;
+            if (simd_length(d1) > 1e-3f) pts.back() += simd_normalize(d1) * ext;
+        }
+        float along = 0;
+        for (size_t k = 0; k < pts.size(); ++k) {
+            const simd_float2 prev = pts[k > 0 ? k - 1 : k], next = pts[k + 1 < pts.size() ? k + 1 : k];
+            simd_float2 dir = next - prev;
+            if (simd_length(dir) < 1e-4f) dir = simd_make_float2(1, 0);
+            dir = simd_normalize(dir);
+            const simd_float2 side = simd_make_float2(-dir.y, dir.x) * (st.width * 0.5f);
+            if (k > 0) along += simd_distance(pts[k], pts[k - 1]);
+            const auto base = uint32_t(verts.size());
+            for (int e = 0; e < 2; ++e) {
+                const simd_float2 p = pts[k] + (e == 0 ? -side : side);
+                const float y = terrain_->smoothHeightAt(p.x, p.y) + 0.2f;
+                verts.push_back({simd_make_float4(p.x, y, p.y, st.opacity), simd_make_float4(float(e), along / std::max(st.width, 4.0f), 0, 0)});
+            }
+            if (k > 0) idx.insert(idx.end(), {base - 2, base - 1, base, base - 1, base + 1, base});
+        }
+    }
+    std::vector<fuel::MeshRenderer::RoadVertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<fuel::MeshRenderer::RoadBatch> batches;
+    for (auto& [type, vi] : byType) {  // narrow, faint types first so tarmac draws on top
+        const auto base = uint32_t(vertices.size());
+        const auto first = uint32_t(indices.size());
+        vertices.insert(vertices.end(), vi.first.begin(), vi.first.end());
+        for (uint32_t i : vi.second) indices.push_back(base + i);
+        const bool tarmac = (type >= 10 && type <= 12) || type == 15 || type == 18 || type == 19;
+        batches.push_back({roads_->styles[type].texture, first, uint32_t(vi.second.size()), !tarmac});
+    }
+    renderer.setRoads(vertices, indices, batches);
 }

@@ -857,6 +857,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<WorldStreamer> streamer;
         std::unique_ptr<fuel::Vegetation> vegetation;
+        std::unique_ptr<fuel::RoadNetwork> roads;
         std::unique_ptr<Garage> garage;
         std::unique_ptr<RaceSession> race;
         if (opt.drive && opt.assemble.empty()) die("--drive needs --assemble VARIANT");
@@ -922,6 +923,9 @@ int main(int argc, const char** argv) {
                         try {
                             vegetation = std::make_unique<fuel::Vegetation>(fuel::loadVegetation(*f));
                             streamer->setVegetation(vegetation.get(), terrain.get());
+                            roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
+                            streamer->setRoads(roads.get());
+                            std::printf("roads: %zu drawable lines\n", roads->lines.size());
                             std::printf("vegetation: %zu tree and %zu bush species\n", vegetation->trees.size(), vegetation->bushes.size());
                         } catch (const std::exception& e) {
                             std::fprintf(stderr, "fuelview: vegetation: %s\n", e.what());

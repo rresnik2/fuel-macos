@@ -364,6 +364,44 @@ fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer
     return float4(tonemap(c * f.params.y), 1.0);
 }
 
+struct RoadVertex {
+    float4 position;  // w = opacity
+    float4 uv;        // x across (0..1), y along
+};
+
+struct RoadOut {
+    float4 position [[position]];
+    float3 world;
+    float2 uv;
+    float opacity;
+    float4 sunPos;
+};
+
+vertex RoadOut vsRoad(uint vid [[vertex_id]], const device RoadVertex* v [[buffer(0)]], constant FrameUniforms& f [[buffer(1)]]) {
+    RoadOut o;
+    float3 w = v[vid].position.xyz;
+    o.position = f.viewProj * float4(w, 1.0);
+    o.world = w;
+    o.uv = v[vid].uv.xy;
+    o.opacity = v[vid].position.w;
+    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    return o;
+}
+
+fragment float4 fsRoad(RoadOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], texture2d<float> tex [[texture(0)]],
+                       depth2d<float> shadowMap [[texture(7)]], constant uint& textured [[buffer(2)]],
+                       constant float4& tint [[buffer(3)]]) {
+    constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
+    // Dirt road textures are grey detail maps over the dirt colour; tarmac is a colour map (tint 1).
+    float3 albedo = (textured != 0 ? tex.sample(rep, float2(in.uv.x, in.uv.y)).rgb : float3(0.5)) * tint.rgb;
+    // Soft edges so the ribbon melts into the ground.
+    float edge = smoothstep(0.0, 0.18, in.uv.x) * smoothstep(1.0, 0.82, in.uv.x);
+    float shadow = shadowFactor(shadowMap, in.sunPos);
+    float3 V = normalize(f.eye.xyz - in.world);
+    float3 rgb = lighting(albedo, float3(0, 1, 0), V, 1.0, shadow, 0.1, 0.8, float2(0), false, f);
+    return float4(tonemap(haze(rgb, in.world, f) * f.params.y), in.opacity * edge);
+}
+
 struct MarkerOut {
     float4 position [[position]];
     float3 color;
@@ -573,6 +611,20 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     terrainPipeline_ = makeSimple(@"vsTerrain", @"fsTerrain");
     {
         MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [shaders_ newFunctionWithName:@"vsRoad"];
+        d.fragmentFunction = [shaders_ newFunctionWithName:@"fsRoad"];
+        d.rasterSampleCount = sampleCount_;
+        d.colorAttachments[0].pixelFormat = kRenderColorFormat;
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        d.depthAttachmentPixelFormat = kRenderDepthFormat;
+        NSError* e = nil;
+        roadPipeline_ = [device newRenderPipelineStateWithDescriptor:d error:&e];
+        if (roadPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
+    }
+    {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
         d.vertexFunction = [shaders_ newFunctionWithName:@"vsMarker"];
         d.fragmentFunction = [shaders_ newFunctionWithName:@"fsMarker"];
         d.rasterSampleCount = sampleCount_;
@@ -660,6 +712,19 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+}
+
+void MeshRenderer::setRoads(const std::vector<RoadVertex>& vertices, const std::vector<uint32_t>& indices,
+                            const std::vector<RoadBatch>& batches) {
+    roadBatches_.clear();
+    roadVertices_ = vertices.empty() ? nil : [device_ newBufferWithBytes:vertices.data() length:vertices.size() * sizeof(RoadVertex)
+                                                                 options:MTLResourceStorageModeShared];
+    roadIndices_ = indices.empty() ? nil : [device_ newBufferWithBytes:indices.data() length:indices.size() * 4
+                                                               options:MTLResourceStorageModeShared];
+    for (const RoadBatch& b : batches) {
+        uint8_t alphaKind = 0;
+        roadBatches_.push_back({texture(b.texture, true, &alphaKind), b});
+    }
 }
 
 void MeshRenderer::setTerrain(const Heightfield& hf) {
@@ -1122,6 +1187,26 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                          indexType:MTLIndexTypeUInt32
                        indexBuffer:terrainIndices_
                  indexBufferOffset:0];
+        if (roadVertices_ != nil && roadIndices_ != nil) {
+            [enc setRenderPipelineState:roadPipeline_];
+            [enc setDepthStencilState:depthNoWrite_];
+            [enc setDepthBias:-4.0f slopeScale:-4.0f clamp:0.0f];
+            [enc setVertexBuffer:roadVertices_ offset:0 atIndex:0];
+            [enc setFragmentTexture:shadowMap_ atIndex:7];
+            for (const auto& [tex, b] : roadBatches_) {
+                const uint32_t textured = tex != nil ? 1u : 0u;
+                [enc setFragmentBytes:&textured length:sizeof textured atIndex:2];
+                const simd_float4 tint = b.dirt ? simd_make_float4(0.42f, 0.30f, 0.20f, 1) : simd_make_float4(1, 1, 1, 1);
+                [enc setFragmentBytes:&tint length:sizeof tint atIndex:3];
+                [enc setFragmentTexture:tex != nil ? tex : white_ atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:b.indexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:roadIndices_
+                         indexBufferOffset:size_t(b.firstIndex) * 4];
+            }
+            [enc setDepthBias:0 slopeScale:0 clamp:0];
+        }
     } else if (showGround) {
         [enc setRenderPipelineState:groundPipeline_];
         [enc setDepthStencilState:depthWrite_];
