@@ -73,6 +73,9 @@ public:
     // Mean of T0 over a square of side `size` centred on (x, z) (n x n samples).
     float meanT0(double x, double z, double size, int n) const;
     bool hasPalette() const { return palette_.size() >= 123; }
+    std::array<float, 3> paletteColour(int slot) const {
+        return {palette_[size_t(slot)][0], palette_[size_t(slot)][1], palette_[size_t(slot)][2]};
+    }
     // Trees_Excluded (0x7831e0), the part the port has: inside a flat surface that
     // allows no plants (byte +0x81 == 0). Lakes, rivers and zones are not tested.
     bool excludesPlants(double x, double z) const;

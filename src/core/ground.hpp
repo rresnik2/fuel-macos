@@ -23,7 +23,9 @@ const char* surfaceName(int index);  // EARTH, ..., GRASS, ..., ROUGHSAND2
 
 struct GroundMaps {
     uint32_t size = 0;              // samples per side, covering the 140 km world square
-    std::vector<uint8_t> colour;    // sRGB RGBA8, row-major (row = z)
+    std::vector<uint8_t> colour;    // sRGB RGBA8, row-major (row = z); see `decoded`
+    bool decoded = false;           // colour = FUEL's point colour ctx+0x70, alpha = far-band forest weight
+    std::array<float, 3> farColour{};  // palette 57 (sRGB 0..1): the far band's forest colour
     std::vector<uint8_t> surface;   // surface type index per sample
     std::array<uint32_t, kSurfaceTypes> textures{};  // Bitmap_Z per surface type
     // Surface type at world (x, z) (nearest sample, clamped to the map).

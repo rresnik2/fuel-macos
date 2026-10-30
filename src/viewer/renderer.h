@@ -272,6 +272,7 @@ private:
     std::vector<std::pair<id<MTLTexture>, RoadBatch>> roadBatches_;
     id<MTLDepthStencilState> depthAlways_;
     id<MTLTexture> heightTex_, groundColour_, groundSurface_, groundDetail_;
+    simd_float4 groundFar_ = {0, 0, 0, 0};  // p16: far-band forest colour, w = decoded colour map
     id<MTLBuffer> terrainIndices_;
     uint32_t terrainIndexCount_ = 0;
     Heightfield terrainData_;

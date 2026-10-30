@@ -1,4 +1,5 @@
 #include "ground.hpp"
+#include "ground_point.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <thread>
 
 namespace fuel {
 
@@ -223,6 +225,30 @@ GroundMaps buildGroundMaps(const DpcFile& world, const Heightfield& heights, uin
             px[3] = 255;
             out.surface[size_t(j) * size + i] = uint8_t(kClassSurface[best]);
         }
+    }
+    // Colour: FUEL's per-point colour (GroundGenerator::colours, the point evaluator's colour bits;
+    // notes/p16-colours.md), sampled at the cell centre, with the 6 m palette-half noise T0 averaged
+    // over the cell (the mix is linear in T0). rgb = ctx+0x70 (near/mid bands); alpha = the far band's
+    // forest weight k (ctx+0x90 = lerp(rgb, palette 57, k)). Roads are drawn as meshes; the map has none.
+    const GroundGenerator pointGen(world, heights, nullptr);
+    if (pointGen.hasPalette()) {
+        const unsigned threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        std::vector<std::thread> pool;
+        for (unsigned t = 0; t < threads; ++t)
+            pool.emplace_back([&, t] {
+                for (uint32_t j = t; j < size; j += threads)
+                    for (uint32_t i = 0; i < size; ++i) {
+                        const double x = -70000.0 + (i + 0.5) * step, z = -70000.0 + (j + 0.5) * step;
+                        const GroundPoint gp = pointGen.at(x, z);
+                        const GroundColours c = pointGen.colours(x, z, gp, pointGen.meanT0(x, z, step, 3));
+                        uint8_t* px = &out.colour[(size_t(j) * size + i) * 4];
+                        for (int k = 0; k < 3; ++k) px[k] = uint8_t(std::clamp(c.base[k], 0.0f, 1.0f) * 255.0f + 0.5f);
+                        px[3] = uint8_t(std::clamp(c.forest, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    }
+            });
+        for (auto& th : pool) th.join();
+        out.decoded = true;
+        out.farColour = pointGen.paletteColour(57);
     }
     return out;
 }
