@@ -35,9 +35,8 @@ std::vector<std::array<float, 3>> assembledHubs(const fuel::AssembledVehicle& ve
     return hubs;
 }
 
-DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain,
-                           double x, double z, float yaw, const std::vector<uint32_t>& riders)
-    : world_(terrain), setup_(setup) {
+VehicleRig::VehicleRig(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const std::vector<uint32_t>& riders)
+    : setup_(setup) {
     for (const fuel::PlacedPart& p : vehicle.parts) {
         if (!p.drawn()) continue;
         const simd_float4x4 m = rowsToSimd(p.world);
@@ -61,13 +60,11 @@ DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::Ve
         links_.push_back({-1, matrix_identity_float4x4, true});
     }
     for (const auto& w : setup.wheels) focusHeight_ = std::max(focusHeight_, w.hub[1] + w.radius * 0.6f);
-    world_.spawn(setup, x, z, yaw);
 }
 
-void DriveSession::update(float dt, const fuel::DriveInput& input) {
-    world_.update(dt, input);
+void VehicleRig::animate(float dt, const fuel::DriveInput& input, float speedKmh) {
     // The rider leans into turns (more with speed) and forward/back with throttle and brakes.
-    const float speed = std::fabs(world_.state().speedKmh) / 3.6f;
+    const float speed = std::fabs(speedKmh) / 3.6f;
     const float leanTarget = setup_.bike ? 0.0f : input.steer * std::min(speed / 15.0f, 1.0f) * 0.32f;
     const float pitchTarget = (input.throttle - input.brake) * 0.12f;
     const float k = std::min(1.0f, dt * 6.0f);
@@ -75,8 +72,7 @@ void DriveSession::update(float dt, const fuel::DriveInput& input) {
     pitch_ += (pitchTarget - pitch_) * k;
 }
 
-std::vector<simd_float4x4> DriveSession::partWorlds() const {
-    const fuel::VehicleState st = world_.state();
+std::vector<simd_float4x4> VehicleRig::partWorlds(const fuel::VehicleState& st) const {
     const simd_float4x4 chassis = poseMatrix(st.chassis);
     // Rider pose offset: rotate about the seat (forward axis for lean, sideways for pitch).
     const float seat = focusHeight_ * 0.55f;
@@ -97,13 +93,43 @@ std::vector<simd_float4x4> DriveSession::partWorlds() const {
     return out;
 }
 
-simd_float3 DriveSession::position() const {
-    const fuel::VehicleState st = world_.state();
+simd_float3 VehicleRig::focus(const fuel::VehicleState& st) const {
     return simd_mul(poseMatrix(st.chassis), simd_make_float4(0, focusHeight_, 0, 1)).xyz;
 }
 
-float DriveSession::heading() const {
-    const auto q = world_.state().chassis.rotation;
+DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain,
+                           double x, double z, float yaw, const std::vector<uint32_t>& riders)
+    : world_(terrain) {
+    addVehicle(vehicle, setup, x, z, yaw, riders);
+}
+
+int DriveSession::addVehicle(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, double x, double z, float yaw,
+                             const std::vector<uint32_t>& riders) {
+    rigs_.emplace_back(vehicle, setup, riders);
+    inputs_.emplace_back();
+    return world_.addVehicle(setup, x, z, yaw);
+}
+
+void DriveSession::replacePlayer(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const std::vector<uint32_t>& riders) {
+    const fuel::Pose p = world_.state(0).chassis;
+    const float yaw = heading(0);
+    rigs_[0] = VehicleRig(vehicle, setup, riders);
+    world_.replaceVehicle(0, setup, p.position[0], p.position[2], yaw);
+}
+
+void DriveSession::setInput(int i, const fuel::DriveInput& input) {
+    if (i > 0 && i < vehicleCount()) inputs_[size_t(i)] = input;
+}
+
+void DriveSession::update(float dt, const fuel::DriveInput& input) {
+    inputs_[0] = input;
+    for (int i = 0; i < vehicleCount(); ++i) world_.setInput(i, inputs_[size_t(i)]);
+    world_.update(dt);
+    for (int i = 0; i < vehicleCount(); ++i) rigs_[size_t(i)].animate(dt, inputs_[size_t(i)], world_.state(i).speedKmh);
+}
+
+float DriveSession::heading(int i) const {
+    const auto q = world_.state(i).chassis.rotation;
     const simd_float3 f = simd_act(simd_quaternion(q[0], q[1], q[2], q[3]), simd_make_float3(0, 0, 1));
     return std::atan2(f.x, f.z);
 }

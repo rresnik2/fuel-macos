@@ -16,7 +16,9 @@
 #include "core/terrain.hpp"
 #include "core/vehicle.hpp"
 
+#include <algorithm>
 #include <array>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -105,6 +107,15 @@ public:
     void setRoads(const std::vector<RoadVertex>& vertices, const std::vector<uint32_t>& indices, const std::vector<RoadBatch>& batches);
     // Points the camera at `centre` instead of the scene's centre.
     void setFocus(simd_float3 centre) { center_ = centre; }
+    // Other vehicles (race opponents), drawn with the scene: each its own parts (vehicle
+    // space, like setScene) and paint; their meshes load with that vehicle's livery.
+    // Replaces the earlier list. Vehicles far from the focus are not drawn.
+    void setVehicles(const std::vector<std::vector<MeshInstance>>& parts, const std::vector<Paint>& paints);
+    // Moves vehicle `k`'s parts (same order as its setVehicles input).
+    void setVehicleWorlds(size_t k, const std::vector<simd_float4x4>& worlds);
+    // Half-size in metres of the area around the focus that gets sun shadows
+    // (0: the scene's radius). Larger shows the shadows of vehicles nearby.
+    float shadowRadius = 0;
 
     // Takes effect for meshes loaded afterwards (the colour applies at once).
     void setPaint(const Paint& paint);
@@ -179,6 +190,10 @@ private:
     };
 
     const GpuMesh* loadMesh(uint32_t meshId, std::string* error);
+    // The same with another livery than the current paint's (cached separately).
+    const GpuMesh* loadMesh(uint32_t meshId, std::string* error, const std::array<uint32_t, 3>& livery);
+    std::unique_ptr<GpuMesh> buildMesh(uint32_t meshId, std::string* error);
+    float shadowHalfSize() const { return std::max(radius_ * 1.05f, shadowRadius); }
     id<MTLTexture> texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind);
     id<MTLRenderPipelineState> pipeline(uint32_t stride, AlphaMode mode);
     id<MTLRenderPipelineState> shadowPipeline(uint32_t stride);
@@ -223,6 +238,13 @@ private:
     std::vector<Instance> propInstances_;   // movable props (shadow casters)
     std::vector<WorldGroup> propGroups_;
     std::vector<int> inputToInstance_;  // setScene input index -> instance, or -1
+    struct OtherVehicle {
+        std::vector<Instance> instances;
+        std::vector<int> inputToInstance;  // setVehicles part index -> instance, or -1
+        simd_float3 paint;                 // sRGB
+    };
+    std::vector<OtherVehicle> vehicles_;
+    std::map<std::pair<uint32_t, std::array<uint32_t, 3>>, std::unique_ptr<GpuMesh>> liveryMeshes_;
     simd_float3 center_ = {0, 0, 0};
     simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};
     float radius_ = 1.0f;

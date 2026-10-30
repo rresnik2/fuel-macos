@@ -34,6 +34,7 @@
 #import <GameController/GameController.h>
 #include "audio/drive_audio.h"
 #include "core/races.hpp"
+#include "physics/race_ai.hpp"
 #include "core/vehicle_params.hpp"
 #include <fstream>
 #include <set>
@@ -50,6 +51,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,8 @@ struct Options {
     bool audioCheck = false;
     bool propCheck = false;
     std::string race;
+    int opponents = 5;     // --race: AI opponents on the grid
+    bool aiCheck = false;  // --ai-check: race headless and report the opponents' progress
     float driveTime = 4.0f;
     bool haveAt = false;
     float atX = 0, atZ = 0;
@@ -162,6 +166,8 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--prop-check") { o.propCheck = true; o.drive = true; o.terrain = true; }
         else if (a == "--drive-time") o.driveTime = std::stof(next());
         else if (a == "--race") { o.race = next(); o.drive = true; o.terrain = true; }
+        else if (a == "--opponents") o.opponents = std::clamp(std::stoi(next()), 0, 11);
+        else if (a == "--ai-check") o.aiCheck = true;
         else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
@@ -185,6 +191,11 @@ Options parseArgs(int argc, const char** argv) {
     if (!o.assemble.empty() && (!o.scene.empty() || o.haveMeshId)) die("--assemble cannot be combined with --scene or --mesh");
     if (!o.assemble.empty() && !o.vehicle.empty()) die("with --assemble the paint follows the variant; drop --vehicle");
     if (o.propCheck && o.shot.empty()) o.shot = "-";  // headless: drive and report, no picture
+    if (o.aiCheck) {
+        if (o.race.empty()) die("--ai-check needs --race NAME");
+        if (o.shot.empty()) o.shot = "-";
+        if (o.driveTime <= 4.0f) o.driveTime = 120.0f;
+    }
     if (o.dataDir.empty()) o.dataDir = defaultDataDir();
     if (o.dpcs.empty()) o.dpcs.push_back("CommonComponent/DATAS/QUAD.DPC");
     return o;
@@ -330,25 +341,60 @@ struct Garage {
     const fuel::Heightfield* terrain = nullptr;
     RiderView* riders = nullptr;
 
-    // Builds entry `i` at (x, z) facing `yaw`; nullptr (with a message) if it cannot drive.
-    std::unique_ptr<DriveSession> build(size_t i, double x, double z, float yaw) const {
+    const std::string& label(size_t i) const { return archives[entries[i].first]->assembler->variants()[entries[i].second].label; }
+    // Assembles entry `i` with its physics setup and rider; false (with a message) if it cannot drive.
+    bool load(size_t i, fuel::AssembledVehicle& av, fuel::VehicleSetup& setup, std::vector<uint32_t>& rider) const {
         AssemblyMode& am = *archives[entries[i].first];
         am.index = entries[i].second;
         const std::string name = am.variant().label;
         try {
             const auto it = params.find(name);
             if (it == params.end()) throw std::runtime_error("no driving parameters");
-            const fuel::AssembledVehicle av = am.assembler->assemble(am.variant(), am.lod);
-            const fuel::VehicleSetup setup = fuel::makeVehicleSetup(am.assembler->dpc(), name, it->second, assembledHubs(av));
-            return std::make_unique<DriveSession>(av, setup, *terrain, x, z, yaw, riders ? riders->parts(name) : std::vector<uint32_t>{});
+            av = am.assembler->assemble(am.variant(), am.lod);
+            setup = fuel::makeVehicleSetup(am.assembler->dpc(), name, it->second, assembledHubs(av));
+            rider = riders ? riders->parts(name) : std::vector<uint32_t>{};
+            return true;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "fuelview: %s: %s\n", name.c_str(), e.what());
-            return nullptr;
+            return false;
         }
+    }
+    // Builds entry `i` at (x, z) facing `yaw`; nullptr (with a message) if it cannot drive.
+    std::unique_ptr<DriveSession> build(size_t i, double x, double z, float yaw) const {
+        fuel::AssembledVehicle av;
+        fuel::VehicleSetup setup;
+        std::vector<uint32_t> rider;
+        if (!load(i, av, setup, rider)) return nullptr;
+        return std::make_unique<DriveSession>(av, setup, *terrain, x, z, yaw, rider);
+    }
+    // Race opponents for entry `player`: entries of its class (the label up to the first '_',
+    // e.g. BUGGY), those of its category (OFF, ROAD, ALL) first, shuffled by `rng`. Repeats
+    // when the class has fewer than `count`.
+    std::vector<size_t> rivals(size_t player, int count, std::mt19937& rng) const {
+        const std::string& me = label(player);
+        auto field = [](const std::string& s, int k) {
+            size_t a = 0;
+            for (int j = 0; j < k && a != std::string::npos; ++j) a = s.find('_', a) == std::string::npos ? std::string::npos : s.find('_', a) + 1;
+            return a == std::string::npos ? std::string() : s.substr(a, s.find('_', a) - a);
+        };
+        std::vector<size_t> same, kin;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (i == player || field(label(i), 0) != field(me, 0)) continue;
+            (field(label(i), 1) == field(me, 1) ? same : kin).push_back(i);
+        }
+        std::shuffle(same.begin(), same.end(), rng);
+        std::shuffle(kin.begin(), kin.end(), rng);
+        std::vector<size_t> pool = same;
+        pool.insert(pool.end(), kin.begin(), kin.end());
+        if (pool.empty()) pool.push_back(player);
+        std::vector<size_t> out;
+        for (int k = 0; k < count; ++k) out.push_back(pool[size_t(k) % pool.size()]);
+        return out;
     }
 };
 
-// --race: FUEL's races (start line, ordered checkpoints, finish, laps).
+// --race: FUEL's races (start line, ordered checkpoints, finish, laps), with
+// AI opponents (vehicles 1.. of the drive session) on the grid behind the player.
 struct RaceSession {
     enum State { Countdown, Running, Finished };
     static constexpr float kRadius = 25.0f;  // the scripts give no gate width
@@ -356,8 +402,21 @@ struct RaceSession {
     size_t index = 0;
     State state = Countdown;
     std::vector<std::array<float, 3>> route;  // targets in order: checkpoints (per lap), then the finish
-    size_t next = 0;
+    fuel::RaceLine line;                      // start, then the route (what the AI follows)
     double clock = 0;  // seconds since the start (negative during the countdown)
+
+    // Everyone in the race: [0] is the player, the others match the session's vehicles 1...
+    struct Racer {
+        std::string name;        // variant label
+        size_t next = 0;         // index of the target it heads for (route.size() once finished)
+        double finished = -1;    // race clock at the finish, -1 while racing
+        fuel::RaceDriver ai;     // opponents (and the player's autopilot)
+    };
+    std::vector<Racer> racers = std::vector<Racer>(1);
+    bool reported = false;          // finishing order printed
+
+    RaceSession() = default;
+    RaceSession(const RaceSession&) = delete;
 
     const fuel::Race& race() const { return races[index]; }
     void begin(DriveSession& d, WorldStreamer* streamer, fuel::MeshRenderer& renderer) {
@@ -365,74 +424,163 @@ struct RaceSession {
         route.clear();
         for (int lap = 0; lap < (r.loops() ? r.laps : 1); ++lap) route.insert(route.end(), r.checkpoints.begin(), r.checkpoints.end());
         if (r.finish[0] != 0 || r.finish[2] != 0) route.push_back(r.finish);
-        next = 0;
+        line.build(r.start, route);
         clock = -3.0;
         state = Countdown;
+        reported = false;
+        for (Racer& racer : racers) {
+            racer.next = 0;
+            racer.finished = -1;
+            racer.ai.restart();
+        }
         // Face the first target: the scripts' start rotation is only roughly a heading.
         float yaw = r.startYaw;
         if (!route.empty()) {
             const float dx = route[0][0] - r.start[0], dz = route[0][2] - r.start[2];
             if (std::hypot(dx, dz) > 5 && std::hypot(dx, dz) < 2000) yaw = std::atan2(dx, dz);
         }
-        d.teleport(r.start[0], r.start[2], yaw);
+        // The grid: the player on the start, opponents beside and in rows behind (three abreast),
+        // spaced for the largest vehicle.
+        float width = 1, length = 2;
+        for (int i = 0; i < d.vehicleCount(); ++i)
+            for (const auto& w : d.setup(i).wheels) {
+                width = std::max(width, 2 * std::fabs(w.hub[0]) + w.width);
+                length = std::max(length, 2 * (std::fabs(w.hub[2]) + w.radius));
+            }
+        const float across = width + 2.5f, back = length + 4.0f;
+        const float fx = std::sin(yaw), fz = std::cos(yaw);
+        for (int i = 0; i < d.vehicleCount(); ++i) {
+            // 0 = player; 1, 2 beside it; then rows of three (centre, right, left) behind.
+            const float lanes[3] = {0, 1, -1};
+            const float side = (i == 0 ? 0.0f : i <= 2 ? lanes[i] : lanes[(i - 3) % 3]) * across;
+            const float behind = i <= 2 ? 0.0f : float(1 + (i - 3) / 3) * back;
+            d.teleport(r.start[0] - fx * behind + fz * side, r.start[2] - fz * behind - fx * side, yaw, i);
+        }
         if (streamer) streamer->update(d.position(), renderer, d.physics(), true);
     }
-    // Advances the race; holds the vehicle on the line during the countdown.
-    void update(float dt, simd_float3 at, fuel::DriveInput& in) {
-        if (state == Finished) return;
+    // Distance along the course: how far racer `i` (at `at`) has come.
+    float progress(size_t i, simd_float3 at) const {
+        return racers[i].finished >= 0 ? line.length() + 1e6f - float(racers[i].finished) : line.progress(racers[i].next, at.x, at.z);
+    }
+    // 1-based race positions, in racer order.
+    std::vector<int> positions(const DriveSession& d) const {
+        std::vector<float> score;
+        for (size_t i = 0; i < racers.size(); ++i) score.push_back(progress(i, d.position(int(i))));
+        std::vector<int> pos(racers.size(), 1);
+        for (size_t i = 0; i < racers.size(); ++i)
+            for (size_t j = 0; j < racers.size(); ++j) pos[i] += j != i && (score[j] > score[i] || (score[j] == score[i] && j < i));
+        return pos;
+    }
+    // Advances the race for every racer; drives the opponents (and holds everyone on the
+    // line during the countdown). `in` is the player's input.
+    void update(float dt, DriveSession& d, fuel::DriveInput& in) {
         clock += dt;
         if (state == Countdown) {
             in = {0, 0, 0, true};
+            for (int i = 1; i < d.vehicleCount(); ++i) d.setInput(i, {0, 0, 0, true});
             if (clock >= 0) state = Running;
             return;
         }
-        const auto& t = route[next];
-        if (std::hypot(at.x - t[0], at.z - t[2]) < kRadius && std::fabs(at.y - t[1]) < 60 && ++next >= route.size()) state = Finished;
-        if (race().timeLimit > 0 && clock > race().timeLimit) state = Finished;
-    }
-    // Test driver: full throttle, steering at the next target.
-    // When stuck against something it backs off with the opposite lock.
-    float stuckTime = 0, reverseTime = 0;
-    fuel::DriveInput autopilot(simd_float3 at, float heading, float speedKmh) {
-        if (state != Running) return {};
-        const auto& t = route[next];
-        const float want = std::atan2(t[0] - at.x, t[2] - at.z);
-        const float err = std::remainder(want - heading, 2.0f * float(M_PI));
-        const float steer = std::clamp(-err * 2.0f, -1.0f, 1.0f);  // positive steer turns right (decreasing heading)
-        stuckTime = std::fabs(speedKmh) < 3 ? stuckTime + 1.0f / 60 : 0;
-        if (stuckTime > 2) reverseTime = 1.5f, stuckTime = 0;
-        if (reverseTime > 0) {
-            reverseTime -= 1.0f / 60;
-            return {0, 1, -steer, false};
+        for (size_t i = 0; i < racers.size() && int(i) < d.vehicleCount(); ++i) {
+            Racer& racer = racers[i];
+            if (racer.finished >= 0) continue;
+            const simd_float3 at = d.position(int(i));
+            const auto& t = route[racer.next];
+            if (std::hypot(at.x - t[0], at.z - t[2]) < kRadius && std::fabs(at.y - t[1]) < 60 && ++racer.next >= route.size()) racer.finished = clock;
         }
-        return {std::fabs(err) > 1.2f ? 0.4f : 1.0f, 0, steer, false};
+        if (state == Running && (racers[0].finished >= 0 || (race().timeLimit > 0 && clock > race().timeLimit))) state = Finished;
+        // Opponents: the AI driver, rubber-banded on the player (up to 12% slower when far
+        // ahead, 8% faster when far behind; FUEL's EMD_SetAIElasticParam gives 200 m).
+        const float player = progress(0, d.position(0));
+        for (int i = 1; i < d.vehicleCount() && size_t(i) < racers.size(); ++i) {
+            Racer& racer = racers[size_t(i)];
+            if (racer.finished >= 0) {
+                d.setInput(i, {0, 0, 0, true});
+                continue;
+            }
+            const float ahead = progress(size_t(i), d.position(i)) - player;
+            const float rubber = ahead > 200 ? 1.0f - 0.12f * std::min(1.0f, (ahead - 200) / 400) :
+                                 ahead < -200 ? 1.0f + 0.08f * std::min(1.0f, (-ahead - 200) / 400) : 1.0f;
+            d.setInput(i, drive(racer, d, i, dt, rubber));
+        }
     }
+    // Test driver for the player: the opponents' AI at full skill, no rubber-banding.
+    fuel::DriveInput autopilot(DriveSession& d) {
+        if (state != Running || racers[0].finished >= 0) return {};
+        return drive(racers[0], d, 0, 1.0f / 60, 1.0f);
+    }
+    fuel::DriveInput drive(Racer& racer, DriveSession& d, int i, float dt, float rubber) {
+        const fuel::VehicleState st = d.state(i);
+        const auto& q = st.chassis.rotation;
+        fuel::RaceDriver::Sense s;
+        s.x = st.chassis.position[0];
+        s.z = st.chassis.position[2];
+        s.heading = d.heading(i);
+        s.speedKmh = st.speedKmh;
+        s.upY = 1 - 2 * (q[0] * q[0] + q[2] * q[2]);  // y of the rotated up axis
+        s.topSpeedKmh = d.setup(i).topSpeedKmh;
+        const fuel::DriveInput in = racer.ai.drive(line, racer.next, s, dt, rubber);
+        if (racer.ai.wantsReset()) {
+            // Back on the line, a few metres to the side for each racer so they do not land on each other.
+            const auto p = racer.ai.resetPoint();
+            const float yaw = racer.ai.resetHeading(), side = float(i % 3 - 1) * 4.0f;
+            d.teleport(p[0] + std::cos(yaw) * side, p[2] - std::sin(yaw) * side, yaw, i);
+            racer.ai.didReset();
+            return {};
+        }
+        return in;
+    }
+    size_t next() const { return racers[0].next; }  // the player's target (the HUD and markers follow it)
     std::vector<simd_float4> markers() const {
+        const size_t next = this->next();
         std::vector<simd_float4> m;
         for (size_t i = next; i < route.size() && i < next + 2; ++i)
             m.push_back(simd_make_float4(route[i][0], route[i][1], route[i][2], i + 1 == route.size() ? 2.0f : float(i - next)));
         return m;
     }
-    std::string hud(simd_float3 at) const {
+    std::string hud(const DriveSession& d) const {
         char buf[256];
+        const simd_float3 at = d.position();
         const double t = std::max(0.0, clock);
         const int min = int(t / 60);
         const double sec = t - min * 60;
         const fuel::Race& r = race();
+        const size_t next = this->next();
+        std::string place;
+        if (racers.size() > 1) place = "   P" + std::to_string(positions(d)[0]) + "/" + std::to_string(racers.size());
         if (state == Countdown) {
             std::snprintf(buf, sizeof buf, "%s   starts in %d", r.name.c_str(), int(std::ceil(-clock)));
         } else if (state == Finished) {
             const bool timedOut = next < route.size();
-            std::snprintf(buf, sizeof buf, "%s   %s %d:%04.1f   Enter: retry   N: next race", r.name.c_str(), timedOut ? "OUT OF TIME" : "FINISHED",
-                          min, sec);
+            std::snprintf(buf, sizeof buf, "%s   %s %d:%04.1f%s   Enter: retry   N: next race", r.name.c_str(), timedOut ? "OUT OF TIME" : "FINISHED",
+                          min, sec, place.c_str());
         } else {
             const auto& tgt = route[next];
             const size_t perLap = r.loops() && !r.checkpoints.empty() ? r.checkpoints.size() : route.size();
             std::string lap = r.loops() ? "   lap " + std::to_string(std::min<size_t>(next / perLap + 1, size_t(r.laps))) + "/" + std::to_string(r.laps) : "";
-            std::snprintf(buf, sizeof buf, "%s   checkpoint %zu/%zu%s   %d:%04.1f   next %.0f m", r.name.c_str(), next + 1, route.size(), lap.c_str(),
-                          min, sec, std::hypot(at.x - tgt[0], at.z - tgt[2]));
+            std::snprintf(buf, sizeof buf, "%s%s   checkpoint %zu/%zu%s   %d:%04.1f   next %.0f m", r.name.c_str(), place.c_str(), next + 1, route.size(),
+                          lap.c_str(), min, sec, std::hypot(at.x - tgt[0], at.z - tgt[2]));
         }
         return buf;
+    }
+    // The order of the field: finishers by time, then the rest by how far they got.
+    std::string standings(const DriveSession& d) const {
+        const std::vector<int> pos = positions(d);
+        std::string out;
+        for (int p = 1; p <= int(racers.size()); ++p)
+            for (size_t i = 0; i < racers.size(); ++i) {
+                if (pos[i] != p) continue;
+                const Racer& r = racers[i];
+                char buf[160];
+                if (r.finished >= 0)
+                    std::snprintf(buf, sizeof buf, "  %d. %-16s %s %d:%04.1f\n", p, r.name.c_str(), i == 0 ? "(you)" : "     ", int(r.finished / 60),
+                                  r.finished - int(r.finished / 60) * 60);
+                else
+                    std::snprintf(buf, sizeof buf, "  %d. %-16s %s racing, checkpoint %zu/%zu\n", p, r.name.c_str(), i == 0 ? "(you)" : "     ",
+                                  r.next + 1, route.size());
+                out += buf;
+            }
+        return out;
     }
 };
 
@@ -446,6 +594,72 @@ std::vector<fuel::Race> loadRaces(const std::string& dataDir) {
             if ((r.start[0] != 0 || r.start[2] != 0) && (!r.checkpoints.empty() || r.finish[0] != 0 || r.finish[2] != 0)) out.push_back(r);
     }
     return out;
+}
+
+// Puts `count` opponents of the player's class into the drive session and the race,
+// each with a random livery and colour of its own, and hands their parts to the renderer.
+void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int count, fuel::MeshRenderer& renderer, const VehicleLook& prefs) {
+    std::mt19937 rng(fuel::asoboCrc(race.race().name));
+    race.racers.resize(1);
+    race.racers[0].name = garage.label(garage.current);
+    std::vector<std::vector<fuel::MeshInstance>> parts;
+    std::vector<fuel::Paint> paints;
+    const simd_float3 at = drive.position();
+    for (size_t entry : garage.rivals(garage.current, count, rng)) {
+        fuel::AssembledVehicle av;
+        fuel::VehicleSetup setup;
+        std::vector<uint32_t> rider;
+        if (!garage.load(entry, av, setup, rider)) continue;
+        const int i = drive.addVehicle(av, setup, at.x, at.z + 30.0 * drive.vehicleCount(), 0, rider);  // the grid comes with RaceSession::begin
+        RaceSession::Racer racer;
+        racer.name = garage.label(entry);
+        racer.ai = fuel::RaceDriver(std::uniform_real_distribution<float>(0.85f, 1.0f)(rng));
+        race.racers.push_back(racer);
+        // Paint: a random livery the vehicle has (or plain paint) and a random palette colour.
+        const AssemblyMode& am = *garage.archives[garage.entries[entry].first];
+        VehicleLook look = makeLook(racer.name, am.assembler->variants()[garage.entries[entry].second].name, am.palettes, am.assembler->dpc(), prefs);
+        std::vector<int> liveries;
+        for (int l = 1; l <= 9; ++l)
+            if (look.liveries[size_t(l)][0] != 0) liveries.push_back(l);
+        look.livery = liveries.empty() ? 0 : liveries[rng() % liveries.size()];
+        look.custom = false;
+        look.color = look.palette.empty() ? 0 : int(rng() % look.palette.size());
+        paints.push_back(look.paint());
+        parts.push_back(drive.parts(i));
+    }
+    renderer.setVehicles(parts, paints);
+    renderer.shadowRadius = parts.empty() ? 0.0f : 22.0f;  // shadows for the vehicles around the player
+}
+
+// Moves the opponents' parts to their physics poses.
+void showOpponents(DriveSession& drive, fuel::MeshRenderer& renderer) {
+    for (int i = 1; i < drive.vehicleCount(); ++i) renderer.setVehicleWorlds(size_t(i - 1), drive.partWorlds(i));
+}
+
+// --ai-check: each racer's checkpoints, speed, position and resets.
+void printAiCheck(const RaceSession& race, const DriveSession& drive) {
+    const std::vector<int> pos = race.positions(drive);
+    std::printf("ai check t=%5.1f s\n", race.clock);
+    for (size_t i = 0; i < race.racers.size(); ++i) {
+        const RaceSession::Racer& r = race.racers[i];
+        const fuel::VehicleState st = drive.state(int(i));
+        std::printf("  P%d %-16s %s skill %.2f  checkpoints %2zu/%zu  %5.1f km/h  resets %d%s\n", pos[i], r.name.c_str(), i == 0 ? "(auto)" : "      ",
+                    r.ai.skill(), r.next, race.route.size(), st.speedKmh, r.ai.resets(),
+                    r.finished >= 0 ? (" finished " + std::to_string(int(r.finished)) + " s").c_str() : "");
+    }
+}
+
+// Passes when every opponent got through checkpoints and none needed more than a few resets.
+bool aiCheckVerdict(const RaceSession& race) {
+    int moving = 0, resets = 0;
+    for (size_t i = 1; i < race.racers.size(); ++i) {
+        moving += race.racers[i].next >= std::min<size_t>(3, race.route.size());
+        resets += race.racers[i].ai.resets();
+    }
+    const int n = int(race.racers.size()) - 1;
+    const bool ok = n > 0 && moving == n && resets <= 2 * n;
+    std::printf("ai check: %d of %d opponents past 3 checkpoints, %d resets in all: %s\n", moving, n, resets, ok ? "ok" : "FAILED");
+    return ok;
 }
 
 MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
@@ -535,7 +749,6 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     WorldStreamer* _streamer; // --drive: the static world
     Garage* _garage;          // --drive: vehicles to switch between
     RaceSession* _race;       // --drive: the current race
-    std::unique_ptr<DriveSession> _switched;  // a vehicle chosen with Tab
     std::unique_ptr<fuel::DriveAudio> _audio; // --drive in a window: engine, tyre, wind, impact sounds
     NSTextField* _hud;        // --drive: speed, gear, race
     std::set<unsigned short> _keys;
@@ -675,16 +888,16 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 // Swaps in the next drivable vehicle where the current one stands.
 - (void)switchVehicle:(int)dir {
-    const simd_float3 at = _drive->position();
-    const float heading = _drive->heading();
     const size_t n = _garage->entries.size();
     for (size_t tries = 0; tries < n; ++tries) {
         _garage->current = (_garage->current + n + size_t(dir + int(n))) % n;
-        std::unique_ptr<DriveSession> next = _garage->build(_garage->current, at.x, at.z, heading);
-        if (!next) continue;
+        fuel::AssembledVehicle av;
+        fuel::VehicleSetup setup;
+        std::vector<uint32_t> rider;
+        if (!_garage->load(_garage->current, av, setup, rider)) continue;
         AssemblyMode& am = *_garage->archives[_garage->entries[_garage->current].first];
-        _switched = std::move(next);
-        _drive = _switched.get();
+        _drive->replacePlayer(av, setup, rider);  // the world and the opponents stay
+        if (_race) _race->racers[0].name = am.variant().label;
         _scene.parts = _drive->parts();
         _scene.variant = am.variant().label;
         _look = am.look(_look);
@@ -785,9 +998,16 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         in.handbrake = in.handbrake || pad.buttonX.pressed;
         if (pad.buttonY.pressed) _drive->reset();
     }
-    if (_race) _race->update(dt, _drive->position(), in);
+    if (_race) _race->update(dt, *_drive, in);
     _drive->update(dt, in);
-    if (_race) _renderer->setMarkers(_race->markers());
+    if (_race) {
+        _renderer->setMarkers(_race->markers());
+        if (_race->state == RaceSession::Finished && !_race->reported) {
+            _race->reported = true;
+            std::printf("%s finished: order\n%s", _race->race().name.c_str(), _race->standings(*_drive).c_str());
+        }
+    }
+    showOpponents(*_drive, *_renderer);
     if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics());
     _renderer->setInstanceWorlds(_drive->partWorlds());
     _renderer->setFocus(_drive->position());
@@ -799,7 +1019,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     const fuel::VehicleState st = _drive->state();
     if (_audio) _audio->update(dt, st, in.throttle);
     self.window.title = [NSString stringWithFormat:@"FUEL — %s", _scene.variant.c_str()];
-    const std::string raceLine = _race ? _race->hud(_drive->position()) : _scene.variant;
+    const std::string raceLine = _race ? _race->hud(*_drive) : _scene.variant;
     _hud.stringValue = [NSString stringWithFormat:@"%s\n%3.0f km/h   gear %d   %5.0f rpm   %s", raceLine.c_str(), std::fabs(st.speedKmh),
                                                   st.gear, st.rpm, _race ? _scene.variant.c_str() : ""];
 }
@@ -1029,8 +1249,10 @@ int main(int argc, const char** argv) {
                     auto it = std::find_if(race->races.begin(), race->races.end(), [&](const fuel::Race& r) { return r.name == opt.race; });
                     if (it == race->races.end()) die("no race named " + opt.race);
                     race->index = size_t(it - race->races.begin());
+                    addOpponents(*garage, *drive, *race, opt.opponents, renderer, prefs);
                     race->begin(*drive, streamer.get(), renderer);
-                    std::printf("race %s: %zu targets; %zu races (N for the next)\n", race->race().name.c_str(), race->route.size(), race->races.size());
+                    std::printf("race %s: %zu targets, %zu opponents; %zu races (N for the next)\n", race->race().name.c_str(), race->route.size(),
+                                race->racers.size() - 1, race->races.size());
                 }
                 if (opt.audioCheck) {  // build sound sets for a few vehicles and print their layers
                     std::vector<std::pair<const fuel::DpcFile*, std::string>> list;
@@ -1120,19 +1342,21 @@ int main(int argc, const char** argv) {
                     for (int i = 0; i < int(runTime * 60); ++i) {
                         fuel::DriveInput in{1.0f, 0, 0, false};
                         if (race && !opt.propCheck) {
-                            if (race->state == RaceSession::Finished) break;
-                            in = race->autopilot(drive->position(), drive->heading(), drive->state().speedKmh);
+                            if (race->state == RaceSession::Finished && !opt.aiCheck) break;
+                            in = race->autopilot(*drive);
                             if (std::getenv("FUEL_RACE_WARP") && race->state == RaceSession::Running && i % 60 == 0) {
                                 // Logic test: hop to the next target every second.
-                                const auto& t = race->route[race->next];
+                                const auto& t = race->route[race->next()];
                                 drive->teleport(t[0], t[2], drive->heading());
                             }
-                            race->update(1.0f / 60, drive->position(), in);
+                            race->update(1.0f / 60, *drive, in);
                             if (std::getenv("FUEL_RACE_TRACE") && i % 600 == 0) {
                                 const simd_float3 p = drive->position();
                                 std::printf("  t=%5.0fs at (%.0f, %.0f, %.0f) %5.1f km/h  heading %4.0f  %s\n", i / 60.0, p.x, p.y, p.z,
-                                            drive->state().speedKmh, drive->heading() * 180 / M_PI, race->hud(p).c_str());
+                                            drive->state().speedKmh, drive->heading() * 180 / M_PI, race->hud(*drive).c_str());
                             }
+                            if (opt.aiCheck && i % 600 == 0) printAiCheck(*race, *drive);
+                            if (opt.aiCheck && std::all_of(race->racers.begin(), race->racers.end(), [](const RaceSession::Racer& r) { return r.finished >= 0; })) break;
                         }
                         drive->update(1.0f / 60, in);
                         if (streamer && (opt.propCheck || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
@@ -1169,9 +1393,15 @@ int main(int argc, const char** argv) {
                     }
                     }
                     renderer.setInstanceWorlds(drive->partWorlds());
+                    showOpponents(*drive, renderer);
                     if (race) {
                         renderer.setMarkers(race->markers());
-                        std::printf("%s\n", race->hud(drive->position()).c_str());
+                        std::printf("%s\n", race->hud(*drive).c_str());
+                        if (race->racers.size() > 1) std::printf("order after %.1f s of racing:\n%s", std::max(0.0, race->clock), race->standings(*drive).c_str());
+                        if (opt.aiCheck) {
+                            printAiCheck(*race, *drive);
+                            return aiCheckVerdict(*race) ? 0 : 1;
+                        }
                     }
                     renderer.setFocus(haveCheckFocus ? checkFocus : drive->position());
                     cam.yaw += drive->heading() + float(M_PI);

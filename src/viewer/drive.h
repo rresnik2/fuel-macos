@@ -1,4 +1,4 @@
-// Drive mode: an assembled vehicle on the terrain, moved by the physics.
+// Drive mode: assembled vehicles on the terrain, moved by the physics.
 #pragma once
 
 #include <simd/simd.h>
@@ -13,25 +13,19 @@
 #include <unordered_map>
 #include <vector>
 
-class DriveSession {
+// The drawn parts of one vehicle and how they follow its physics state.
+class VehicleRig {
 public:
-    // Builds the physics vehicle for `vehicle`'s parts and places it at (x, z).
     // `riders`: extra meshes (the baked rider, in vehicle space) that follow the chassis.
-    DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain, double x,
-                 double z, float yaw, const std::vector<uint32_t>& riders = {});
-
+    VehicleRig(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const std::vector<uint32_t>& riders);
     // The parts in vehicle space, for MeshRenderer::setScene.
     const std::vector<fuel::MeshInstance>& parts() const { return parts_; }
-    void update(float dt, const fuel::DriveInput& input);
-    void reset() { world_.reset(); }
-    // Puts the vehicle on its wheels at (x, z) facing `yaw`.
-    void teleport(double x, double z, float yaw) { world_.spawn(setup_, x, z, yaw); }
+    const fuel::VehicleSetup& setup() const { return setup_; }
+    // Rider body language for this frame's input.
+    void animate(float dt, const fuel::DriveInput& input, float speedKmh);
     // World matrices for the parts, in parts() order.
-    std::vector<simd_float4x4> partWorlds() const;
-    fuel::VehicleState state() const { return world_.state(); }
-    simd_float3 position() const;  // a point on the body, for the camera
-    fuel::DriveWorld& physics() { return world_; }
-    float heading() const;  // radians; 0 = +z
+    std::vector<simd_float4x4> partWorlds(const fuel::VehicleState& st) const;
+    simd_float3 focus(const fuel::VehicleState& st) const;  // a point on the body, for the camera
 
 private:
     struct PartLink {
@@ -40,11 +34,50 @@ private:
         bool rider = false;          // leans with the driving input
     };
     float lean_ = 0, pitch_ = 0;     // rider body language (radians), smoothed
-    fuel::DriveWorld world_;
     fuel::VehicleSetup setup_;
     std::vector<fuel::MeshInstance> parts_;
     std::vector<PartLink> links_;
     float focusHeight_ = 0.5f;  // where the camera looks, above the vehicle origin
+};
+
+// Drive mode: assembled vehicles on the terrain, moved by the physics. Vehicle 0
+// is the player; the others (race opponents) are added with addVehicle and
+// driven through setInput.
+class DriveSession {
+public:
+    // Builds the physics vehicle for `vehicle`'s parts and places it at (x, z).
+    // `riders`: extra meshes (the baked rider, in vehicle space) that follow the chassis.
+    DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain, double x,
+                 double z, float yaw, const std::vector<uint32_t>& riders = {});
+
+    // Adds another vehicle at (x, z) facing `yaw`; returns its index.
+    int addVehicle(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, double x, double z, float yaw,
+                   const std::vector<uint32_t>& riders = {});
+    int vehicleCount() const { return int(rigs_.size()); }
+    // Swaps the player's vehicle for another where it stands (the world and other vehicles stay).
+    void replacePlayer(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const std::vector<uint32_t>& riders = {});
+    // Input for vehicle `i` > 0 from the next update on (the player's comes with update).
+    void setInput(int i, const fuel::DriveInput& input);
+
+    // The parts of vehicle `i` in vehicle space, for MeshRenderer::setScene.
+    const std::vector<fuel::MeshInstance>& parts(int i = 0) const { return rigs_[size_t(i)].parts(); }
+    const fuel::VehicleSetup& setup(int i = 0) const { return rigs_[size_t(i)].setup(); }
+    // Advances every vehicle; `input` drives the player.
+    void update(float dt, const fuel::DriveInput& input);
+    void reset(int i = 0) { world_.reset(i); }
+    // Puts vehicle `i` on its wheels at (x, z) facing `yaw`.
+    void teleport(double x, double z, float yaw, int i = 0) { world_.placeVehicle(i, x, z, yaw); }
+    // World matrices for the parts of vehicle `i`, in parts(i) order.
+    std::vector<simd_float4x4> partWorlds(int i = 0) const { return rigs_[size_t(i)].partWorlds(world_.state(i)); }
+    fuel::VehicleState state(int i = 0) const { return world_.state(i); }
+    simd_float3 position(int i = 0) const { return rigs_[size_t(i)].focus(world_.state(i)); }  // a point on the body, for the camera
+    fuel::DriveWorld& physics() { return world_; }
+    float heading(int i = 0) const;  // radians; 0 = +z
+
+private:
+    fuel::DriveWorld world_;
+    std::vector<VehicleRig> rigs_;
+    std::vector<fuel::DriveInput> inputs_;
 };
 
 // Streams the static world around the player: every object the sub-worlds

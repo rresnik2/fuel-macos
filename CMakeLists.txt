@@ -79,8 +79,8 @@ FetchContent_Declare(JoltPhysics
   SOURCE_SUBDIR Build)
 FetchContent_MakeAvailable(JoltPhysics)
 
-# Vehicle physics on Jolt, tuned from the game's data.
-add_library(fuelphysics STATIC src/physics/vehicle_physics.cpp)
+# Vehicle physics on Jolt, tuned from the game's data, and the opponents' driver AI.
+add_library(fuelphysics STATIC src/physics/vehicle_physics.cpp src/physics/race_ai.cpp)
 target_link_libraries(fuelphysics PUBLIC fuelcore Jolt)
 
 # Drives a vehicle headless and prints the result.

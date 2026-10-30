@@ -15,6 +15,7 @@ namespace {
 // Only the stride differs.
 constexpr uint32_t kMinDrawableStride = 28;
 constexpr NSUInteger kShadowMapSize = 2048;
+constexpr float kVehicleDrawDistance = 2500.0f;  // metres from the focus (setVehicles)
 
 const char* kShaderSource = R"METAL(
 #include <metal_stdlib>
@@ -929,6 +930,23 @@ void MeshRenderer::setPaint(const Paint& paint) {
 const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string* error) {
     if (auto it = bakedMeshes_.find(meshId); it != bakedMeshes_.end()) return it->second.get();
     if (auto it = meshes_.find(meshId); it != meshes_.end()) return it->second.get();
+    std::unique_ptr<GpuMesh> gm = buildMesh(meshId, error);
+    return gm ? (meshes_[meshId] = std::move(gm)).get() : nullptr;
+}
+
+const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string* error, const std::array<uint32_t, 3>& livery) {
+    if (auto it = bakedMeshes_.find(meshId); it != bakedMeshes_.end()) return it->second.get();
+    const auto key = std::make_pair(meshId, livery);
+    if (auto it = liveryMeshes_.find(key); it != liveryMeshes_.end()) return it->second.get();
+    // makeMaterial substitutes the current paint's livery.
+    const std::array<uint32_t, 3> own = paint_.livery;
+    paint_.livery = livery;
+    std::unique_ptr<GpuMesh> gm = buildMesh(meshId, error);
+    paint_.livery = own;
+    return gm ? (liveryMeshes_[key] = std::move(gm)).get() : nullptr;
+}
+
+std::unique_ptr<MeshRenderer::GpuMesh> MeshRenderer::buildMesh(uint32_t meshId, std::string* error) {
     auto hit = library_.find(meshId, cls::Mesh);
     if (!hit) {
         *error = "no such Mesh_Z";
@@ -989,7 +1007,7 @@ const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string
                                                         options:MTLResourceStorageModeShared];
     gm->boundsMin = simd_make_float3(stats.boundsMin[0], stats.boundsMin[1], stats.boundsMin[2]);
     gm->boundsMax = simd_make_float3(stats.boundsMax[0], stats.boundsMax[1], stats.boundsMax[2]);
-    return (meshes_[meshId] = std::move(gm)).get();
+    return gm;
 }
 
 bool MeshRenderer::addBakedMesh(uint32_t key, const BakedMesh& mesh, std::string* error) {
@@ -1121,10 +1139,34 @@ void MeshRenderer::setInstanceWorlds(const std::vector<simd_float4x4>& worlds) {
         if (inputToInstance_[k] >= 0) instances_[size_t(inputToInstance_[k])].world = worlds[k];
 }
 
+void MeshRenderer::setVehicles(const std::vector<std::vector<MeshInstance>>& parts, const std::vector<Paint>& paints) {
+    vehicles_.clear();
+    for (size_t v = 0; v < parts.size(); ++v) {
+        const Paint paint = v < paints.size() ? paints[v] : paint_;
+        OtherVehicle ov;
+        ov.paint = paint.color;
+        for (const MeshInstance& in : parts[v]) {
+            std::string err;
+            const GpuMesh* gm = loadMesh(in.meshId, &err, paint.livery);
+            ov.inputToInstance.push_back(gm && gm->indices != nil ? int(ov.instances.size()) : -1);
+            if (gm && gm->indices != nil) ov.instances.push_back({gm, in.world});
+        }
+        vehicles_.push_back(std::move(ov));
+    }
+}
+
+void MeshRenderer::setVehicleWorlds(size_t k, const std::vector<simd_float4x4>& worlds) {
+    if (k >= vehicles_.size()) return;
+    OtherVehicle& ov = vehicles_[k];
+    for (size_t i = 0; i < worlds.size() && i < ov.inputToInstance.size(); ++i)
+        if (ov.inputToInstance[i] >= 0) ov.instances[size_t(ov.inputToInstance[i])].world = worlds[i];
+}
+
 simd_float4x4 MeshRenderer::sunViewProj() const {
     const simd_float3 up = std::fabs(sunDir_.y) > 0.99f ? simd_make_float3(0, 0, 1) : simd_make_float3(0, 1, 0);
-    const simd_float3 eye = center_ + sunDir_ * (radius_ * 3.0f);
-    return simd_mul(orthoRH(radius_ * 1.05f, radius_ * 0.5f, radius_ * 6.0f), lookAtRH(eye, center_, up));
+    const float r = shadowHalfSize() / 1.05f;
+    const simd_float3 eye = center_ + sunDir_ * (r * 3.0f);
+    return simd_mul(orthoRH(r * 1.05f, r * 0.5f, r * 6.0f), lookAtRH(eye, center_, up));
 }
 
 void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
@@ -1147,6 +1189,9 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
         if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
     for (const Instance& inst : propInstances_)
         if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
+    for (const OtherVehicle& ov : vehicles_)
+        for (const Instance& inst : ov.instances)
+            if (simd_distance(inst.world.columns[3].xyz, center_) < shadowHalfSize() * 1.5f + 5.0f) casters.push_back(&inst);
     for (const Instance* ip : casters) {
         const Instance& inst = *ip;
         const GpuMesh& gm = *inst.mesh;
@@ -1237,6 +1282,18 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             if (inst.mesh->draws[pass].empty()) continue;
             [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
             drawMesh(*inst.mesh, 1);
+        }
+        for (const OtherVehicle& ov : vehicles_) {  // each with its own paint colour
+            if (ov.instances.empty() || simd_distance(ov.instances[0].world.columns[3].xyz, center_) > kVehicleDrawDistance) continue;
+            FrameUniforms vu = fu;
+            vu.paint = simd_make_float4(srgbToLinear(ov.paint.x), srgbToLinear(ov.paint.y), srgbToLinear(ov.paint.z), 1);
+            [enc setFragmentBytes:&vu length:sizeof vu atIndex:1];
+            for (const Instance& inst : ov.instances) {
+                if (inst.mesh->draws[pass].empty()) continue;
+                [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
+                drawMesh(*inst.mesh, 1);
+            }
+            [enc setFragmentBytes:&fu length:sizeof fu atIndex:1];
         }
         for (const WorldGroup& g : worldGroups_) {  // one instanced draw per mesh
             if (g.mesh->draws[pass].empty()) continue;
