@@ -195,15 +195,35 @@ void WorldStreamer::buildRoads(simd_float3 player, fuel::MeshRenderer& renderer)
             simd_float2 dir = next - prev;
             if (simd_length(dir) < 1e-4f) dir = simd_make_float2(1, 0);
             dir = simd_normalize(dir);
-            const simd_float2 side = simd_make_float2(-dir.y, dir.x) * (st.width * 0.5f);
+            // Miter at corners: widen the offset by 1/cos(half the turn) so the road keeps its width.
+            float miter = 1.0f;
+            if (k > 0 && k + 1 < pts.size() && simd_length(pts[k] - prev) > 1e-3f) {
+                const simd_float2 d1 = simd_normalize(pts[k] - prev);
+                miter = 1.0f / std::max(0.35f, simd_dot(simd_make_float2(-dir.y, dir.x), simd_make_float2(-d1.y, d1.x)));
+            }
+            const simd_float2 side = simd_make_float2(-dir.y, dir.x) * (st.width * 0.5f * miter);
             if (k > 0) along += simd_distance(pts[k], pts[k - 1]);
             const auto base = uint32_t(verts.size());
             for (int e = 0; e < 2; ++e) {
                 const simd_float2 p = pts[k] + (e == 0 ? -side : side);
-                const float y = terrain_->smoothHeightAt(p.x, p.y) + 0.2f;
+                const float y = terrain_->smoothHeightAt(p.x, p.y) + 0.35f;
                 verts.push_back({simd_make_float4(p.x, y, p.y, st.opacity), simd_make_float4(float(e), along / std::max(st.width, 4.0f), 0, 0)});
             }
             if (k > 0) idx.insert(idx.end(), {base - 2, base - 1, base, base - 1, base + 1, base});
+        }
+        // Round caps at both ends hide the notches where pieces meet at an angle.
+        for (const auto& end : {line.points.front(), line.points.back()}) {
+            const float y = terrain_->smoothHeightAt(end[0], end[1]) + 0.2f;
+            const auto centre = uint32_t(verts.size());
+            verts.push_back({simd_make_float4(end[0], y, end[1], st.opacity), simd_make_float4(0.5f, 0, 0, 0)});
+            constexpr int kSegments = 10;
+            for (int s = 0; s <= kSegments; ++s) {
+                const float a = float(s) / kSegments * 6.2831853f;
+                const float px = end[0] + std::cos(a) * st.width * 0.5f, pz = end[1] + std::sin(a) * st.width * 0.5f;
+                verts.push_back({simd_make_float4(px, terrain_->smoothHeightAt(px, pz) + 0.2f, pz, st.opacity),
+                                 simd_make_float4(0.08f, std::sin(a) * 0.5f, 0, 0)});
+                if (s > 0) idx.insert(idx.end(), {centre, centre + uint32_t(s), centre + uint32_t(s) + 1});
+            }
         }
     }
     std::vector<fuel::MeshRenderer::RoadVertex> vertices;

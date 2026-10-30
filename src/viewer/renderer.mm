@@ -1214,8 +1214,6 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             drawMesh(*g.mesh, g.count);
         }
     };
-    drawPass(0);
-    drawPass(1);
     if (terrain) {
         [enc setRenderPipelineState:terrainPipeline_];
         [enc setDepthStencilState:depthWrite_];
@@ -1236,7 +1234,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         if (roadVertices_ != nil && roadIndices_ != nil) {
             [enc setRenderPipelineState:roadPipeline_];
             [enc setDepthStencilState:depthNoWrite_];
-            [enc setDepthBias:-4.0f slopeScale:-4.0f clamp:0.0f];
+            [enc setDepthBias:-8.0f slopeScale:-24.0f clamp:0.0f];
             [enc setVertexBuffer:roadVertices_ offset:0 atIndex:0];
             [enc setFragmentTexture:shadowMap_ atIndex:7];
             for (const auto& [tex, b] : roadBatches_) {
@@ -1253,7 +1251,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             }
             [enc setDepthBias:0 slopeScale:0 clamp:0];
         }
-    } else if (showGround) {
+    }
+    // Terrain and roads first, so vehicles and objects cover the road ribbons.
+    drawPass(0);
+    drawPass(1);
+    if (!terrain && showGround) {
         [enc setRenderPipelineState:groundPipeline_];
         [enc setDepthStencilState:depthWrite_];
         [enc setCullMode:MTLCullModeNone];
