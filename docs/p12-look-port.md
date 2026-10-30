@@ -41,6 +41,20 @@ Reference frames: ~/re-work/fuel/notes/ref-look/
   sat 1.0, split tone cool shadows / golden highlights, ground palette desaturated (greens most)
   and darkened x(0.92, 0.86, 0.76); bluer zenith.
 
+- 4f97b13 Dust: no plumes from wheelspin on the spot (the window's start line was an opaque veil).
+- 216d03f Sun raised to 22 deg, sky ambient (0.38, 0.38, 0.42): slopes facing away from the sun
+  were black. Roads now take the terrain normal from the height map (they glowed on dark slopes).
+  Final per-frame GPU (1600x1000) 4.4-5.3 ms, (2560x1600) 6.8-8.0 ms.
+
+## Known gaps
+- Light shafts need occluders near the sun (trees, buildings); grassland CR2 shows little.
+- The chase camera avoids static objects and terrain, not other vehicles: AI riders that tuck in
+  right behind the player fill the frame.
+- Dust is full-resolution alpha overdraw; a half-res dust target would bound the worst case.
+- One fixed sun for the whole world (no per-race time of day from game data); sky/haze/grade are
+  hand-tuned to the reference video, not read from FUEL's atmosphere settings.
+- No camera shake, exhaust flames, or heat haze; the single-mesh viewer also gets the grade.
+
 ## GPU cost (M-series, FUEL_GPU_BENCH=60, whole frame incl. shadows; CR2-Yell-CP start)
 | size | post on | FUEL_NO_POST |
 | 1600x1000 | 4.6-5.6 ms | 4.2-4.7 ms |
