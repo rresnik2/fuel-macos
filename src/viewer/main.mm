@@ -66,9 +66,8 @@ simd_float4x4 matrix_from_translation(float x, float y, float z) {
     return m;
 }
 
-constexpr MTLPixelFormat kColorFormat = fuel::kRenderColorFormat;
-constexpr MTLPixelFormat kDepthFormat = fuel::kRenderDepthFormat;
-constexpr NSUInteger kSamples = 4;
+constexpr MTLPixelFormat kColorFormat = fuel::kOutputColorFormat;
+constexpr NSUInteger kSamples = 4;  // the scene's MSAA
 
 fuel::Recorder gRecorder;  // --record
 
@@ -94,6 +93,7 @@ struct Options {
     int lod = 1;
     int width = 1600, height = 1000;
     float yawDeg = 37.0f, pitchDeg = 17.0f;
+    bool haveYaw = false;  // --yaw given: with --film, the chase camera looks from that angle (0 = behind)
     float distance = 0;
     bool cull = true;
     float dirt = 0.0f;
@@ -177,7 +177,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
-        else if (a == "--yaw") o.yawDeg = std::stof(next());
+        else if (a == "--yaw") o.yawDeg = std::stof(next()), o.haveYaw = true;
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
         else if (a == "--distance") o.distance = std::stof(next());
         else if (a == "--no-cull") o.cull = false;
@@ -687,8 +687,6 @@ bool aiCheckVerdict(const RaceSession& race) {
     return ok;
 }
 
-MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
-
 void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> tex, const std::string& path) {
     const NSUInteger w = tex.width, h = tex.height, rowBytes = w * 4;
     id<MTLBuffer> buf = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
@@ -716,39 +714,33 @@ void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> te
     if (!ok) die("cannot write " + path);
 }
 
-void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Options& o, const fuel::OrbitCamera& cam) {
+// Renders one frame to o.shot; returns its GPU time in milliseconds.
+double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Options& o, const fuel::OrbitCamera& cam) {
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    auto makeTarget = [&](MTLPixelFormat pf, NSUInteger samples) {
-        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:NSUInteger(o.width) height:NSUInteger(o.height) mipmapped:NO];
-        td.textureType = samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
-        td.sampleCount = samples;
-        td.usage = MTLTextureUsageRenderTarget;
-        td.storageMode = MTLStorageModePrivate;
-        return [device newTextureWithDescriptor:td];
-    };
-    id<MTLTexture> msaa = makeTarget(kColorFormat, kSamples);
-    id<MTLTexture> resolved = makeTarget(kColorFormat, 1);
-    id<MTLTexture> depth = makeTarget(kDepthFormat, kSamples);
-
-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = msaa;
-    rp.colorAttachments[0].resolveTexture = resolved;
-    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rp.colorAttachments[0].clearColor = clearColor();
-    rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
-    rp.depthAttachment.texture = depth;
-    rp.depthAttachment.loadAction = MTLLoadActionClear;
-    rp.depthAttachment.clearDepth = 1.0;
-    rp.depthAttachment.storeAction = MTLStoreActionDontCare;
-
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    renderer.encodeShadows(cb);
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-    renderer.encode(enc, float(o.width) / float(o.height), cam);
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    writePng(device, queue, resolved, o.shot);
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kColorFormat
+                                                                                  width:NSUInteger(o.width)
+                                                                                 height:NSUInteger(o.height)
+                                                                              mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> image = [device newTextureWithDescriptor:td];
+    // FUEL_GPU_BENCH=N: render the frame N more times first and report the GPU time.
+    const int bench = std::getenv("FUEL_GPU_BENCH") ? std::max(0, std::atoi(std::getenv("FUEL_GPU_BENCH"))) : 0;
+    double total = 0, best = 1e9;
+    for (int k = 0; k <= bench; ++k) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        renderer.render(cb, image, cam);
+        [cb commit];
+        [cb waitUntilCompleted];
+        const double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        if (k == bench) {
+            if (bench > 0) std::printf("gpu bench %s: %d frames at %dx%d, mean %.2f ms, best %.2f ms\n", o.shot.c_str(), bench, o.width, o.height, total / bench, best);
+            writePng(device, queue, image, o.shot);
+            return ms;
+        }
+        total += ms, best = std::min(best, ms);
+    }
+    return 0;
 }
 
 }  // namespace
@@ -781,6 +773,10 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     double _lastTime;
     float _steer;             // smoothed keyboard steering
     float _camYawOffset;      // mouse look around the chase camera
+    fuel::OrbitCamera _startCam;  // --drive: mouse pitch and zoom act relative to this
+    ChaseCamera _chase;       // --drive: the camera actually used (_cam holds the mouse's changes)
+    fuel::OrbitCamera _chaseView;
+    DustSystem _dust;
     fuel::Recorder::Frame _frame;  // --record: this frame's timings
 }
 
@@ -839,11 +835,11 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _lastTime = 0;
         _steer = 0;
         _camYawOffset = 0;
+        _startCam = cam;
         _sceneMode = assembly != nullptr || !scene.parts.empty();
-        self.colorPixelFormat = kColorFormat;
-        self.depthStencilPixelFormat = kDepthFormat;
-        self.sampleCount = kSamples;
-        self.clearColor = clearColor();
+        self.colorPixelFormat = kColorFormat;  // the renderer draws offscreen and finishes into the drawable
+        self.depthStencilPixelFormat = MTLPixelFormatInvalid;
+        self.sampleCount = 1;
         self.delegate = self;
         if (gRecorder.active()) self.framebufferOnly = NO;  // frame grabs read the drawable
     }
@@ -990,6 +986,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     if ([ch isEqualToString:@"c"]) _renderer->cullBackFaces = !_renderer->cullBackFaces;
     else if ([ch isEqualToString:@"w"]) _renderer->wireframe = !_renderer->wireframe;
     else if ([ch isEqualToString:@"r"]) _cam = fuel::OrbitCamera{};
+    else if ([ch isEqualToString:@"o"]) _renderer->postEffects = !_renderer->postEffects;
     else if ([ch isEqualToString:@"d"]) _renderer->dirt = _renderer->dirt >= 1.0f ? 0.0f : _renderer->dirt + 0.5f;
     else if ([ch isEqualToString:@"g"]) { _renderer->showGround = !_renderer->showGround; _renderer->showTerrain = !_renderer->showTerrain; }
     else if ([ch isEqualToString:@"q"]) [NSApp terminate:nil];
@@ -1056,12 +1053,15 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics());
     _frame.streamMs = (CACurrentMediaTime() - t0) * 1000.0;
     _renderer->setInstanceWorlds(_drive->partWorlds());
-    _renderer->setFocus(_drive->position());
-    // Chase camera: swing behind the vehicle, mouse look decays back.
-    float targetYaw = _drive->heading() + float(M_PI) + _camYawOffset;
-    float diff = std::remainder(targetYaw - _cam.yaw, 2.0f * float(M_PI));
-    _cam.yaw += diff * std::min(1.0f, dt * 3.0f);
+    // Chase camera: swings behind the vehicle; mouse look decays back, drag and
+    // scroll raise and zoom it.
+    _chaseView = _chase.update(dt, *_drive, _renderer->sceneRadius(), _camYawOffset, _cam.pitch - _startCam.pitch,
+                               _cam.distance / _startCam.distance);
     _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
+    _renderer->setFocus(_chase.focus());
+    _renderer->speedBlur = _chase.speedEffect();
+    _dust.update(dt, *_drive, _drive->position());
+    _renderer->setDust(_dust.particles());
     const fuel::VehicleState st = _drive->state();
     _frame.speedKmh = std::fabs(st.speedKmh);
     _frame.gear = st.gear;
@@ -1085,25 +1085,18 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 - (void)drawInMTKView:(MTKView*)view {
     if (_drive) [self driveStep];
+    id<CAMetalDrawable> drawable = view.currentDrawable;
+    if (drawable == nil) return;
     id<MTLCommandBuffer> cb = [_queue commandBuffer];
-    _renderer->encodeShadows(cb);
-    MTLRenderPassDescriptor* rp = view.currentRenderPassDescriptor;
-    if (rp == nil) {
-        [cb commit];
-        return;
-    }
     const double t0 = CACurrentMediaTime();
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-    const CGSize s = view.drawableSize;
-    _renderer->encode(enc, s.height > 0 ? float(s.width / s.height) : 1.0f, _cam);
-    [enc endEncoding];
+    _renderer->render(cb, drawable.texture, _drive ? _chaseView : _cam);
     if (gRecorder.active()) {
         _frame.encodeMs = (CACurrentMediaTime() - t0) * 1000.0;
         gRecorder.watchGpu(cb);
-        if (gRecorder.frame(_frame)) gRecorder.grab(cb, view.currentDrawable.texture);
+        if (gRecorder.frame(_frame)) gRecorder.grab(cb, drawable.texture);
         _frame = {};
     }
-    [cb presentDrawable:view.currentDrawable];
+    [cb presentDrawable:drawable];
     [cb commit];
 }
 @end
@@ -1150,6 +1143,7 @@ int main(int argc, const char** argv) {
         if (device == nil) die("no Metal device");
         if (!device.supportsBCTextureCompression) die("this GPU cannot sample DXT (BC) textures");
         fuel::MeshRenderer renderer(device, kSamples, library);
+        renderer.postEffects = std::getenv("FUEL_NO_POST") == nullptr;  // FUEL_NO_POST=1: plain tone mapping (O toggles in the window)
         renderer.cullBackFaces = opt.cull;
         renderer.dirt = std::clamp(opt.dirt, 0.0f, 1.0f);
         std::unique_ptr<fuel::Heightfield> terrain;
@@ -1407,6 +1401,9 @@ int main(int argc, const char** argv) {
                         streamer->update(drive->position(), renderer, drive->physics(), true);
                         std::printf("prop check: aiming at a prop at (%.0f, %.0f) from 45 m\n", target.x, target.z);
                     }
+                    ChaseCamera chase;  // --film: the window's chase camera and dust, stepped with the physics
+                    DustSystem dust;
+                    fuel::OrbitCamera chaseView;
                     float speedBefore = 0, speedMin = 1e9f, firstContactS = -1, speedLater = -1;
                     const size_t movedBase = streamer ? streamer->propStats().moved : 0;
                     for (int i = 0; i < int(runTime * 60); ++i) {
@@ -1431,6 +1428,10 @@ int main(int argc, const char** argv) {
                         const double tp0 = CACurrentMediaTime();
                         drive->update(1.0f / 60, in);
                         const double tp1 = CACurrentMediaTime();
+                        if (opt.film > 0) {
+                            chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius(), opt.haveYaw ? opt.yawDeg * float(M_PI) / 180.0f : 0.0f);
+                            dust.update(1.0f / 60, *drive, drive->position());
+                        }
                         if (streamer && (opt.propCheck || opt.film > 0 || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
                         if (opt.film > 0) {  // worst step times since the last frame
                             static double worstPhys = 0, worstStream = 0;
@@ -1445,19 +1446,19 @@ int main(int argc, const char** argv) {
                             renderer.setInstanceWorlds(drive->partWorlds());
                             showOpponents(*drive, renderer);
                             if (race) renderer.setMarkers(race->markers());
-                            renderer.setFocus(drive->position());
-                            fuel::OrbitCamera chase = cam;
-                            chase.yaw += drive->heading() + float(M_PI);
+                            renderer.setFocus(chase.focus());
+                            renderer.speedBlur = chase.speedEffect();
+                            renderer.setDust(dust.particles());
                             Options frame = opt;
                             const fs::path out(opt.shot);
                             char suffix[16];
                             std::snprintf(suffix, sizeof suffix, "_%04d", i / std::max(1, int(opt.film * 60)));
                             frame.shot = (out.parent_path() / (out.stem().string() + suffix + out.extension().string())).string();
-                            renderShot(device, renderer, frame, chase);
+                            const double gpuMs = renderShot(device, renderer, frame, chaseView);
                             const fuel::VehicleState fs = drive->state();
                             const simd_float3 fp = drive->position();
-                            std::printf("film %s t=%.1f (%.0f, %.0f, %.0f) %.0f km/h %d wheels down%s\n", frame.shot.c_str(), i / 60.0, fp.x, fp.y, fp.z, fs.speedKmh, fs.wheelsOnGround,
-                                        race ? (" " + race->hud(*drive)).c_str() : "");
+                            std::printf("film %s t=%.1f (%.0f, %.0f, %.0f) %.0f km/h %d wheels down, %zu dust, gpu %.1f ms%s\n", frame.shot.c_str(), i / 60.0, fp.x, fp.y, fp.z,
+                                        fs.speedKmh, fs.wheelsOnGround, dust.particles().size(), gpuMs, race ? (" " + race->hud(*drive)).c_str() : "");
                         }
                         if (streamer && opt.propCheck) {
                             const float v = drive->state().speedKmh;

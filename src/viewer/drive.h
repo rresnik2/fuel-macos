@@ -82,6 +82,44 @@ private:
     std::vector<fuel::DriveInput> inputs_;
 };
 
+// The racing chase camera: low and close behind the vehicle, swinging round after
+// it with some lag. It drops back when the vehicle accelerates and closes in when
+// it brakes, and pulls back and widens its field of view with speed.
+class ChaseCamera {
+public:
+    // Call every frame (or physics step). `yawOffset` looks around the vehicle
+    // (radians), `pitchOffset` raises the camera, `zoom` scales the distance.
+    fuel::OrbitCamera update(float dt, const DriveSession& drive, float sceneRadius, float yawOffset = 0, float pitchOffset = 0,
+                             float zoom = 1);
+    simd_float3 focus() const { return focus_; }  // for MeshRenderer::setFocus (vertically smoothed)
+    float speedEffect() const;                     // 0..1, for MeshRenderer::speedBlur
+
+private:
+    bool started_ = false;
+    float yaw_ = 0, speedFast_ = 0, speedSlow_ = 0, surge_ = 0;
+    simd_float3 focus_ = {0, 0, 0};
+};
+
+// Dust thrown up by the wheels: billowing particles, more on loose ground and
+// when the tyres slide or spin, for every vehicle near the camera.
+class DustSystem {
+public:
+    void update(float dt, const DriveSession& drive, simd_float3 eye);
+    const std::vector<fuel::DustParticle>& particles() const { return drawn_; }
+
+private:
+    struct Particle {
+        simd_float3 position, velocity, colour;
+        float age, life, size, grow, rotation, spin, opacity, seed;
+    };
+    std::vector<Particle> particles_;
+    std::vector<fuel::DustParticle> drawn_;
+    std::vector<simd_float3> lastChassis_;  // per vehicle, for its velocity
+    std::vector<float> carry_;              // per vehicle and wheel: fractional particles owed
+    uint32_t rng_ = 0x9e3779b9u;
+    float random();                         // 0..1
+};
+
 // Streams the static world around the player: every object the sub-worlds
 // place, drawn within kDrawRadius and solid within kCollideRadius.
 class WorldStreamer {
