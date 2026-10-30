@@ -119,26 +119,15 @@ float sampleLayer(const Raster* r, uint32_t i, uint32_t j, uint32_t n) {
 
 }  // namespace
 
-const char* surfaceName(int index) { return index >= 0 && index < kSurfaceTypes ? kSurfaceNames[index] : "?"; }
-
-GroundMaps buildGroundMaps(const DpcFile& world, const Heightfield& heights, uint32_t size) {
+std::vector<std::array<float, 4>> loadGroundPalette(const DpcFile& world) {
+    std::vector<std::array<float, 4>> out(std::size(kPaletteDates), std::array<float, 4>{0, 0, 0, 0});
     const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
-    if (gens.empty()) throw std::runtime_error("no GenWorld_Z");
+    if (gens.empty()) return out;
     const auto gen = world.body(*world.find(gens.front()));
-    if (!gen) throw std::runtime_error("GenWorld_Z has no body");
-    // GenWorld_Z body: u32 node, u32 palette (UserDefine_Z), u32 roads, u32 n, maps[n], u32 m, ground textures[m].
-    const uint32_t paletteId = rd32(*gen, 4);
-    const uint32_t nMaps = rd32(*gen, 12);
-    std::vector<uint32_t> maps;
-    for (uint32_t i = 0; i < nMaps; ++i) maps.push_back(rd32(*gen, 16 + size_t(i) * 4));
-    const size_t texOff = 16 + size_t(nMaps) * 4;
-    GroundMaps out;
-    const uint32_t nTex = rd32(*gen, texOff);
-    for (uint32_t i = 0; i < nTex && i < uint32_t(kSurfaceTypes); ++i) out.textures[i] = rd32(*gen, texOff + 4 + size_t(i) * 4);
-
-    // Palette: a text script of ItemColor "<date>" R G B entries.
+    if (!gen) return out;
+    // Palette: a text script of ItemColor "<date>" R G B entries (UserDefine_Z id at GenWorld_Z body +4).
     std::map<std::string, std::array<uint8_t, 3>> byDate;
-    if (const DpcFile::Entry* pe = world.find(paletteId)) {
+    if (const DpcFile::Entry* pe = world.find(rd32(*gen, 4))) {
         if (const auto body = world.body(*pe)) {
             const std::string text(body->begin() + std::min<size_t>(4, body->size()), body->end());
             size_t p = 0;
@@ -152,13 +141,35 @@ GroundMaps buildGroundMaps(const DpcFile& world, const Heightfield& heights, uin
             }
         }
     }
+    // The loader (0x6afed0 -> 0x6afe40) scales by 1/255 ([0x9dbfcc]); a slot without an entry keeps its
+    // previous value (Unknown; alpha 0 marks it here).
+    for (size_t i = 0; i < out.size(); ++i)
+        if (auto it = byDate.find(kPaletteDates[i]); it != byDate.end())
+            out[i] = {it->second[0] / 255.0f, it->second[1] / 255.0f, it->second[2] / 255.0f, 1.0f};
+    return out;
+}
+
+const char* surfaceName(int index) { return index >= 0 && index < kSurfaceTypes ? kSurfaceNames[index] : "?"; }
+
+GroundMaps buildGroundMaps(const DpcFile& world, const Heightfield& heights, uint32_t size) {
+    const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
+    if (gens.empty()) throw std::runtime_error("no GenWorld_Z");
+    const auto gen = world.body(*world.find(gens.front()));
+    if (!gen) throw std::runtime_error("GenWorld_Z has no body");
+    // GenWorld_Z body: u32 node, u32 palette (UserDefine_Z), u32 roads, u32 n, maps[n], u32 m, ground textures[m].
+    const uint32_t nMaps = rd32(*gen, 12);
+    std::vector<uint32_t> maps;
+    for (uint32_t i = 0; i < nMaps; ++i) maps.push_back(rd32(*gen, 16 + size_t(i) * 4));
+    const size_t texOff = 16 + size_t(nMaps) * 4;
+    GroundMaps out;
+    const uint32_t nTex = rd32(*gen, texOff);
+    for (uint32_t i = 0; i < nTex && i < uint32_t(kSurfaceTypes); ++i) out.textures[i] = rd32(*gen, texOff + 4 + size_t(i) * 4);
+
+    const std::vector<std::array<float, 4>> pal = loadGroundPalette(world);
     float palette[kClasses][3];
     for (int c = 0; c < kClasses; ++c) {
-        std::array<uint8_t, 3> rgb = {128, 128, 128};
         const int slot = kClassPalette[c];
-        if (slot < int(std::size(kPaletteDates)))
-            if (auto it = byDate.find(kPaletteDates[slot]); it != byDate.end()) rgb = it->second;
-        for (int k = 0; k < 3; ++k) palette[c][k] = rgb[size_t(k)] / 255.0f;
+        for (int k = 0; k < 3; ++k) palette[c][k] = pal[size_t(slot)][3] > 0 ? pal[size_t(slot)][size_t(k)] : 0.5f;
     }
 
     // Layers by map slot (names from the game's debug HUD; see the notes).

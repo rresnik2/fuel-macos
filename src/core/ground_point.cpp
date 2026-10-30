@@ -1,4 +1,5 @@
 #include "ground_point.hpp"
+#include "ground.hpp"
 #include "resources.hpp"
 
 #include <algorithm>
@@ -86,8 +87,9 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
         p += 4 + rd32(b, p) + 4;
         p += 4 + size_t(rd32(b, p)) * 4;
     }
-    // Maps used here: 2 humidity, 8 population, 10 rock (Terrain_Map10).
-    for (int slot : {2, 8, 10}) {
+    // Maps used here: 2 humidity, 8 population, 10 rock (Terrain_Map10); colours (p16):
+    // 3 clay, 4 colour layer, 5 volcano, 6 chalk, 7 forest, 9 occlusion, 13 incinerated, 18 (ctx+0x184).
+    for (int slot : {2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 18}) {
         if (size_t(slot) >= mapIds.size() || mapIds[size_t(slot)] == 0) continue;
         if (const DpcFile::Entry* e = world.find(mapIds[size_t(slot)]))
             if (const auto mb = world.body(*e)) {
@@ -144,6 +146,11 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
     t18_ = Fractal(perm_, 4, 2000.0f, 39.442329f, 0.3f, 0.3f, 0.5f);
     t24_ = Fractal(perm_, 2, 15.0f, 74.172333f, 0.3f, 0.3f, 0.5f);
     t28_ = Fractal(perm_, 5, 500.0f, 79.442329f, 0.3f, 0.3f, 0.5f);
+    // Colour noises: bank+0x0004 (T0, palette half), bank+0x9e4c (colour layer), bank+0xcdc8 (strata).
+    f0004_ = Fractal(perm_, 2, 6.13931f, 39.37579f, 0.3f, 0.5f, 0.5f);
+    f9e4c_ = Fractal(perm_, 1, 100.0f, 65.145248f, 0.3f, 0.3f, 5.0f);
+    fcdc8_ = Fractal(perm_, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
+    palette_ = loadGroundPalette(world);
     // Grass_EmitTuft tables: tile weights (0x9ff02c) and tile sizes (0x9ff04c); the
     // tile index reaches 8, and the engine reads past the weights into the sizes.
     const std::vector<float> t = readEngineFloats(world, 0x9FF02C, 17);
@@ -232,8 +239,9 @@ bool GroundGenerator::excludesPlants(double x, double z) const {
 // Road weight (Point_RoadSampler 0x6fbab0 return value): 1 on the road, fading out over
 // 5.5 m around its edge. APPROXIMATED: the engine's per-type profile table (0xa677e0, filled
 // at run time) is replaced by the port's road widths.
-float GroundGenerator::roadWeight(double x, double z, bool* nearRoad) const {
+float GroundGenerator::roadWeight(double x, double z, bool* nearRoad, float* tarmac) const {
     *nearRoad = false;
+    if (tarmac) *tarmac = 0;
     if (roads_ == nullptr) return 0;
     const auto it = roads_->segCells.find(
         RoadNetwork::cellKey(int32_t(std::floor(x / RoadNetwork::kSegCell)), int32_t(std::floor(z / RoadNetwork::kSegCell))));
@@ -250,14 +258,19 @@ float GroundGenerator::roadWeight(double x, double z, bool* nearRoad) const {
         const double t = len2 > 0 ? std::clamp(((x - ax) * bx + (z - az) * bz) / len2, 0.0, 1.0) : 0.0;
         const double d = std::hypot(x - (ax + bx * t), z - (az + bz * t));
         if (d < 0.5 * width + 8.0) *nearRoad = true;
-        best = std::max(best, clamp01(float((0.5 * width - d + 2.75) * 0.18181819)));
+        const float w = clamp01(float((0.5 * width - d + 2.75) * 0.18181819));
+        // ctx+0x1f4 is a per-profile "tarmac" value from the run-time profile table (0x6fc32b):
+        // APPROXIMATED as 1 on tarmac road types, 0 on dirt.
+        if (tarmac && isTarmacRoad(int(line.type)) && w > 0) *tarmac = 1;
+        best = std::max(best, w);
     }
     return best;
 }
 
 // Point_RockCover (0x6b8d80) over Terrain_RockEval (0x7a4c20).
-float GroundGenerator::rockCover(double x, double z, const GroundPoint& p, float coarseNy) const {
-    if (p.road > 0.95f) return 0;
+void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarseNy) const {
+    p.rock = p.rockSlope = 0;
+    if (p.road > 0.95f) return;
     const float m = mapAt(10, x, z);
     float l = 0;
     const float a = t0c_.at(x, z) + m;
@@ -278,13 +291,19 @@ float GroundGenerator::rockCover(double x, double z, const GroundPoint& p, float
         l += soft2(2 * v - 1) * k;
     }
     float rock = clamp01(clamp01(l) * s + m);  // + lake (map 11, empty in USA1)
-    if (p.height > 3000 - 500 * p.normal[2]) rock = 1;
+    // ctx+0x1e4 adds slopes over 45 degrees (ramp from 40).
+    const float slope = std::acos(clamp01(p.normal[1]));
+    float rockSlope = clamp01((slope >= 45 * kDeg ? 1.0f : std::max(0.0f, (slope - 40 * kDeg) / (5 * kDeg))) + rock);
+    if (p.height > 3000 - 500 * p.normal[2]) rock = rockSlope = 1;
     rock = clamp01(rock - p.cover - p.road);  // - junction term (ctx+0x238, not ported)
-    return clamp01(rock - p.highGround);       // - water (ctx+0x228, not ported)
+    rockSlope = clamp01(rockSlope - p.cover - p.road);
+    p.rock = clamp01(rock - p.highGround);  // - water (ctx+0x228, not ported)
+    p.rockSlope = clamp01(rockSlope - p.highGround);
 }
 
 // Point_Fields (0x6b9100).
-int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover) const {
+int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover,
+                               float* random) const {
     if (!(p.normal[1] > 0.8707f) || !(p.height < 1500)) return 0;
     const float pop = mapAt(8, x, z);
     if (!(pop > 0.25f && pop < 0.75f)) return 0;
@@ -294,6 +313,7 @@ int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float c
     const float u = float(a - i), v = float(c - j);
     const double cx = i * 200 + 100, cz = j * 200 + 100;
     const float r = float(hashByte(perm_, cx * 12.317513 + cz * 10.193578)) / 255.0f;
+    *random = r;
     int type = 0;
     if (r > 0.3f && p.humidity > 0.2f && cover < 0.5f && !nearRoad && coarseNy > 0.98f) type = r < 0.33f ? 1 : 2;
     if (u <= 0.0125f || v <= 0.0125f || u >= 0.9875f || v >= 0.9875f) return 0;
@@ -327,7 +347,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     const SurfaceWeights fs = surfaceWeights(x, z);
     p.cover = fs.cover;
     // Bit 12: road weight plus the flat surfaces that clear grass.
-    p.road = clamp01(roadWeight(x, z, &nearRoad) + clamp01(1 - (fs.add + fs.noise)) * fs.cut);
+    p.road = clamp01(roadWeight(x, z, &nearRoad, &p.tarmac) + clamp01(1 - (fs.add + fs.noise)) * fs.cut);
     // Bit 4: high ground (p13 V2 0x4de850) minus road.
     {
         float a = clamp01(p.height - (2500.0f + 250.0f * p.normal[2]));
@@ -335,8 +355,8 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
         const float hg = contrast8(2 * a - 1) * 0.5f + 0.5f;
         p.highGround = clamp01(hg - (2 - p.road) * p.road);
     }
-    p.rock = rockCover(x, z, p, coarse[1]);
-    p.field = fieldType(x, z, p, coarse[1], nearRoad, fs.cover);
+    rockCover(x, z, p, coarse[1]);
+    p.field = fieldType(x, z, p, coarse[1], nearRoad, fs.cover, &p.fieldRandom);
     if (!full) return p;
 
     // Bit 8 (Point_Grass 0x6ba610).
@@ -376,6 +396,139 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     // Bit 23: grass size.
     p.grassSize = clamp01(clamp01((1 - p.normal[1] - 0.1f) * 10) + s4c(ffd44_.at(x, z)) - (1 - fs.keep));
     return p;
+}
+
+float GroundGenerator::meanT0(double x, double z, double size, int n) const {
+    float sum = 0;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i)
+            sum += clamp01(f0004_.at(x + ((i + 0.5) / n - 0.5) * size, z + ((j + 0.5) / n - 0.5) * size));
+    return sum / float(n * n);
+}
+
+// The point's colours: bits 23 (weights), 9 and 10 (palette mixers), 7 (grass colour) and 14 (the
+// composer), decoded in ~/re-work/fuel/notes/p16-colours.md (C2-C11). Colours are float4 in the
+// engine; the alphas end up 0 or unused here, so only rgb is carried.
+GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p, float t0) const {
+    GroundColours out;
+    if (!hasPalette()) return out;
+    using C = std::array<float, 3>;
+    auto P = [&](int k) { return C{palette_[size_t(k)][0], palette_[size_t(k)][1], palette_[size_t(k)][2]}; };
+    auto lerp = [](const C& a, const C& b, float t) { return C{a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t}; };
+    auto madd = [](C& acc, const C& c, float w) { for (int i = 0; i < 3; ++i) acc[size_t(i)] += c[size_t(i)] * w; };
+
+    // Bit 23 (0x6bb1f0): palette-half blend T0 and the material weights.
+    const float T = t0 >= 0 ? t0 : clamp01(f0004_.at(x, z));
+    auto L = [&](int k1, int k2) { return lerp(P(k1), P(k2), T); };
+    const float clay = mapAt(3, x, z), chalk = mapAt(6, x, z), volcano = mapAt(5, x, z);
+    const float a0 = clamp01(1.3f * mapAt(4, x, z) - 0.15f + 0.1f * f9e4c_.at(x, z));  // 0x6a9d90
+    float a = a0, u = 0;
+    if (a0 < 1) {
+        a = a0 + 0.5f * T * clay;
+        u = clamp01(clay - a);
+    }
+    a = clamp01(a);
+    const float sum = volcano + chalk + u + a, rest = clamp01(1 - sum), norm = 1.0f / (sum + rest);
+    // The weight of a layer counts only above 0.025 (the mixers skip it).
+    const float wa = a > 0.025f ? a : 0, wu = u > 0.025f ? u : 0, wc = chalk > 0.025f ? chalk : 0, wv = volcano > 0.025f ? volcano : 0;
+    // One palette mix: slot of each material (rest, a', u, chalk, volcano) in both halves.
+    auto mix = [&](const int (&first)[5], const int (&second)[5]) {
+        C c{0, 0, 0};
+        madd(c, L(first[0], second[0]), rest);
+        madd(c, L(first[1], second[1]), wa);
+        madd(c, L(first[2], second[2]), wu);
+        madd(c, L(first[3], second[3]), wc);
+        madd(c, L(first[4], second[4]), wv);
+        for (float& v : c) v *= norm;
+        return c;
+    };
+
+    // Humidity terms and the strata value ctx+0x1a8 (bit 20).
+    const float H = p.surfaceHumidity;
+    float strata;
+    {
+        const float v = fcdc8_.at(x, z);
+        const float y = 0.25f * std::sin(0.2f * (100 * v + p.height)) + 0.75f * std::sin(0.01f * (500 * v + p.height));
+        strata = clamp01(y * (2 - std::fabs(y)) * clamp01(1 - 5 * (p.normal[1] - 0.8f)) * 0.2f);
+    }
+    const float pm = clamp01(1.8f * (std::sqrt(H) - 0.333f) + 0.2f * strata);  // bit 9
+    const float pr = clamp01(std::sqrt(H) + 0.2f * strata);                    // bit 10
+
+    // Burnt ground (bit 7): Incinerated map 13.
+    const float burnI = mapAt(13, x, z);
+    const float burn = std::min(contrast8(2 * burnI - 1) * 0.5f + 0.5f, 0.9f);
+
+    // Mixer 1 (0x6b0750): M1 earth, M2 road dirt.
+    C c4[4];
+    for (int j = 0; j < 4; ++j) c4[j] = mix({16 + j, 20 + j, 24 + j, 28 + j, 32 + j}, {70 + j, 74 + j, 78 + j, 82 + j, 86 + j});
+    C M1 = lerp(c4[1], c4[0], pm), M2 = lerp(c4[3], c4[2], pm);
+    M1 = lerp(M1, P(58), chalk * mapAt(18, x, z));
+    // ctx+0x220 (wet ground) needs the water level map: 0 without water (port).
+    if (burn > 0.01f) {
+        const C b{0.4f, 0.35f, 0.35f};
+        M1 = lerp(M1, b, burn), M2 = lerp(M2, b, burn);
+    }
+    // Mixers 2 and 3 (0x6b22e0, 0x6b3130): rock colours M3, M4 (0x6b22e0's chalk Y reads slot 54 twice).
+    const C M3 = lerp(mix({51, 52, 53, 54, 55}, {101, 103, 105, 54, 109}), mix({46, 47, 48, 49, 50}, {100, 102, 104, 106, 108}), pr);
+    const C M4 = lerp(mix({41, 42, 43, 44, 45}, {91, 93, 95, 97, 99}), mix({36, 37, 38, 39, 40}, {90, 92, 94, 96, 98}), pr);
+
+    // Bit 7 (0x6b9f40): grass colour X.
+    const float occ = clamp01(mapAt(9, x, z));  // ctx+0x230 (tree/bush shade near the camera not ported)
+    const float s = clamp01(1.25f * H);
+    C X;
+    if (p.field == 2) {
+        const bool first = p.fieldRandom < 0.66f;
+        X = lerp(P(first ? 4 : 63), P(first ? 3 : 62), clamp01((H - 0.25f) * 1.8f));
+    } else {
+        X = lerp(L(8, 67), L(7, 66), s);
+    }
+    const float q = occ;  // (1 - 0.5 (1 - cover) ctx+0x21c) * occ, with the road-edge term 0x21c taken as 0
+    if (q < 0.99f) X = lerp(lerp(L(121, 122), L(119, 120), s), X, q);
+    if (burn > 0.01f) {
+        const float lum = X[0] + X[1] + X[2];  // weights g 0xa066f0 = (1, 1, 1)
+        C k;
+        for (int i = 0; i < 3; ++i) k[size_t(i)] = (lum + 0.75f * (0.2f - lum)) * (0.75f + 0.25f * occ);
+        X = lerp(X, k, burn * (2 - occ));
+    }
+
+    // Bit 8 tail: grass colour weight.
+    const float dry = clamp01(1 - 2 * clamp01((H - 0.33f) * 1.5625f + burn));
+    const float g = clamp01(p.grass - 0.8f * dry);
+
+    // Stones ctx+0x1dc (bit 24), dry land.
+    float stones = 0;
+    if (p.road <= 0.95f) {
+        const float F = ffd44_.at(x, z);
+        const float nst = clamp01(0.5f + 0.5f * contrast8(2 * F * (2 - std::fabs(F)) - 1));
+        const float slope = std::acos(clamp01(p.normal[1]));
+        const float st = clamp01(nst * band(slope, 30 * kDeg, 45 * kDeg, 5 * kDeg) - p.grass - p.road);
+        const float uu = 2 * st - 1, au = std::fabs(uu);
+        stones = clamp01(0.5f + 0.5f * uu * (4 - 6 * au + (4 - au) * uu * uu) - p.highGround);
+    }
+
+    // Bit 14 (0x6bc230): the composer.
+    C A = lerp(M1, X, g);
+    const float cr = clamp01(stones + p.rockSlope - p.grass);
+    if (cr > 0.025f) A = lerp(A, lerp(M3, M4, p.rockSlope), cr);
+    C G = A;
+    if (p.road > 0.025f) {
+        G = lerp(M2, P(14), p.tarmac);
+        A = lerp(A, G, p.road);
+    }
+    if (p.highGround > 0.025f) A = lerp(A, P(56), p.highGround);
+    float f = clamp01(2 * (mapAt(7, x, z) * p.humidity - 0.5f));
+    f *= f;
+    if (p.height > 3000 - 500 * p.normal[2] - 200) f = 0;
+    const float k = std::max(f - p.rock, 0.0f);
+    const C far = lerp(lerp(A, P(57), k), P(56), 0.1f * p.highGround);
+    for (int i = 0; i < 3; ++i) {
+        out.base[i] = A[size_t(i)];
+        out.far[i] = far[size_t(i)];
+        out.road[i] = G[size_t(i)];
+    }
+    out.occlusion = occ;
+    out.forest = k;
+    return out;
 }
 
 bool GroundGenerator::rejectsPlant(double x, double z) const {
@@ -419,7 +572,16 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
             tuft.size = tileSize * size;
             tuft.tile = uint8_t(tile);
             tuft.windAmp = uint8_t(std::lround((float(r2) / 255.0f + 1) * 0.5f * 2.25f * 100.0f));
-            tuft.tint = uint8_t(std::lround(byte64(p.road) * 255.0f));
+            const float road = byte64(p.road);
+            tuft.tint = uint8_t(std::lround(road * 255.0f));
+            // Grass_Decide (0x7ddf96..): colour lerp(R+0x0c, R+0x1c, road) = lerp(ctx+0x80, ctx+0x50, road);
+            // alpha clamp(0.8 a + 0.2) (0x7dcdb0), which the grass shader uses as sky occlusion.
+            const GroundColours col = colours(x, z, p);
+            for (int i = 0; i < 3; ++i) {
+                const float v = col.base[i] + (col.road[i] - col.base[i]) * road;
+                tuft.rgb[i] = uint8_t(std::lround(clamp01(v) * 255.0f));
+            }
+            tuft.occlusion = uint8_t(std::lround(clamp01(0.8f * byte64(col.occlusion) + 0.2f) * 255.0f));
             out.push_back(tuft);
         }
 }

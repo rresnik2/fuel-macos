@@ -724,6 +724,7 @@ const char* kGrassShaderSource = R"METAL(
 struct GrassInstance {
     float4 posSize;  // base xyz, card height
     uchar4 info;     // atlas cell, wind amplitude x 100, road weight x 255, unused
+    uchar4 colour;   // the point's ground colour (sRGB) and sky occlusion (p16)
 };
 
 struct GrassParams {
@@ -735,6 +736,7 @@ struct GrassOut {
     float3 world;
     float2 uv;
     float3 tint;
+    float occlusion;
     float4 sunPos;
 };
 
@@ -767,13 +769,12 @@ vertex GrassOut vsGrass(uint vid [[vertex_id]], uint iid [[instance_id]], consta
     o.world = w;
     const uint tile = t.info.x;
     o.uv = float2(float(tile & 3u), float(tile >> 2u)) * 0.25 + kGrassUv[c];
-    o.tint = float3(1.0);
-    if (f.fog.y > 0.0) {
-        constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
-        o.tint = groundGrade(groundColour.sample(lin, (base.xz + 70000.0) / 140000.0, level(0)).rgb) * 2.0;
-    }
-    // The engine lerps two ground colours by the road weight; dirt tracks get drier grass.
-    o.tint = mix(o.tint, o.tint * float3(1.15, 1.0, 0.75), float(t.info.z) / 255.0);
+    // ground_rotshape.vhl: vcolor = colour x 2 (x the scattering extinction, which the port's haze
+    // applies later); the colour is the decoded point colour lerp(ctx+0x80, ctx+0x50, road) and its
+    // alpha the sky occlusion. The texel multiplies it in the pixel shader.
+    const float3 srgb = float3(t.colour.rgb) / 255.0;
+    o.tint = select(pow((srgb + 0.055) / 1.055, 2.4), srgb / 12.92, srgb <= 0.04045) * 2.0;
+    o.occlusion = float(t.colour.a) / 255.0;
     o.sunPos = f.sunViewProj * float4(w, 1.0);
     return o;
 }
@@ -783,11 +784,11 @@ fragment float4 fsGrass(GrassOut in [[stage_in]], constant FrameUniforms& f [[bu
     constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge, max_anisotropy(4));
     float4 d = atlas.sample(smp, in.uv);
     if (d.a < 0.4) discard_fragment();
-    const float lum = max(dot(in.tint, float3(0.3, 0.55, 0.15)), 1e-3);
-    d.rgb *= in.tint / lum * clamp(lum, 0.6, 1.0);
+    d.rgb *= in.tint;
     const float shadow = mix(0.55, 1.0, shadowFactor(shadowMap, in.sunPos));
     const float3 V = normalize(f.eye.xyz - in.world);
-    const float3 rgb = lighting(d.rgb, float3(0, 1, 0), V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
+    // The occlusion scales the sky light only (ground_rotshape.vhl: lerp(DSKY_AMBIENT, sky, occlusion)).
+    const float3 rgb = lighting(d.rgb, float3(0, 1, 0), V, in.occlusion, shadow, 0.0, 1.0, float2(0), false, f);
     return float4(haze(rgb, in.world, f), d.a);
 }
 )METAL";
@@ -1977,6 +1978,7 @@ void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
     struct Gpu {
         simd_float4 posSize;
         uint8_t info[4];
+        uint8_t colour[4];
     };
     static_assert(sizeof(Gpu) == 32, "matches GrassInstance");
     grassCount_ = tufts.size();
@@ -1985,7 +1987,7 @@ void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
     std::vector<Gpu> data(tufts.size());
     for (size_t i = 0; i < tufts.size(); ++i) {
         const GrassTuft& t = tufts[i];
-        data[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}};
+        data[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}, {t.rgb[0], t.rgb[1], t.rgb[2], t.occlusion}};
     }
     grassBuffer_ = [device_ newBufferWithBytes:data.data() length:data.size() * sizeof(Gpu) options:MTLResourceStorageModeShared];
 }
