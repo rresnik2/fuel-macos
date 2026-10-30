@@ -94,13 +94,31 @@ public:
     DriveWorld(const DriveWorld&) = delete;
     DriveWorld& operator=(const DriveWorld&) = delete;
 
-    // Places the vehicle on the terrain at (x, z), facing `yaw` radians.
+    // Vehicles: any number, each with its own input; index 0 is the player. The
+    // terrain collides as heightfield patches (~2 km) that follow the vehicles:
+    // those near each other share one, a vehicle far from the rest gets its own.
+    // Vehicles collide with each other, the props and the static objects.
+    //
+    // Adds a vehicle on the terrain at (x, z), facing `yaw` radians; returns its index.
+    int addVehicle(const VehicleSetup& setup, double x, double z, float yaw);
+    int vehicleCount() const;
+    // Swaps vehicle `i` for another setup, placed at (x, z) facing `yaw`.
+    void replaceVehicle(int i, const VehicleSetup& setup, double x, double z, float yaw);
+    // Puts vehicle `i` on its wheels at (x, z) facing `yaw` (at rest).
+    void placeVehicle(int i, double x, double z, float yaw);
+    // Puts vehicle `i` back on its wheels where it is.
+    void reset(int i);
+    // The input vehicle `i` drives with from the next update on.
+    void setInput(int i, const DriveInput& input);
+    // Advances every vehicle by `dt` seconds in fixed 1/60 s steps.
+    void update(float dt);
+    VehicleState state(int i) const;
+
+    // Single-vehicle shorthands for vehicle 0. spawn adds it (or replaces it).
     void spawn(const VehicleSetup& setup, double x, double z, float yaw);
-    // Puts the vehicle back on its wheels where it is.
-    void reset();
-    // Advances by `dt` seconds in fixed 1/60 s steps.
+    void reset() { reset(0); }
     void update(float dt, const DriveInput& input);
-    VehicleState state() const;
+    VehicleState state() const { return state(0); }
 
     // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
     // surface counts as dirt. The default applies to worlds created afterwards.
