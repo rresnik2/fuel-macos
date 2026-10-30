@@ -27,6 +27,7 @@ add_library(fuelcore STATIC
   src/core/surface.cpp
   src/core/vehicle_params.cpp
   src/core/races.cpp
+  src/core/hubs.cpp
   src/core/assembly.cpp
   src/core/sound.cpp
   src/core/rider.cpp
