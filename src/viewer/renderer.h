@@ -188,7 +188,13 @@ private:
     Paint paint_;
     simd_float3 sunDir_;
     std::vector<Instance> instances_;
-    std::vector<Instance> worldInstances_;
+    std::vector<Instance> worldInstances_;  // flat list (shadow casters)
+    struct WorldGroup {
+        const GpuMesh* mesh;
+        id<MTLBuffer> matrices;
+        uint32_t count;
+    };
+    std::vector<WorldGroup> worldGroups_;   // instanced draws
     std::vector<int> inputToInstance_;  // setScene input index -> instance, or -1
     simd_float3 center_ = {0, 0, 0};
     simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};

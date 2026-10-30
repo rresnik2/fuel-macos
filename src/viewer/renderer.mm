@@ -62,6 +62,7 @@ struct VertexOut {
     float4 tangent;
     float2 uv;
     float4 sunPos;
+    float3 m0, m1, m2;  // the instance's rotation (for object-space normal maps)
 };
 
 constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
@@ -123,9 +124,14 @@ float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float
     return color + env * saturate(fr) * ao * mix(0.5, 1.0, shadow);
 }
 
+// Instanced: one world matrix per instance in buffer 2.
 vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
-                        constant float4x4& model [[buffer(2)]]) {
+                        const device float4x4* models [[buffer(2)]], uint iid [[instance_id]]) {
+    const float4x4 model = models[iid];
     VertexOut o;
+    o.m0 = model[0].xyz;
+    o.m1 = model[1].xyz;
+    o.m2 = model[2].xyz;
     float4 w = model * float4(in.position, 1.0);
     o.position = f.viewProj * w;
     o.world = w.xyz;
@@ -137,14 +143,13 @@ vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[bu
 }
 
 vertex float4 vsShadow(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
-                       constant float4x4& model [[buffer(2)]]) {
-    return f.sunViewProj * (model * float4(in.position, 1.0));
+                       const device float4x4* models [[buffer(2)]], uint iid [[instance_id]]) {
+    return f.sunViewProj * (models[iid] * float4(in.position, 1.0));
 }
 
 fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
                        constant FrameUniforms& f [[buffer(1)]],
                        constant MaterialUniforms& m [[buffer(2)]],
-                       constant float4x4& model [[buffer(3)]],
                        texture2d<float> tDiffuse [[texture(0)]],
                        texture2d<float> tOcclusion [[texture(2)]],
                        texture2d<float> tNormal [[texture(3)]],
@@ -175,7 +180,8 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     float3 N = normalize(in.normal) * (front ? 1.0 : -1.0);
     if (m.features & HasNormalLocal) {
         // Object-space normal map, two channels plus alpha.
-        N = normalize((model * float4(tNormalLocal.sample(smp, uvHalf).xyw * 2.0 - 1.0, 0.0)).xyz);
+        const float3 nl = tNormalLocal.sample(smp, uvHalf).xyw * 2.0 - 1.0;
+        N = normalize(in.m0 * nl.x + in.m1 * nl.y + in.m2 * nl.z);
     } else if (m.features & HasNormal) {
         // Tangent-space normal map with x in alpha and y in green.
         float2 xy = tNormal.sample(smp, uvHalf).wy * 2.0 - 1.0;
@@ -937,11 +943,19 @@ bool MeshRenderer::setScene(const std::vector<MeshInstance>& instances, std::str
 
 size_t MeshRenderer::setWorldInstances(const std::vector<MeshInstance>& instances) {
     worldInstances_.clear();
+    std::unordered_map<const GpuMesh*, std::vector<simd_float4x4>> byMesh;
     for (const MeshInstance& in : instances) {
         std::string err;
         const GpuMesh* gm = loadMesh(in.meshId, &err);
-        if (gm != nullptr && gm->indices != nil) worldInstances_.push_back({gm, in.world});
+        if (gm == nullptr || gm->indices == nil) continue;
+        worldInstances_.push_back({gm, in.world});
+        byMesh[gm].push_back(in.world);
     }
+    worldGroups_.clear();
+    for (const auto& [gm, worlds] : byMesh)
+        worldGroups_.push_back({gm, [device_ newBufferWithBytes:worlds.data() length:worlds.size() * sizeof(simd_float4x4)
+                                                        options:MTLResourceStorageModeShared],
+                                uint32_t(worlds.size())});
     return worldInstances_.size();
 }
 
@@ -1033,11 +1047,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc setDepthStencilState:mode == AlphaMode::Blend ? depthNoWrite_ : depthWrite_];
         [enc setCullMode:cullBackFaces ? MTLCullModeBack : MTLCullModeNone];
         [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-        for (const std::vector<Instance>* list : {&instances_, &worldInstances_}) for (const Instance& inst : *list) {
-            const GpuMesh& gm = *inst.mesh;
-            if (gm.draws[pass].empty()) continue;
-            [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
-            [enc setFragmentBytes:&inst.world length:sizeof inst.world atIndex:3];
+        auto drawMesh = [&](const GpuMesh& gm, NSUInteger count) {
             for (const Draw& d : gm.draws[pass]) {
                 const GpuMaterial& m = gm.materials[d.material];
                 [enc setRenderPipelineState:pipeline(gm.vbStrides[d.vb], mode)];
@@ -1051,8 +1061,19 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                                 indexCount:d.indexCount
                                  indexType:MTLIndexTypeUInt32
                                indexBuffer:gm.indices
-                         indexBufferOffset:size_t(d.firstIndex) * 4];
+                         indexBufferOffset:size_t(d.firstIndex) * 4
+                             instanceCount:count];
             }
+        };
+        for (const Instance& inst : instances_) {
+            if (inst.mesh->draws[pass].empty()) continue;
+            [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
+            drawMesh(*inst.mesh, 1);
+        }
+        for (const WorldGroup& g : worldGroups_) {  // one instanced draw per mesh
+            if (g.mesh->draws[pass].empty()) continue;
+            [enc setVertexBuffer:g.matrices offset:0 atIndex:2];
+            drawMesh(*g.mesh, g.count);
         }
     };
     drawPass(0);
