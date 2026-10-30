@@ -11,6 +11,7 @@
 #include "core/ground_point.hpp"
 #include "core/roads.hpp"
 #include "core/terrain.hpp"
+#include "core/vegetation.hpp"
 #include "core/world.hpp"
 
 #include <chrono>
@@ -83,6 +84,17 @@ int main(int argc, char** argv) {
                 } catch (const std::exception&) {
                 }
                 const fuel::GroundGenerator gen(dpc, levelled, roads.get());
+                if (std::getenv("FUEL_FIELDSCAN")) {  // the whole world, one point per 100 m
+                    long counts[3] = {}, popOk = 0, flatLow = 0;
+                    for (double pz = -69950; pz < 70000; pz += 100)
+                        for (double px = -69950; px < 70000; px += 100) {
+                            const fuel::GroundPoint p = gen.at(px, pz);
+                            counts[std::clamp(p.field, 0, 2)]++;
+                            flatLow += p.normal[1] > 0.8707f && p.height < 1500;
+                        }
+                    std::printf("fieldscan: none %ld ploughed %ld crops %ld; flat and low %ld\n", counts[0], counts[1], counts[2], flatLow);
+                    (void)popOk;
+                }
                 if (std::getenv("FUEL_GPOINT")) {  // a line of points eastwards, one per 5 m
                     for (int k = 0; k < r; k += 5) {
                         const fuel::GroundPoint p = gen.at(x + k, z);
@@ -126,6 +138,15 @@ int main(int argc, char** argv) {
                             sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, sum[4] / cnt, sum[5] / cnt);
                 std::printf("  fields: none %d ploughed %d crops %d; in no-plant flat surfaces: %d (of %d)\n", fields[0], fields[1], fields[2],
                             excluded, n * n);
+                try {  // trees and bushes with and without the ground tests
+                    const fuel::Vegetation veg = fuel::loadVegetation(dpc);
+                    std::vector<fuel::Plant> before, after;
+                    fuel::scatterPlants(veg, levelled, roads.get(), nullptr, x, z, float(r), before);
+                    fuel::scatterPlants(veg, levelled, roads.get(), nullptr, x, z, float(r), after, false, 0, &gen);
+                    std::printf("  plants: %zu without the ground tests, %zu with\n", before.size(), after.size());
+                } catch (const std::exception& e) {
+                    std::printf("  plants: %s\n", e.what());
+                }
             } else if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
                 std::printf("height at (%.1f, %.1f) = %.2f m\n", x, z, hf.heightAt(x, z));
