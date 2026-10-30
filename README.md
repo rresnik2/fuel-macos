@@ -49,6 +49,19 @@ Early. What works today:
   races from the game's mission scripts: start line, ordered checkpoints shown
   as glowing beacons, laps, finish and a timer. N / Shift-N picks the next or
   previous race, Return restarts.
+- **AI opponents**: races put five opponents (`--opponents N`, 0 to 11) of the
+  player's class on the grid beside and behind the player, each a random
+  livery and colour. They follow the checkpoint line looking ahead, brake for
+  the corners to come, see static objects and steep terrain with a fan of rays
+  and steer round them, back out when stuck and are put back on the line after
+  ~4 s stuck, on the roof, or 12 s without progress (further along for each
+  reset that did not help). Each has a skill (0.85-1.0 of the top speed) and
+  is rubber-banded on the player (up to 12% slower when 200+ m ahead, 8% faster
+  when behind). The HUD shows the race position; the finishing order is printed
+  at the end. `fuelview --assemble BUGGY_OFF_1 --race CR2-Yell-CP --ai-check
+  CommonComponent/DATAS/BUGGY.DPC` races headless (the player on the same AI)
+  for up to `--drive-time` seconds (default 120) and prints every racer's
+  checkpoints, speed and resets; `FUEL_AI_TRACE=N` follows opponent N.
 - **Knock-aside props**: world objects with a collision radius of 0.4 to 3 m
   (barriers, banners, signs, cones, barrels) within 120 m of the player are
   dynamic Jolt bodies (convex hulls, mass from volume at 150 kg/m^3, capped at a

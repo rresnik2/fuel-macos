@@ -502,7 +502,8 @@ struct RaceSession {
             const float rubber = ahead > 200 ? 1.0f - 0.12f * std::min(1.0f, (ahead - 200) / 400) :
                                  ahead < -200 ? 1.0f + 0.08f * std::min(1.0f, (-ahead - 200) / 400) : 1.0f;
             d.setInput(i, drive(racer, d, i, dt, rubber));
-            static const char* trace = std::getenv("FUEL_AI_TRACE");  // DEBUG
+            // FUEL_AI_TRACE=N: follow opponent N twice a second (and print every reset).
+            static const char* trace = std::getenv("FUEL_AI_TRACE");
             if (trace && std::atoi(trace) == i && int(clock * 60) % 30 == 0) {
                 const fuel::VehicleState st = d.state(i);
                 const simd_float3 p = d.position(i);
@@ -533,7 +534,8 @@ struct RaceSession {
         if (racer.ai.wantsReset()) {
             // Back on the line, a few metres to the side for each racer so they do not land on each other.
             const auto p = racer.ai.resetPoint();
-            if (std::getenv("FUEL_AI_TRACE")) std::printf("    reset #%d at t=%.1f from (%.0f, %.0f) next %zu speed %.1f up %.2f\n", i, clock, s.x, s.z, racer.next, s.speedKmh, s.upY);  // DEBUG
+            if (std::getenv("FUEL_AI_TRACE"))
+                std::printf("    reset #%d at t=%.1f from (%.0f, %.0f) next %zu speed %.1f up %.2f\n", i, clock, s.x, s.z, racer.next, s.speedKmh, s.upY);
             const float yaw = racer.ai.resetHeading(), side = float(i % 3 - 1) * 4.0f;
             d.teleport(p[0] + std::cos(yaw) * side, p[2] - std::sin(yaw) * side, yaw, i);
             racer.ai.didReset();

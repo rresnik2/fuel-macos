@@ -94,7 +94,7 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
     float want = std::atan2(target[0] - float(s.x), target[2] - float(s.z));
 
     // Obstacles: try headings fanning out from the line (the side picked last time first)
-    // and take the first one free for the distance needed to react; boxed in, the clearest.
+    // and take the first one free for the distance needed to react.
     float blockedSpeed = 1e9f;
     if (s.clearance) {
         const float range = std::clamp(12.0f + std::fabs(speed) * 1.4f, 18.0f, 50.0f);
@@ -103,11 +103,14 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
         float best = -1, bestOffset = 0;
         bool found = false;
         const float side = dodge_ >= 0 ? 1.0f : -1.0f;
-        for (bool slopes : {true, false}) {  // a slope everywhere ahead: take it anyway, minding only objects
+        // Slopes first, fanning wider (up to 78 degrees: a diagonal makes a slope gentler); if no
+        // heading is free, the one that gets furthest when that is a fair way, else any heading
+        // free of objects (a slope everywhere ahead: take it anyway).
+        for (bool slopes : {true, false}) {
             best = -1;
             for (int k = 0; k <= 8 && !found; ++k)
                 for (float sign : {side, -side}) {
-                    const float offset = sign * float(k) * 0.13f;
+                    const float offset = sign * float(k) * (slopes ? 0.17f : 0.13f);
                     const float free = s.clearance(want + offset, need, slopes);
                     if (free > best) best = free, bestOffset = offset;
                     if (free >= need) {
@@ -117,8 +120,9 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
                     }
                     if (k == 0) break;
                 }
-            if (found) break;
+            if (found || (slopes && best >= 16.0f)) break;
         }
+        found = found || best >= need;
         dodge_ = found && bestOffset == 0 ? dodge_ * 0.9f : bestOffset;
         want += bestOffset;
         if (!found) blockedSpeed = std::sqrt(2.0f * kDecel * std::max(0.0f, best - 4.0f)) * 3.6f;
