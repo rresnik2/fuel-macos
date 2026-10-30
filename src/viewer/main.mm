@@ -835,6 +835,7 @@ int main(int argc, const char** argv) {
                 fuel::DpcFile usa1(world.string());
                 terrain = std::make_unique<fuel::Heightfield>(fuel::loadWorldHeightfield(usa1));
                 renderer.setTerrain(*terrain);
+                renderer.setGround(fuel::buildGroundMaps(usa1, *terrain, 2334), usa1);
                 if (opt.haveAt && !opt.world && !opt.drive)
                     renderer.placement = matrix_from_translation(opt.atX, terrain->heightAt(opt.atX, opt.atZ), opt.atZ);
             } catch (const std::exception& e) {

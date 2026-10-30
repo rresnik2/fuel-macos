@@ -11,6 +11,7 @@
 
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
+#include "core/ground.hpp"
 #include "core/terrain.hpp"
 #include "core/vehicle.hpp"
 
@@ -100,6 +101,8 @@ public:
     // Draws the world heightfield under the scene (with sky and haze) instead
     // of the ground plane.
     void setTerrain(const Heightfield& hf);
+    // Ground colour, surface types and FUEL's ground detail textures (looked up in `world`).
+    void setGround(const GroundMaps& maps, const DpcFile& world);
     bool showTerrain = true;
 
     // Call before the main pass each frame: renders the sun's shadow map.
@@ -171,7 +174,7 @@ private:
     id<MTLRenderPipelineState> groundPipeline_, terrainPipeline_, skyPipeline_, markerPipeline_;
     std::vector<simd_float4> markers_;
     id<MTLDepthStencilState> depthAlways_;
-    id<MTLTexture> heightTex_;
+    id<MTLTexture> heightTex_, groundColour_, groundSurface_, groundDetail_;
     id<MTLBuffer> terrainIndices_;
     uint32_t terrainIndexCount_ = 0;
     Heightfield terrainData_;

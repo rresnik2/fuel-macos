@@ -5,6 +5,7 @@
 // --pgm compares every sample with a 16-bit PGM export (raw * 65535 / 4095).
 
 #include "core/dpc.hpp"
+#include "core/ground.hpp"
 #include "core/terrain.hpp"
 
 #include <chrono>
@@ -16,7 +17,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: fuelterrain USA1.DPC [--pgm REFERENCE.pgm] [--at X Z ...]\n");
+        std::fprintf(stderr, "usage: fuelterrain USA1.DPC [--pgm REFERENCE.pgm] [--at X Z ...] [--ground OUT.ppm SIZE]\n");
         return 2;
     }
     try {
@@ -33,6 +34,15 @@ int main(int argc, char** argv) {
             if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
                 std::printf("height at (%.1f, %.1f) = %.2f m\n", x, z, hf.heightAt(x, z));
+                i += 2;
+            } else if (a == "--ground" && i + 2 < argc) {  // --ground FILE.ppm SIZE: the colour map
+                const auto g0 = std::chrono::steady_clock::now();
+                const fuel::GroundMaps g = fuel::buildGroundMaps(dpc, hf, uint32_t(std::atoi(argv[i + 2])));
+                std::printf("ground maps %u x %u in %.2f s\n", g.size, g.size,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count());
+                std::ofstream out(argv[i + 1], std::ios::binary);
+                out << "P6\n" << g.size << " " << g.size << "\n255\n";
+                for (size_t k = 0; k < size_t(g.size) * g.size; ++k) out.write(reinterpret_cast<const char*>(&g.colour[k * 4]), 3);
                 i += 2;
             } else if (a == "--pgm" && i + 1 < argc) {
                 std::ifstream f(argv[++i], std::ios::binary);

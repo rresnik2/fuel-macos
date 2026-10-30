@@ -38,7 +38,7 @@ struct FrameUniforms {
     float4 footprint;     // xy scene centre (x, z), zw half extents
     float4 terrain;       // origin x, origin z, sample spacing, metres per texel value 1.0
     float4 terrainGrid;   // grid centre x, z, radius, vertices per side
-    float4 fog;           // x haze density per metre (0 = none)
+    float4 fog;           // x haze density per metre (0 = none), y = 1 when ground maps are loaded
 };
 
 struct MaterialUniforms {
@@ -276,7 +276,9 @@ vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[
 }
 
 fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
-                          texture2d<float> hm [[texture(0)]], depth2d<float> shadowMap [[texture(7)]]) {
+                          texture2d<float> hm [[texture(0)]], texture2d<float> groundColour [[texture(1)]],
+                          texture2d<uint> groundSurface [[texture(2)]], texture2d_array<float> detail [[texture(3)]],
+                          depth2d<float> shadowMap [[texture(7)]]) {
     float e = f.terrain.z;
     float2 xz = in.world.xz;
     float hl = terrainHeight(hm, xz - float2(e, 0), f), hr = terrainHeight(hm, xz + float2(e, 0), f);
@@ -284,12 +286,42 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
     float3 N = normalize(float3(hl - hr, 2.0 * e, hd - hu));
     float slope = 1.0 - N.y;
     float n = valueNoise(xz * 0.004) * 0.6 + valueNoise(xz * 0.03) * 0.3 + valueNoise(xz * 0.25) * 0.1;
-    // Procedural surface: grass and dry ground by altitude, rock on steep slopes, snow up high.
-    float3 grass = float3(0.035, 0.060, 0.018), dry = float3(0.11, 0.085, 0.045);
-    float3 rock = float3(0.10, 0.092, 0.085), snow = float3(0.80, 0.82, 0.86);
-    float3 c = mix(grass, dry, saturate(n * 0.9 + (in.world.y - 1500.0) / 1800.0));
-    c = mix(c, rock, smoothstep(0.16, 0.32, slope + (n - 0.5) * 0.08));
-    c = mix(c, snow, smoothstep(3100.0, 3500.0, in.world.y + n * 300.0) * (1.0 - smoothstep(0.35, 0.6, slope)));
+    float3 c;
+    if (f.fog.y > 0.0) {
+        // FUEL's ground: palette colour from the world map, modulated by the local
+        // surface's detail texture (B = grey detail x2, R/G/A = normal; y up).
+        constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+        constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
+        float2 uv = (xz + 70000.0) / 140000.0;
+        c = groundColour.sample(lin, uv).rgb;
+        float dist = length(f.eye.xyz - in.world);
+        float near = 1.0 - smoothstep(150.0, 600.0, dist);
+        if (near > 0.0) {
+            float size = float(groundSurface.get_width());
+            float2 t = uv * size - 0.5;
+            float2 i0 = floor(t), a = t - i0;
+            float2 duv = xz / 4.0;  // one repeat per 4 m
+            float4 d = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                uint2 cell = uint2(clamp(i0 + float2(k & 1, k >> 1), 0.0, size - 1.0));
+                float w = ((k & 1) ? a.x : 1.0 - a.x) * ((k >> 1) ? a.y : 1.0 - a.y);
+                const uint layer = groundSurface.read(cell).r;
+                // Two scales (4 m and 17.3 m) so the repeat does not show.
+                d += w * (0.6 * detail.sample(rep, duv, layer) + 0.4 * detail.sample(rep, duv * 0.231 + 0.37, layer));
+            }
+            c *= mix(1.0, d.b * 2.0, near);
+            float3 nt = float3(d.r, d.g, d.a) * 2.0 - 1.0;
+            float3 T = normalize(float3(1, 0, 0) - N * N.x), B = cross(T, N);
+            N = normalize(mix(N, normalize(T * nt.x + N * max(nt.y, 0.2) - B * nt.z), near * 0.8));
+        }
+    } else {
+        // Procedural fallback: grass and dry ground by altitude, rock on steep slopes, snow up high.
+        float3 grass = float3(0.035, 0.060, 0.018), dry = float3(0.11, 0.085, 0.045);
+        float3 rock = float3(0.10, 0.092, 0.085), snow = float3(0.80, 0.82, 0.86);
+        c = mix(grass, dry, saturate(n * 0.9 + (in.world.y - 1500.0) / 1800.0));
+        c = mix(c, rock, smoothstep(0.16, 0.32, slope + (n - 0.5) * 0.08));
+        c = mix(c, snow, smoothstep(3100.0, 3500.0, in.world.y + n * 300.0) * (1.0 - smoothstep(0.35, 0.6, slope)));
+    }
     float shadow = shadowFactor(shadowMap, in.sunPos);
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(c, N, V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
@@ -539,6 +571,75 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     depthAlways_ = [device newDepthStencilStateWithDescriptor:ds];
 
     sunDir_ = simd_normalize(simd_make_float3(0.55f, 0.80f, 0.45f));
+}
+
+void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
+    // Colour map (sRGB, mipmapped) and surface-type map (one byte per sample).
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                    width:maps.size
+                                                                                   height:maps.size
+                                                                                mipmapped:YES];
+    groundColour_ = [device_ newTextureWithDescriptor:td];
+    [groundColour_ replaceRegion:MTLRegionMake2D(0, 0, maps.size, maps.size) mipmapLevel:0 withBytes:maps.colour.data() bytesPerRow:maps.size * 4];
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:maps.size height:maps.size mipmapped:NO];
+    groundSurface_ = [device_ newTextureWithDescriptor:td];
+    [groundSurface_ replaceRegion:MTLRegionMake2D(0, 0, maps.size, maps.size) mipmapLevel:0 withBytes:maps.surface.data() bytesPerRow:maps.size];
+
+    // Detail textures: one 256x256 DXT5 slice per surface type, taken from the
+    // mip level of each source that is 256 wide (sources are 256-1024).
+    constexpr uint32_t kSide = 256, kLevels = 9;
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC3_RGBA width:kSide height:kSide mipmapped:YES];
+    td.textureType = MTLTextureType2DArray;
+    td.arrayLength = kSurfaceTypes;
+    td.mipmapLevelCount = kLevels;
+    groundDetail_ = [device_ newTextureWithDescriptor:td];
+    for (int s = 0; s < kSurfaceTypes; ++s) {
+        const DpcFile::Entry* e = world.find(maps.textures[size_t(s)]);
+        std::optional<std::vector<uint8_t>> body;
+        BitmapInfo bm;
+        try {
+            if (e != nullptr) {
+                bm = parseBitmapLink(world.link(*e));
+                body = world.body(*e);
+            }
+        } catch (const std::exception&) {
+            body.reset();
+        }
+        const bool usable = body && bm.format == PixelFormat::DXT5 && bm.width >= kSide && bm.width == bm.height &&
+                            checkBitmap(bm, uint32_t(body->size())).empty();
+        const std::vector<uint32_t> sizes = usable ? bm.mipSizes() : std::vector<uint32_t>{};
+        size_t offset = 0;
+        uint32_t level = 0, w = usable ? bm.width : 0;
+        while (usable && w > kSide) offset += sizes[level++], w >>= 1;
+        std::vector<uint8_t> flat(16, 0);  // neutral block fallback: normal up, detail 0.5
+        for (uint32_t m = 0; m < kLevels; ++m) {
+            const uint32_t side = std::max(1u, kSide >> m), blocks = std::max(1u, side / 4);
+            const uint8_t* src;
+            if (usable && level + m < bm.mips) {
+                src = body->data() + offset;
+                offset += sizes[level + m];
+            } else {
+                // DXT5 block: alpha 0.5, colour (0.5, 1, 0.5) = flat normal with neutral detail.
+                static const uint8_t kFlat[16] = {128, 128, 0, 0, 0, 0, 0, 0, 0xEF, 0x87, 0xEF, 0x87, 0, 0, 0, 0};
+                flat.assign(size_t(blocks) * blocks * 16, 0);
+                for (size_t b = 0; b < size_t(blocks) * blocks; ++b) std::memcpy(&flat[b * 16], kFlat, 16);
+                src = flat.data();
+            }
+            [groundDetail_ replaceRegion:MTLRegionMake2D(0, 0, side, side)
+                             mipmapLevel:m
+                                   slice:NSUInteger(s)
+                               withBytes:src
+                             bytesPerRow:blocks * 16
+                           bytesPerImage:size_t(blocks) * blocks * 16];
+        }
+    }
+    id<MTLCommandQueue> q = [device_ newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit generateMipmapsForTexture:groundColour_];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
 }
 
 void MeshRenderer::setTerrain(const Heightfield& hf) {
@@ -908,7 +1009,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.sunViewProj = sunViewProj();
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
-    fu.fog = simd_make_float4(terrain ? 1.0f / 16000.0f : 0.0f, 0, 0, 0);
+    fu.fog = simd_make_float4(terrain ? 1.0f / 16000.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, 0, 0);
     fu.sunDir = simd_make_float4(sunDir_, 3.0f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
     fu.eye = simd_make_float4(eye, 1);
@@ -963,6 +1064,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
         [enc setVertexTexture:heightTex_ atIndex:0];
         [enc setFragmentTexture:heightTex_ atIndex:0];
+        if (groundColour_ != nil) {
+            [enc setFragmentTexture:groundColour_ atIndex:1];
+            [enc setFragmentTexture:groundSurface_ atIndex:2];
+            [enc setFragmentTexture:groundDetail_ atIndex:3];
+        }
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:terrainIndexCount_
                          indexType:MTLIndexTypeUInt32

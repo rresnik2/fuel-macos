@@ -28,6 +28,19 @@ struct Heightfield {
     float smoothHeightAt(double x, double z) const;
 };
 
+// One GenWorld map (Binary_Z): a grid of 12-bit values over the same 140 km
+// square as the heightfield.
+struct Raster {
+    uint32_t width = 0, height = 0;
+    float maxValue = 1;  // the value that means "full"
+    std::vector<uint16_t> raw;
+    float at(uint32_t col, uint32_t row) const { return float(raw[size_t(row) * width + col]) / maxValue; }
+};
+// Decodes a Binary_Z body (4x4 block codec). Throws on malformed data.
+Raster decodeRaster(const std::vector<uint8_t>& binaryBody);
+// The Binary_Z map IDs listed by the world's GenWorld_Z (index 0 = heights).
+std::vector<uint32_t> genWorldMaps(const DpcFile& world);
+
 // Decodes the heightfield of a world DPC (WORLD/USA1.DPC). Throws when the
 // file has no GenWorld_Z or the map does not decode.
 Heightfield loadWorldHeightfield(const DpcFile& world);
