@@ -242,3 +242,12 @@ Livery: batch materials named `LIVERY_XX_<PART>` (and `LIVERY_XX_BODY` for the
 suit) take their diffuse and specular bitmaps (slots 0 and 4) from the
 Material_Z that the MaterialAnim_Z `LIVERY_<nn>_<PART>` points to (body +0x3C).
 The default rider uses livery 01 throughout.
+
+## Movable props (port behaviour, not a file format)
+
+The world DPCs carry no mass or "breakable" data that the port decodes, so the
+knock-aside rule is a heuristic: a placed mesh whose collision radius (bounding
+sphere around its origin) is 0.4 to 3 m is a dynamic prop; 3 m and larger is a
+static solid. Mass comes from the convex hull volume (hulls overstate hollow
+props, so it is capped relative to the vehicle). The physics keeps tyre casts
+on a separate layer that sees only static ground, so tyres never ride up props.

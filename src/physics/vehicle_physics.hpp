@@ -80,6 +80,13 @@ struct VehicleState {
     float impactSpeed = 0;
 };
 
+struct PropPose {
+    uint32_t id = 0;
+    Pose pose;
+    bool awake = false;
+    float displacement = 0;  // metres from where it was placed
+};
+
 class DriveWorld {
 public:
     explicit DriveWorld(const Heightfield& terrain);
@@ -107,6 +114,19 @@ public:
     void addStaticShape(uint32_t key, const std::vector<float>& positions, const std::vector<uint32_t>& indices);
     // Replaces the set of placed static objects: (shape key, world matrix).
     void setStaticObjects(const std::vector<std::pair<uint32_t, std::array<double, 16>>>& objects);
+
+    // Movable props: small objects that sit asleep until hit, then tumble. A
+    // shape is registered once per mesh (a convex hull of its points; mass
+    // from its volume at ~150 kg/m^3, clamped to 5..400 kg). Props collide
+    // with the vehicle, terrain, static objects and each other.
+    bool hasPropShape(uint32_t key) const;
+    void addPropShape(uint32_t key, const std::vector<float>& positions);
+    // Adds prop `id` at a row-vector world matrix (rotation and per-axis scale); false when it has no shape.
+    bool addProp(uint32_t id, uint32_t shapeKey, const std::array<double, 16>& world);
+    bool hasProp(uint32_t id) const;
+    void removeProp(uint32_t id);
+    // Props whose pose changed since the last call (mesh-origin pose; scale is not included).
+    std::vector<PropPose> changedProps();
 
 private:
     struct Impl;

@@ -78,6 +78,7 @@ struct Options {
     bool terrain = false;
     bool drive = false;
     bool audioCheck = false;
+    bool propCheck = false;
     std::string race;
     float driveTime = 4.0f;
     bool haveAt = false;
@@ -158,6 +159,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--terrain") o.terrain = true;
         else if (a == "--drive") { o.drive = true; o.terrain = true; }
         else if (a == "--audio-check") o.audioCheck = true;
+        else if (a == "--prop-check") { o.propCheck = true; o.drive = true; o.terrain = true; }
         else if (a == "--drive-time") o.driveTime = std::stof(next());
         else if (a == "--race") { o.race = next(); o.drive = true; o.terrain = true; }
         else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
@@ -182,6 +184,7 @@ Options parseArgs(int argc, const char** argv) {
     }
     if (!o.assemble.empty() && (!o.scene.empty() || o.haveMeshId)) die("--assemble cannot be combined with --scene or --mesh");
     if (!o.assemble.empty() && !o.vehicle.empty()) die("with --assemble the paint follows the variant; drop --vehicle");
+    if (o.propCheck && o.shot.empty()) o.shot = "-";  // headless: drive and report, no picture
     if (o.dataDir.empty()) o.dataDir = defaultDataDir();
     if (o.dpcs.empty()) o.dpcs.push_back("CommonComponent/DATAS/QUAD.DPC");
     return o;
@@ -1096,9 +1099,27 @@ int main(int argc, const char** argv) {
                 if (!err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
                 if (drive) {  // drive straight ahead for a while, then look from behind
                     if (streamer) streamer->update(drive->position(), renderer, drive->physics(), true);
-                    for (int i = 0; i < int(opt.driveTime * 60); ++i) {
+                    std::vector<simd_float3> tried;
+                    simd_float3 checkFocus = {0, 0, 0};
+                    bool haveCheckFocus = false;
+                    const simd_float3 checkFrom = drive->position();
+                    const float runTime = opt.propCheck ? std::max(opt.driveTime, 9.0f) : opt.driveTime;
+                    for (int trial = 0; trial < (opt.propCheck ? 8 : 1); ++trial) {  // --prop-check: try props until one is hit cleanly
+                    if (streamer && opt.propCheck) {  // aim the vehicle at a prop from 45 m away and keep the throttle down
+                        simd_float3 target;
+                        if (!streamer->nearestProp(checkFrom, tried, target)) die("--prop-check: no movable props near the start (use --race or --at)");
+                        tried.push_back(target);
+                        const simd_float3 from = checkFrom;
+                        const float yaw = std::atan2(target.x - from.x, target.z - from.z);
+                        drive->teleport(target.x - 45 * std::sin(yaw), target.z - 45 * std::cos(yaw), yaw);
+                        streamer->update(drive->position(), renderer, drive->physics(), true);
+                        std::printf("prop check: aiming at a prop at (%.0f, %.0f) from 45 m\n", target.x, target.z);
+                    }
+                    float speedBefore = 0, speedMin = 1e9f, firstContactS = -1, speedLater = -1;
+                    const size_t movedBase = streamer ? streamer->propStats().moved : 0;
+                    for (int i = 0; i < int(runTime * 60); ++i) {
                         fuel::DriveInput in{1.0f, 0, 0, false};
-                        if (race) {
+                        if (race && !opt.propCheck) {
                             if (race->state == RaceSession::Finished) break;
                             in = race->autopilot(drive->position(), drive->heading(), drive->state().speedKmh);
                             if (std::getenv("FUEL_RACE_WARP") && race->state == RaceSession::Running && i % 60 == 0) {
@@ -1114,18 +1135,50 @@ int main(int argc, const char** argv) {
                             }
                         }
                         drive->update(1.0f / 60, in);
-                        if (streamer && i % 30 == 0) streamer->update(drive->position(), renderer, drive->physics());
+                        if (streamer && (opt.propCheck || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
+                        if (streamer && opt.propCheck) {
+                            const float v = drive->state().speedKmh;
+                            if (i % 20 == 0 && std::getenv("FUEL_PROP_TRACE")) {
+                                const simd_float3 q = drive->position();
+                                std::printf("  t=%.2f (%.1f, %.1f, %.1f) %.1f km/h moved %zu\n", i / 60.0, q.x, q.y, q.z, v, streamer->propStats().moved);
+                            }
+                            if (firstContactS < 0) {
+                                if (streamer->propStats().moved > movedBase) firstContactS = float(i) / 60.0f;
+                                else speedBefore = v;
+                            } else {
+                                speedMin = std::min(speedMin, v);
+                                if (speedLater < 0 && float(i) / 60.0f >= firstContactS + 1.0f) speedLater = v;
+                                if (speedLater >= 0 && float(i) / 60.0f >= firstContactS + 1.5f) break;  // enough: show the aftermath
+                            }
+                        }
+                    }
+                    if (streamer && opt.propCheck) {
+                        const auto ps = streamer->propStats();
+                        const float speedAfter = drive->state().speedKmh;
+                        std::printf("prop check: %zu props tracked, %zu simulated, %zu moved (%zu in this run); first contact at %.1f s\n", ps.tracked, ps.bodies, ps.moved, ps.moved - movedBase, firstContactS);
+                        std::printf("prop check: speed before contact %.1f km/h, lowest after %.1f km/h, 1 s after %.1f km/h\n", speedBefore,
+                                    firstContactS < 0 ? 0.0f : speedMin, speedLater);
+                        const bool ok = ps.moved > movedBase && speedBefore > 15.0f && speedLater > 0.6f * speedBefore;
+                        { const simd_float3 car = drive->position(); std::printf("prop check: furthest prop displaced %.1f m, now at (%.1f, %.1f, %.1f); vehicle at (%.1f, %.1f, %.1f); terrain under it %.1f\n", ps.maxDisplacement, ps.where.x, ps.where.y, ps.where.z, car.x, car.y, car.z, terrain ? terrain->smoothHeightAt(ps.where.x, ps.where.z) : 0.0f); }
+                        if (ok && opt.shot != "-") checkFocus = ps.where + simd_make_float3(0, 1, 0), haveCheckFocus = true;
+                        std::printf("prop check: %s (at end %.1f km/h)\n", ok ? "ok" : "FAILED (no props moved, or the vehicle lost its speed)", speedAfter);
+                        if (ok || trial == 7) {
+                            if (opt.shot == "-" && !ok) return 1;
+                            break;
+                        }
+                    }
                     }
                     renderer.setInstanceWorlds(drive->partWorlds());
                     if (race) {
                         renderer.setMarkers(race->markers());
                         std::printf("%s\n", race->hud(drive->position()).c_str());
                     }
-                    renderer.setFocus(drive->position());
+                    renderer.setFocus(haveCheckFocus ? checkFocus : drive->position());
                     cam.yaw += drive->heading() + float(M_PI);
                     const fuel::VehicleState st = drive->state();
                     std::printf("after %.1f s: %.1f km/h, gear %d, %d wheels on the ground\n", opt.driveTime, st.speedKmh, st.gear, st.wheelsOnGround);
                 }
+                if (opt.shot == "-") return 0;
                 renderShot(device, renderer, opt, cam);
                 std::printf("wrote %s: %s, %zu parts, %u triangles\n", opt.shot.c_str(), scene.variant.c_str(), scene.parts.size(), renderer.triangleCount());
                 return 0;

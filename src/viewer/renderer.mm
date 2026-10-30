@@ -1098,6 +1098,24 @@ size_t MeshRenderer::setWorldInstances(const std::vector<MeshInstance>& instance
     return worldInstances_.size();
 }
 
+size_t MeshRenderer::setPropInstances(const std::vector<MeshInstance>& instances) {
+    propInstances_.clear();
+    std::unordered_map<const GpuMesh*, std::vector<simd_float4x4>> byMesh;
+    for (const MeshInstance& in : instances) {
+        std::string err;
+        const GpuMesh* gm = loadMesh(in.meshId, &err);
+        if (gm == nullptr || gm->indices == nil) continue;
+        propInstances_.push_back({gm, in.world});
+        byMesh[gm].push_back(in.world);
+    }
+    propGroups_.clear();
+    for (const auto& [gm, worlds] : byMesh)
+        propGroups_.push_back({gm, [device_ newBufferWithBytes:worlds.data() length:worlds.size() * sizeof(simd_float4x4)
+                                                       options:MTLResourceStorageModeShared],
+                               uint32_t(worlds.size())});
+    return propInstances_.size();
+}
+
 void MeshRenderer::setInstanceWorlds(const std::vector<simd_float4x4>& worlds) {
     for (size_t k = 0; k < worlds.size() && k < inputToInstance_.size(); ++k)
         if (inputToInstance_[k] >= 0) instances_[size_t(inputToInstance_[k])].world = worlds[k];
@@ -1126,6 +1144,8 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
     std::vector<const Instance*> casters;
     for (const Instance& inst : instances_) casters.push_back(&inst);
     for (const Instance& inst : worldInstances_)
+        if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
+    for (const Instance& inst : propInstances_)
         if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
     for (const Instance* ip : casters) {
         const Instance& inst = *ip;
@@ -1219,6 +1239,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             drawMesh(*inst.mesh, 1);
         }
         for (const WorldGroup& g : worldGroups_) {  // one instanced draw per mesh
+            if (g.mesh->draws[pass].empty()) continue;
+            [enc setVertexBuffer:g.matrices offset:0 atIndex:2];
+            drawMesh(*g.mesh, g.count);
+        }
+        for (const WorldGroup& g : propGroups_) {
             if (g.mesh->draws[pass].empty()) continue;
             [enc setVertexBuffer:g.matrices offset:0 atIndex:2];
             drawMesh(*g.mesh, g.count);

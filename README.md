@@ -49,6 +49,15 @@ Early. What works today:
   races from the game's mission scripts: start line, ordered checkpoints shown
   as glowing beacons, laps, finish and a timer. N / Shift-N picks the next or
   previous race, Return restarts.
+- **Knock-aside props**: world objects with a collision radius of 0.4 to 3 m
+  (barriers, banners, signs, cones, barrels) within 120 m of the player are
+  dynamic Jolt bodies (convex hulls, mass from volume at 150 kg/m^3, capped at a
+  fifth of the vehicle's mass). They sleep until hit, then tumble and are drawn
+  where the physics puts them; knocked props stay where they landed until the
+  player is 300 m away. Larger objects stay static. `fuelview --assemble
+  QUAD_ROAD_2 --race CR2-Yell-CP --prop-check` (or `--at 45850,-6250`) drives at
+  props headless and reports how many moved and the speed before and after;
+  add `--shot` for a picture of the aftermath.
 - **The rider**: every vehicle in `--assemble` and `--drive` carries FUEL's
   rider (default livery), skinned on the CPU into the seated pose of the
   vehicle's archetype from the game's own animations and drawn with the
