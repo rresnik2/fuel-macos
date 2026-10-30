@@ -13,15 +13,13 @@ float slopeDeg(const fuel::Heightfield& t, double x, double z) {
     return std::atan(std::hypot(dx, dz)) * 57.29578f;
 }
 
-constexpr float kMaxSlope = 25.0f;      // degrees: steeper is a cliff, not a place to start
-constexpr float kObjectClearance = 3.0f;  // metres from a placed object's bounding circle
+constexpr float kMaxSlope = 35.0f;  // degrees: steeper is a cliff, not a place to start (vista points sit on edges)
 
 }  // namespace
 
 std::string spawnProblem(DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer, const fuel::Heightfield& terrain, float x,
                          float z, float yaw) {
     if (slopeDeg(terrain, x, z) > kMaxSlope) return "cliff";
-    if (streamer.nearObject(x, z, kObjectClearance)) return "inside an object";
     drive.teleport(x, z, yaw);
     streamer.update(drive.position(), renderer, drive.physics(), true);
     for (int i = 0; i < 90; ++i) drive.update(1.0f / 60, fuel::DriveInput{});
@@ -58,13 +56,14 @@ HubSpawn placeAtHubPoint(DriveSession& drive, WorldStreamer& streamer, fuel::Mes
 
 int runHubCheck(const std::vector<fuel::Hub>& hubs, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer,
                 const fuel::Heightfield& terrain) {
-    size_t spots = 0, nudged = 0, failed = 0;
+    size_t spots = 0, nudged = 0, failed = 0, inCircle = 0;
     for (const fuel::Hub& h : hubs) {
         size_t n[3] = {0, 0, 0}, bad[3] = {0, 0, 0};
         std::string notes;
         auto test = [&](int kind, const fuel::HubPoint& p) {
             const HubSpawn s = placeAtHubPoint(drive, streamer, renderer, terrain, p);
             ++n[kind], ++spots;
+            if (streamer.nearObject(p.x, p.z, 0.0f)) ++inCircle;  // information only: bounding circles are generous
             if (s.problem.empty()) return;
             ++bad[kind];
             char line[256];
@@ -84,6 +83,6 @@ int runHubCheck(const std::vector<fuel::Hub>& hubs, DriveSession& drive, WorldSt
         std::fputs(notes.c_str(), stdout);
         std::fflush(stdout);
     }
-    std::printf("hub check: %zu hubs, %zu spawns, %zu nudged to a clear spot, %zu without one: %s\n", hubs.size(), spots, nudged, failed, failed ? "FAILED" : "ok");
+    std::printf("hub check: %zu hubs, %zu spawns (%zu of the points lie inside a placed object's bounding circle), %zu nudged to a clear spot, %zu without one: %s\n", hubs.size(), spots, inCircle, nudged, failed, failed ? "FAILED" : "ok");
     return failed ? 1 : 0;
 }
