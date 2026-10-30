@@ -23,6 +23,9 @@ inline constexpr uint32_t SkidFirst = 0x0e, SkidLast = 0x1e;
 inline constexpr uint32_t RollFirst = 0x20, RollLast = 0x39;
 inline constexpr uint32_t Wind = 0x40;
 inline constexpr uint32_t ImpactFirst = 0x42, ImpactLast = 0x4b;
+inline constexpr uint32_t Scrape = 0x47;  // loop: body sliding against something
+inline constexpr uint32_t AbsorberFirst = 0x54, AbsorberLast = 0x59, AbsorberBig = 0x5a;  // suspension thumps
+inline constexpr uint32_t BackfireFirst = 0x5e, BackfireLast = 0x61;
 }  // namespace snd
 
 struct Sound {
@@ -50,6 +53,11 @@ struct EngineModel {
     static constexpr int kLayers = 6;
     float idleRpm = 1000, maxRpm = 6000, gain = 1;  // P325, P324, P649
     std::array<float, 7> nativeRpm{};               // P636..P642
+    // Backfire (P645 pop interval s, P646 rpm drop rate threshold in rpm/s (negative),
+    // P653 throttle ceiling, P654 normalised-rpm floor) and absorber thumps
+    // (P651 compression speed threshold m/s, P652 volume scale).
+    float popInterval = 0.15f, popRateThreshold = -1500, popThrottleMax = 0.5f, popRpmMin = 0.5f;
+    float absorberThreshold = 2.0f, absorberScale = 10.0f;
 
     struct Mix {
         std::array<float, kLayers> pitch{};   // playback rate per layer

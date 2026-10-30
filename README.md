@@ -35,8 +35,16 @@ Early. What works today:
   as rpm-crossfaded idle and on/off-load layers, tyre rolling and skid loops,
   wind, and impact one-shots on hard braking or landings. M mutes.
   `fuelview --drive --audio-check` prints the sound layers of a few vehicles
-  without opening audio. Ground-surface sounds are not mapped yet (one gravel
-  class is used everywhere).
+  without opening audio. The tyre loops follow the surface under each wheel
+  (crossfaded per class); backfire pops on fast rpm drops, suspension thumps on
+  hard compression and a scrape loop when the body slides against the ground or
+  an object are played too.
+- **Surfaces**: the ground type under each wheel (the 40-type map, overridden by
+  tarmac and dirt roads) scales that tyre's grip (tarmac 1.15, dirt 1.0, grass
+  0.9, sand 0.75, snow 0.6, mud/wet 0.65, rock 0.95) and adds rolling resistance
+  on soft ground; see docs/formats.md. `fueldrive DATA DPC VARIANT --surfaces`
+  runs a throttle-then-brake test on tarmac, grass and sand and prints top
+  speed, 0-80 km/h and braking distance.
 - **Races**: `--race NAME` (for example `CR2-Yell-CP`) loads one of FUEL's 250
   races from the game's mission scripts: start line, ordered checkpoints shown
   as glowing beacons, laps, finish and a timer. N / Shift-N picks the next or

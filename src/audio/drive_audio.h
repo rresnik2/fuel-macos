@@ -22,9 +22,15 @@ struct VehicleSounds {
     EngineModel engine;
     std::array<Sound, EngineModel::kLayers> idleOrOff;  // [0] idle, [1..5] off-load layers
     std::array<Sound, EngineModel::kLayers> on;         // [1..5] on-load layers ([0] unused)
-    Sound rollSlow, rollFast, skid, wind;
+    struct Tyre {
+        Sound rollSlow, rollFast, skid;
+    };
+    std::array<Tyre, kSoundClasses> tyres;              // by sound class (see surfaceSoundClass); empty if the bank lacks it
+    Sound wind, scrape;
     std::vector<Sound> impacts;                         // one-shots, in bank order
-    int surfaceClass = -1;                              // the rolling/skid class used (see drive_audio.mm)
+    std::vector<Sound> backfires;                       // 0x5e..0x61
+    std::vector<Sound> absorbers;                       // 0x54..0x59, then the big thump (0x5a) last if present
+    bool bigAbsorber = false;
 };
 
 // Decodes the sound set for `variant`. Throws std::runtime_error when the

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "core/dpc.hpp"
+#include "core/surface.hpp"
 #include "core/terrain.hpp"
 
 #include <array>
@@ -69,6 +70,14 @@ struct VehicleState {
     int gear = 0;
     int wheelsOnGround = 0;
     float skid = 0;  // 0..1: how hard the tyres slide or spin (average over wheels on the ground)
+    // Per wheel (same order as `wheels`):
+    std::vector<int> wheelSurface;       // surface type under the contact point, -1 when airborne or unknown
+    std::vector<float> wheelSkid;        // 0..1 slide/spin of this wheel (0 in the air)
+    std::vector<float> wheelCompression; // suspension compression speed, m/s (positive = compressing)
+    // The chassis body touching the world (terrain or an object): sliding speed along the
+    // contact in m/s (0 = no contact) and the largest normal speed of a new impact this step.
+    float scrapeSpeed = 0;
+    float impactSpeed = 0;
 };
 
 class DriveWorld {
@@ -85,6 +94,11 @@ public:
     // Advances by `dt` seconds in fixed 1/60 s steps.
     void update(float dt, const DriveInput& input);
     VehicleState state() const;
+
+    // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
+    // surface counts as dirt. The default applies to worlds created afterwards.
+    void setSurfaceQuery(SurfaceQuery query);
+    static void setDefaultSurfaceQuery(SurfaceQuery query);
 
     // Static world objects the vehicle collides with. A shape is registered
     // once per mesh; instances place it with a row-vector world matrix
