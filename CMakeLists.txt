@@ -25,6 +25,7 @@ add_library(fuelcore STATIC
   src/core/vehicle_params.cpp
   src/core/races.cpp
   src/core/assembly.cpp
+  src/core/rider.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 
@@ -35,6 +36,10 @@ target_link_libraries(fuelcheck PRIVATE fuelcore)
 # Assembles vehicle variants and prints their placed parts (or JSON).
 add_executable(fuelscene src/tools/fuelscene.cpp)
 target_link_libraries(fuelscene PRIVATE fuelcore)
+
+# Bakes the rider for a vehicle and checks it against a reference export.
+add_executable(fuelrider src/tools/fuelrider.cpp)
+target_link_libraries(fuelrider PRIVATE fuelcore)
 
 # Mesh viewer: the first native Metal program (P5 spike).
 add_executable(fuelview

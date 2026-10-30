@@ -234,7 +234,13 @@ Lod parseLodBody(const std::vector<uint8_t>& body) {
     l.objects = r.u32Array(kListLimit);
     r.u32();
     for (int i = 0; i < 2; ++i)
-        if (r.u32() != 0) r.skipArray(8, kListLimit);
+        if (r.u32() != 0) {
+            const uint32_t n = r.count(kListLimit);
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t slot = r.u32(), anim = r.u32();
+                if (i == 0) l.animations.push_back({slot, anim});
+            }
+        }
     r.u32();
     r.expectEnd();
     return l;
@@ -258,14 +264,17 @@ Skin parseSkinBody(const std::vector<uint8_t>& body) {
         if (r.u32() != 0) r.skipArray(8, kListLimit);
     r.u32();
     r.u32();
-    for (uint32_t i = 0, sets = r.count(kListLimit); i < sets; ++i)
-        for (uint32_t j = 0, recs = r.count(kListLimit); j < recs; ++j) {
-            r.raw(0x60);
+    s.sets.resize(r.count(kListLimit));
+    for (auto& set : s.sets) {
+        set.resize(r.count(kListLimit));
+        for (SkinRecord& rec : set) {
+            std::memcpy(rec.data(), r.raw(0x60), 0x60);
             for (uint32_t k = 0, subs = r.count(kListLimit); k < subs; ++k) {
                 r.u32();
                 r.raw(r.count(4096));
             }
         }
+    }
     r.expectEnd();
     return s;
 }
@@ -280,6 +289,9 @@ Skel parseSkelBody(const std::vector<uint8_t>& body) {
         b.userDefine = r.u32();
         const uint8_t* block = r.raw(0xA0);  // local TRS; +0x60 holds a second copy of the rotation
         std::memcpy(b.restQuat.data(), block + 0x60, 16);
+        std::memcpy(b.localQuat.data(), block, 16);
+        std::memcpy(b.localScale.data(), block + 0x10, 12);
+        std::memcpy(b.localT.data(), block + 0x20, 12);
         for (float& f : b.world) f = r.f32();
         b.firstChild = r.i32();
         b.parent = r.i32();

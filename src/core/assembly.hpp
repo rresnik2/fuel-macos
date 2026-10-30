@@ -82,12 +82,19 @@ std::vector<NodeGroup> parseGameObjBody(const std::vector<uint8_t>& body);  // t
 struct Lod {
     std::vector<NamedSphere> spheres;
     std::vector<uint32_t> objects;  // [0] = LOD1, ...
+    // (animation slot, Animation_Z id) pairs; the rider's Lod_Z lists its poses here.
+    std::vector<std::pair<uint32_t, uint32_t>> animations;
 };
 Lod parseLodBody(const std::vector<uint8_t>& body);  // throws
 
 // Skin_Z body; only the mesh list matters for placement.
+// One per-batch record of a skinned part (0x60 bytes): [0] material name CRC,
+// [1..21] the bone-name palette (0xffffffff = keep the previous batch's slot,
+// 0xfffffffe = end of list), the rest is runtime state.
+using SkinRecord = std::array<uint32_t, 24>;
 struct Skin {
     std::vector<uint32_t> meshes;
+    std::vector<std::vector<SkinRecord>> sets;  // one set per mesh, one record per batch
 };
 Skin parseSkinBody(const std::vector<uint8_t>& body);  // throws
 
@@ -97,6 +104,8 @@ struct Bone {
     uint32_t name = 0;        // CRC of the bone name ("Hips", "LeftHand", ...)
     uint32_t userDefine = 0;  // UserDefine_Z with the bone's commands, 0 = none
     std::array<float, 4> restQuat{};  // second rotation copy (bone +0x60), xyzw
+    std::array<float, 4> localQuat{};   // local rotation (xyzw), scale and translation
+    std::array<float, 3> localScale{}, localT{};
     std::array<float, 16> world{};    // world bind matrix, row-vector convention
     int32_t firstChild = -1, parent = -1, nextSibling = -1, prevSibling = -1;
 };
