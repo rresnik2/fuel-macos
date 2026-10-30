@@ -36,11 +36,11 @@ float soft2(float t) { return 0.5f + 0.5f * t * (2 - std::fabs(t)); }
 // S4 contrast of a clamped value, back to 0..1 (0x6a7ae0, 0x6a6650 tails).
 float s4c(float v) { return contrast4(2 * clamp01(v) - 1) * 0.5f + 0.5f; }
 
-// 0x6a57f0: 1 inside [lo, hi], 0 beyond `soft` outside it, linear between.
+// 0x6a57f0: 0 below lo - soft, a linear ramp up to lo, 1 on [lo, hi). Above hi the
+// engine computes (hi - x) / soft, clamped, so the upper edge is a hard cut (Observed asm).
 float band(float x, float lo, float hi, float soft) {
-    if (x < lo - soft || x > hi + soft) return 0;
+    if (x < lo - soft || x >= hi) return 0;
     if (x < lo) return (x - (lo - soft)) / soft;
-    if (x > hi) return (hi + soft - x) / soft;
     return 1;
 }
 
