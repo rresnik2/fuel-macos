@@ -31,6 +31,7 @@
 #import "renderer.h"
 #import "drive.h"
 #import <GameController/GameController.h>
+#include "audio/drive_audio.h"
 #include "core/races.hpp"
 #include "core/vehicle_params.hpp"
 #include <fstream>
@@ -75,6 +76,7 @@ struct Options {
     bool world = false;
     bool terrain = false;
     bool drive = false;
+    bool audioCheck = false;
     std::string race;
     float driveTime = 4.0f;
     bool haveAt = false;
@@ -153,6 +155,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--world") o.world = true;
         else if (a == "--terrain") o.terrain = true;
         else if (a == "--drive") { o.drive = true; o.terrain = true; }
+        else if (a == "--audio-check") o.audioCheck = true;
         else if (a == "--drive-time") o.driveTime = std::stof(next());
         else if (a == "--race") { o.race = next(); o.drive = true; o.terrain = true; }
         else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
@@ -518,6 +521,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     Garage* _garage;          // --drive: vehicles to switch between
     RaceSession* _race;       // --drive: the current race
     std::unique_ptr<DriveSession> _switched;  // a vehicle chosen with Tab
+    std::unique_ptr<fuel::DriveAudio> _audio; // --drive in a window: engine, tyre, wind, impact sounds
     NSTextField* _hud;        // --drive: speed, gear, race
     std::set<unsigned short> _keys;
     double _lastTime;
@@ -553,6 +557,10 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _streamer = streamer;
         _garage = garage;
         _race = race;
+        if (drive && garage && !garage->entries.empty()) {
+            _audio = std::make_unique<fuel::DriveAudio>();
+            [self loadAudio];
+        }
         if (drive) {
             _hud = [NSTextField labelWithString:@""];
             _hud.font = [NSFont monospacedDigitSystemFontOfSize:22 weight:NSFontWeightSemibold];
@@ -641,6 +649,15 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 - (void)keyUp:(NSEvent*)e { _keys.erase(e.keyCode); }
 
+// Builds the sound set of the garage's current vehicle.
+- (void)loadAudio {
+    AssemblyMode& am = *_garage->archives[_garage->entries[_garage->current].first];
+    am.index = _garage->entries[_garage->current].second;
+    const std::string name = am.variant().label;
+    const auto it = _garage->params.find(name);
+    if (it != _garage->params.end()) _audio->setVehicle(am.assembler->dpc(), name, it->second);
+}
+
 // Swaps in the next drivable vehicle where the current one stands.
 - (void)switchVehicle:(int)dir {
     const simd_float3 at = _drive->position();
@@ -660,6 +677,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         std::string err;
         if (!_renderer->setScene(_scene.parts, &err) && !err.empty()) std::fprintf(stderr, "fuelview: %s\n", err.c_str());
         if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics(), true);
+        if (_audio) [self loadAudio];
         return;
     }
 }
@@ -668,6 +686,10 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     if (_drive) {
         if ([self driveKey:e.keyCode]) {
             _keys.insert(e.keyCode);
+            return;
+        }
+        if (e.keyCode == 46 && _audio) {  // M: mute
+            _audio->toggleMute();
             return;
         }
         if (e.keyCode == 15) {  // R
@@ -760,6 +782,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     _cam.yaw += diff * std::min(1.0f, dt * 3.0f);
     _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
     const fuel::VehicleState st = _drive->state();
+    if (_audio) _audio->update(dt, st, in.throttle);
     self.window.title = [NSString stringWithFormat:@"FUEL — %s", _scene.variant.c_str()];
     const std::string raceLine = _race ? _race->hud(_drive->position()) : _scene.variant;
     _hud.stringValue = [NSString stringWithFormat:@"%s\n%3.0f km/h   gear %d   %5.0f rpm   %s", raceLine.c_str(), std::fabs(st.speedKmh),
@@ -972,6 +995,17 @@ int main(int argc, const char** argv) {
                     race->index = size_t(it - race->races.begin());
                     race->begin(*drive, streamer.get(), renderer);
                     std::printf("race %s: %zu targets; %zu races (N for the next)\n", race->race().name.c_str(), race->route.size(), race->races.size());
+                }
+                if (opt.audioCheck) {  // build sound sets for a few vehicles and print their layers
+                    std::vector<std::pair<const fuel::DpcFile*, std::string>> list;
+                    for (const char* want : {"QUAD_ROAD_2", "BUGGY_ROAD_2", "TRUCK_OFF_1", "BIKE_ROAD_3"})
+                        for (const auto& [ai, vi] : garage->entries) {
+                            AssemblyMode& am = *garage->archives[ai];
+                            if (am.assembler->variants()[vi].label == want) list.push_back({&am.assembler->dpc(), want});
+                        }
+                    const int bad = fuel::audioCheck(list, params);
+                    std::printf("audio check: %zu vehicles, %d problems\n", list.size(), bad);
+                    return bad ? 1 : 0;
                 }
                 if (std::getenv("FUEL_GARAGE_CHECK")) {  // build and drive every vehicle briefly
                     int ok = 0;

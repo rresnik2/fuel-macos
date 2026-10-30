@@ -68,6 +68,7 @@ struct VehicleState {
     float rpm = 0;
     int gear = 0;
     int wheelsOnGround = 0;
+    float skid = 0;  // 0..1: how hard the tyres slide or spin (average over wheels on the ground)
 };
 
 class DriveWorld {
