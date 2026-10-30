@@ -1190,9 +1190,9 @@ int main(int argc, const char** argv) {
         VehicleLook look;
         std::unique_ptr<AssemblyMode> assembly;
         std::unique_ptr<DriveSession> drive;
-        std::unique_ptr<WorldStreamer> streamer;
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
+        std::unique_ptr<WorldStreamer> streamer;  // after what its worker reads, so it is destroyed (and waits) first
         std::unique_ptr<Garage> garage;
         std::unique_ptr<RaceSession> race;
         if (opt.drive && opt.assemble.empty()) die("--drive needs --assemble VARIANT");
