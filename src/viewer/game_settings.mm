@@ -28,7 +28,7 @@ void applyWindowSettings(const fuel::Settings& s, NSWindow* window, MTKView* vie
     // A resolution below the screen's renders at that size and is scaled up.
     const NSSize screenPx = [window.screen convertRectToBacking:window.screen.frame].size;
     if (s.width > 0 && s.height > 0 && (s.width < screenPx.width || s.height < screenPx.height)) {
-        view.autoResizeDrawableSize = NO;
+        view.autoResizeDrawable = NO;
         view.drawableSize = CGSizeMake(s.width, s.height);
     }
 }
