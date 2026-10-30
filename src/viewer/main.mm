@@ -30,6 +30,7 @@
 
 #import "renderer.h"
 #import "drive.h"
+#import "recorder.h"
 #include "rider_view.h"
 #import <GameController/GameController.h>
 #include "audio/drive_audio.h"
@@ -69,6 +70,8 @@ constexpr MTLPixelFormat kColorFormat = fuel::kRenderColorFormat;
 constexpr MTLPixelFormat kDepthFormat = fuel::kRenderDepthFormat;
 constexpr NSUInteger kSamples = 4;
 
+fuel::Recorder gRecorder;  // --record
+
 struct Options {
     std::string dataDir;
     std::vector<std::string> dpcs;
@@ -100,6 +103,7 @@ struct Options {
     bool havePaint = false;
     int paint[3] = {60, 60, 60};
     bool noRider = false;
+    std::string record;  // --record DIR: frame log and grabs of a window session
 };
 
 // Paint and liveries available for the chosen vehicle.
@@ -178,6 +182,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--no-cull") o.cull = false;
         else if (a == "--dirt") o.dirt = std::stof(next());
         else if (a == "--no-rider") o.noRider = true;
+        else if (a == "--record") o.record = next();
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
         else if (a == "--color") o.color = std::stoi(next());
@@ -774,6 +779,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     double _lastTime;
     float _steer;             // smoothed keyboard steering
     float _camYawOffset;      // mouse look around the chase camera
+    fuel::Recorder::Frame _frame;  // --record: this frame's timings
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -837,6 +843,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         self.sampleCount = kSamples;
         self.clearColor = clearColor();
         self.delegate = self;
+        if (gRecorder.active()) self.framebufferOnly = NO;  // frame grabs read the drawable
     }
     return self;
 }
@@ -944,6 +951,10 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
             _keys.insert(e.keyCode);
             return;
         }
+        if (e.keyCode == 40 && gRecorder.active()) {  // K: mark a glitch in the recording
+            gRecorder.mark("MARK");
+            return;
+        }
         if (e.keyCode == 46 && _audio) {  // M: mute
             _audio->toggleMute();
             return;
@@ -1026,8 +1037,11 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         in.handbrake = in.handbrake || pad.buttonX.pressed;
         if (pad.buttonY.pressed) _drive->reset();
     }
+    _frame.dt = dt;
+    double t0 = CACurrentMediaTime();
     if (_race) _race->update(dt, *_drive, in);
     _drive->update(dt, in);
+    _frame.physicsMs = (CACurrentMediaTime() - t0) * 1000.0;
     if (_race) {
         _renderer->setMarkers(_race->markers());
         if (_race->state == RaceSession::Finished && !_race->reported) {
@@ -1036,7 +1050,9 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         }
     }
     showOpponents(*_drive, *_renderer);
+    t0 = CACurrentMediaTime();
     if (_streamer) _streamer->update(_drive->position(), *_renderer, _drive->physics());
+    _frame.streamMs = (CACurrentMediaTime() - t0) * 1000.0;
     _renderer->setInstanceWorlds(_drive->partWorlds());
     _renderer->setFocus(_drive->position());
     // Chase camera: swing behind the vehicle, mouse look decays back.
@@ -1045,6 +1061,12 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     _cam.yaw += diff * std::min(1.0f, dt * 3.0f);
     _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
     const fuel::VehicleState st = _drive->state();
+    _frame.speedKmh = std::fabs(st.speedKmh);
+    _frame.gear = st.gear;
+    _frame.wheelsOnGround = st.wheelsOnGround;
+    _frame.vehicles = _drive->vehicleCount();
+    const simd_float3 at = _drive->position();
+    _frame.x = at.x, _frame.y = at.y, _frame.z = at.z;
     if (_audio) _audio->update(dt, st, in.throttle);
     for (size_t k = 0; k < _rivalAudio.size() && int(k) + 1 < _drive->vehicleCount(); ++k) {
         // Quiet, and only within ~150 m (no panning).
@@ -1068,10 +1090,17 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         [cb commit];
         return;
     }
+    const double t0 = CACurrentMediaTime();
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     const CGSize s = view.drawableSize;
     _renderer->encode(enc, s.height > 0 ? float(s.width / s.height) : 1.0f, _cam);
     [enc endEncoding];
+    if (gRecorder.active()) {
+        _frame.encodeMs = (CACurrentMediaTime() - t0) * 1000.0;
+        gRecorder.watchGpu(cb);
+        if (gRecorder.frame(_frame)) gRecorder.grab(cb, view.currentDrawable.texture);
+        _frame = {};
+    }
     [cb presentDrawable:view.currentDrawable];
     [cb commit];
 }
@@ -1465,6 +1494,15 @@ int main(int argc, const char** argv) {
                                                                  NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
                                                          backing:NSBackingStoreBuffered
                                                            defer:NO];
+        if (!opt.record.empty()) {
+            if (!gRecorder.open(opt.record)) die("cannot write to " + opt.record);
+            if (std::FILE* f = std::fopen((opt.record + "/command.txt").c_str(), "w")) {
+                for (int i = 0; i < argc; ++i) std::fprintf(f, "%s%s", i ? " " : "", argv[i]);
+                std::fprintf(f, "\n");
+                std::fclose(f);
+            }
+            std::printf("recording to %s (press K to mark a glitch)\n", opt.record.c_str());
+        }
         FuelView* view = [[FuelView alloc] initWithFrame:frame
                                                   device:device
                                                 renderer:&renderer
