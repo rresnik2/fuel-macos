@@ -129,6 +129,7 @@ public:
     ~WorldStreamer() {
         if (job_.valid()) job_.wait();
         if (grassJob_.valid()) grassJob_.wait();
+        if (tileJob_.valid()) tileJob_.wait();
     }
     size_t placementCount() const { return placed_.size(); }
     // Procedural trees and bushes (drawn; tree trunks solid within kCollideRadius).
@@ -227,6 +228,19 @@ private:
     };
     GrassJob buildGrass(simd_float3 player, GrassCache cache) const;
     void updateGrass(simd_float3 player, fuel::MeshRenderer& renderer, bool force);
+    // Fine ground colour around the player (MeshRenderer::setGroundTile): FUEL colours its
+    // terrain per vertex, 1 m apart near the camera, finer than the 60 m colour map.
+    struct GroundTile {
+        int level = 0;
+        double originX = 0, originZ = 0;
+        float extent = 0;
+        std::vector<uint8_t> rgba;
+    };
+    static constexpr float kTileSpacing[2] = {1.0f, 4.0f}, kTileStep[2] = {48.0f, 192.0f};  // rebuilt after this much travel
+    GroundTile buildGroundTile(int level, simd_float3 player) const;
+    void updateGroundTiles(simd_float3 player, fuel::MeshRenderer& renderer, bool force);
+    std::future<GroundTile> tileJob_;
+    simd_float2 tileAt_[2] = {{1e30f, 1e30f}, {1e30f, 1e30f}};
     GrassCache grassCache_;  // handed to the worker and back, never shared
     std::future<GrassJob> grassJob_;
     simd_float3 grassAt_ = {1e30f, 0, 1e30f};

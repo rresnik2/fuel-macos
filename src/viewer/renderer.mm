@@ -48,6 +48,7 @@ struct FrameUniforms {
     float4 camUp;
     float4 groundFar;     // rgb: far-band forest colour (palette 57, linear); w = 1 when the colour map is
                           // FUEL's decoded point colour (alpha = forest weight), 0 for the old heuristic map
+    float4 groundFine[2]; // fine colour tiles around the player: origin x, z, extent, w = 1 when loaded
 };
 
 struct MaterialUniforms {
@@ -355,10 +356,26 @@ vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[
     return o;
 }
 
+// The 60 m colour map refined by the fine tiles around the player (4 m, then 1 m texels),
+// each fading out over the outer eighth of its square. FUEL colours its terrain per
+// vertex: 1 m apart in the 24 m chunks near the camera, coarser further out.
+float4 groundColourAt(float2 xz, float4 gc, texture2d_array<float> fine, constant FrameUniforms& f) {
+    constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    for (int l = 1; l >= 0; --l) {
+        const float4 t = f.groundFine[l];
+        if (t.w <= 0.0) continue;
+        const float2 u = (xz - t.xy) / t.z;
+        const float edge = min(min(u.x, 1.0 - u.x), min(u.y, 1.0 - u.y));
+        const float w = saturate(edge * 8.0);
+        if (w > 0.0) gc = mix(gc, fine.sample(lin, u, uint(l)), w);
+    }
+    return gc;
+}
+
 fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
                           texture2d<float> hm [[texture(0)]], texture2d<float> groundColour [[texture(1)]],
                           texture2d<uint> groundSurface [[texture(2)]], texture2d_array<float> detail [[texture(3)]],
-                          depth2d<float> shadowMap [[texture(7)]]) {
+                          texture2d_array<float> groundFine [[texture(4)]], depth2d<float> shadowMap [[texture(7)]]) {
     float e = f.terrain.z;
     float2 xz = in.world.xz;
     float hl = terrainHeight(hm, xz - float2(e, 0), f), hr = terrainHeight(hm, xz + float2(e, 0), f);
@@ -378,7 +395,7 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
         float2 uv = (xz + 70000.0) / 140000.0;
-        const float4 gc = groundColour.sample(lin, uv);
+        const float4 gc = groundColourAt(xz, groundColour.sample(lin, uv), groundFine, f);
         // Decoded map (p16): the point colour ctx+0x70 as is; the heuristic map gets the old grade.
         c = f.groundFar.w > 0.0 ? gc.rgb : groundGrade(gc.rgb);
         const float2 warp = float2(xz.x + 5.0 * sin(0.02 * xz.y) + 2.0 * sin(0.2 * xz.y),
@@ -823,6 +840,7 @@ struct FrameUniforms {
     simd_float4 camRight;
     simd_float4 camUp;
     simd_float4 groundFar;
+    simd_float4 groundFine[2];
 };
 
 namespace {
@@ -1076,6 +1094,16 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
     groundFar_ = simd_make_float4(srgbToLinear(maps.farColour[0]), srgbToLinear(maps.farColour[1]), srgbToLinear(maps.farColour[2]),
                                   maps.decoded ? 1.0f : 0.0f);
     [groundColour_ replaceRegion:MTLRegionMake2D(0, 0, maps.size, maps.size) mipmapLevel:0 withBytes:maps.colour.data() bytesPerRow:maps.size * 4];
+    {
+        MTLTextureDescriptor* fd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                      width:kGroundTile
+                                                                                     height:kGroundTile
+                                                                                  mipmapped:YES];
+        fd.textureType = MTLTextureType2DArray;
+        fd.arrayLength = 2;
+        groundFine_ = [device_ newTextureWithDescriptor:fd];
+        groundFineRect_[0] = groundFineRect_[1] = simd_make_float4(0, 0, 1, 0);
+    }
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:maps.size height:maps.size mipmapped:NO];
     groundSurface_ = [device_ newTextureWithDescriptor:td];
     [groundSurface_ replaceRegion:MTLRegionMake2D(0, 0, maps.size, maps.size) mipmapLevel:0 withBytes:maps.surface.data() bytesPerRow:maps.size];
@@ -1706,6 +1734,8 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
     fu.fog = simd_make_float4(terrain ? 1.0f / 3600.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, zn, zf / (zn - zf));
+    fu.groundFine[0] = groundFineRect_[0];
+    fu.groundFine[1] = groundFineRect_[1];
     fu.groundFar = groundFar_;
     fu.sunDir = simd_make_float4(sunDir_, 4.2f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
@@ -1794,6 +1824,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             [enc setFragmentTexture:groundColour_ atIndex:1];
             [enc setFragmentTexture:groundSurface_ atIndex:2];
             [enc setFragmentTexture:groundDetail_ atIndex:3];
+            [enc setFragmentTexture:groundFine_ atIndex:4];
         }
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:terrainIndexCount_
@@ -1984,6 +2015,24 @@ void MeshRenderer::createGrassPipeline() {
     grassPipeline_ = [device_ newRenderPipelineStateWithDescriptor:d error:&e];
     if (grassPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
     grassEpoch_ = std::chrono::steady_clock::now();
+}
+
+
+void MeshRenderer::setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba) {
+    if (groundFine_ == nil || level < 0 || level > 1 || rgba.size() != size_t(kGroundTile) * kGroundTile * 4) return;
+    [groundFine_ replaceRegion:MTLRegionMake2D(0, 0, kGroundTile, kGroundTile)
+                   mipmapLevel:0
+                         slice:NSUInteger(level)
+                     withBytes:rgba.data()
+                   bytesPerRow:kGroundTile * 4
+                 bytesPerImage:0];
+    if (blitQueue_ == nil) blitQueue_ = [device_ newCommandQueue];
+    id<MTLCommandBuffer> cb = [blitQueue_ commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit generateMipmapsForTexture:groundFine_];
+    [blit endEncoding];
+    [cb commit];
+    groundFineRect_[level] = simd_make_float4(float(originX), float(originZ), extent, 1);
 }
 
 void MeshRenderer::setGrassAtlas(uint32_t bitmapId) {

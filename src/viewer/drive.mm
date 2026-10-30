@@ -4,6 +4,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <thread>
 
 #include "core/resources.hpp"
 #include "core/surface.hpp"
@@ -532,6 +533,7 @@ void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorl
 
 void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force) {
     updateGrass(player, renderer, force);
+    updateGroundTiles(player, renderer, force);
     pollBackground(renderer, physics);
     if (!force && simd_distance(player, last_) < 40.0f) {
         updateProps(renderer, physics, false);
@@ -764,4 +766,54 @@ void WorldStreamer::updateGrass(simd_float3 player, fuel::MeshRenderer& renderer
         return;
     }
     grassJob_ = std::async(std::launch::async, [this, player, cache = std::move(grassCache_)]() mutable { return buildGrass(player, std::move(cache)); });
+}
+
+// ---- Fine ground colour ----
+
+WorldStreamer::GroundTile WorldStreamer::buildGroundTile(int level, simd_float3 player) const {
+    constexpr uint32_t n = fuel::MeshRenderer::kGroundTile;
+    const double sp = kTileSpacing[level], extent = sp * n;
+    // Snap to 16 texels so a rebuilt tile lines up with the last one.
+    const double snap = 16 * sp;
+    GroundTile t{level, std::round(player.x / snap) * snap - extent / 2, std::round(player.z / snap) * snap - extent / 2, float(extent),
+                 std::vector<uint8_t>(size_t(n) * n * 4)};
+    const auto t0 = std::chrono::steady_clock::now();
+    // Two threads: more starve physics and streaming on the main thread (4 performance cores).
+    constexpr unsigned threads = 2;
+    std::vector<std::thread> pool;
+    for (unsigned k = 0; k < threads; ++k)
+        pool.emplace_back([&, k] {
+            for (uint32_t j = k; j < n; j += threads)
+                for (uint32_t i = 0; i < n; ++i) {
+                    const double x = t.originX + (i + 0.5) * sp, z = t.originZ + (j + 0.5) * sp;
+                    const fuel::GroundPoint p = ground_->at(x, z);
+                    // The 6 m palette-half noise is taken at the point (1 m) or averaged over the texel (4 m).
+                    const fuel::GroundColours c = ground_->colours(x, z, p, level == 0 ? -1.0f : ground_->meanT0(x, z, sp, 2));
+                    uint8_t* px = &t.rgba[(size_t(j) * n + i) * 4];
+                    for (int q = 0; q < 3; ++q) px[q] = uint8_t(std::clamp(c.base[q], 0.0f, 1.0f) * 255.0f + 0.5f);
+                    px[3] = uint8_t(std::clamp(c.forest, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+        });
+    for (auto& th : pool) th.join();
+    if (std::getenv("FUEL_STREAM_TRACE"))
+        std::printf("ground tile %d: %.0f m at (%.0f, %.0f) in %.1f ms\n", level, extent, t.originX, t.originZ,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return t;
+}
+
+void WorldStreamer::updateGroundTiles(simd_float3 player, fuel::MeshRenderer& renderer, bool force) {
+    if (ground_ == nullptr || !ground_->hasPalette()) return;
+    auto apply = [&](GroundTile&& t) { renderer.setGroundTile(t.level, t.originX, t.originZ, t.extent, t.rgba); };
+    if (tileJob_.valid() && (force || tileJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) apply(tileJob_.get());
+    if (tileJob_.valid()) return;
+    for (int level = 0; level < 2; ++level) {
+        if (std::hypot(player.x - tileAt_[level].x, player.z - tileAt_[level].y) < kTileStep[level]) continue;
+        tileAt_[level] = simd_make_float2(player.x, player.z);
+        if (force) {
+            apply(buildGroundTile(level, player));
+            continue;
+        }
+        tileJob_ = std::async(std::launch::async, [this, level, player] { return buildGroundTile(level, player); });
+        return;  // one tile at a time
+    }
 }

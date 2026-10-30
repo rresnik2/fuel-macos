@@ -170,6 +170,11 @@ public:
     // ---- Grass tufts (p14): FUEL's 1 m-grid grass cards (core/ground_point.hpp).
     void setGrassAtlas(uint32_t bitmapId);                 // the Grass material's 4x4 atlas
     void setGrass(const std::vector<GrassTuft>& tufts);    // replaces the list
+    // Fine ground colour around the player (level 0: 1 m, level 1: 4 m texels), kGroundTile
+    // texels per side, sRGB RGBA8 like the colour map (alpha = far-band forest weight); the
+    // terrain blends it over the 60 m map. `originX/Z` = world position of texel (0, 0)'s corner.
+    static constexpr uint32_t kGroundTile = 256;
+    void setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba);
     float grassRadius = 60.0f;                             // tufts shrink away towards it
 
     // Renders a frame into `target` (kOutputColorFormat, single-sample, any size):
@@ -272,6 +277,9 @@ private:
     std::vector<std::pair<id<MTLTexture>, RoadBatch>> roadBatches_;
     id<MTLDepthStencilState> depthAlways_;
     id<MTLTexture> heightTex_, groundColour_, groundSurface_, groundDetail_;
+    id<MTLTexture> groundFine_;  // 2-slice array (setGroundTile)
+    id<MTLCommandQueue> blitQueue_;  // mipmaps for the fine tiles
+    simd_float4 groundFineRect_[2] = {};  // origin x, z, extent, 1 when loaded
     simd_float4 groundFar_ = {0, 0, 0, 0};  // p16: far-band forest colour, w = decoded colour map
     id<MTLBuffer> terrainIndices_;
     uint32_t terrainIndexCount_ = 0;
