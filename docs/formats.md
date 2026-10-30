@@ -143,3 +143,45 @@ USA1.DPC. WorldRef_Z objects in USA1 give each sub-world's bounds.
 `EMD_SetCheckpoint x y z rx ry rz 1.0 flag` per checkpoint, in order.
 Rotations are Euler angles in radians; ry is roughly the heading. The
 scripts give no checkpoint width.
+
+## Skinning and the rider
+
+Every vehicle carries the same pilot, `IT_PILOT_SKIN` in
+`CommonComponent/DATAS/PILOT.DPC`. Its Lod_Z (`9a9c3e61`) lists one Skin_Z per
+LOD and, in its first pair list, `(slot, Animation_Z)` pairs. The Skin_Z names
+17 part meshes (Head1-9, Chest1-5, Legs1-3; the mesh link name is the CRC of
+the part name) and a 57-bone Skel_Z. The default rider draws Head1, Chest1 and
+Legs1.
+
+Skin_Z body, after the mesh list and per-bone tables: one set per mesh, one
+0x60-byte record per draw batch of that mesh. Record word 0 is the batch's
+material name; words 1-21 are a palette of bone-name CRCs for 21 slots, where
+`ffffffff` keeps the slot from the previous batch of the same mesh and
+`fffffffe` ends the list. Skinned vertices are 60 bytes (position, tangent and
+normal as D3DCOLOR at 12 and 16, uv at 20, four float blend indices at 28, four
+float weights at 44) or, for rigid helmets, 48 bytes (one index at 28, one
+weight at 44). A blend index is six times the palette slot (the original
+shaders spend six constant registers per bone). Vertices are in the model space
+of the bind pose, so a bone's skin matrix is `inverse(bind world) * pose world`
+(row-vector convention) and a vertex is the weighted sum over its bones.
+
+Skel_Z bones store local scale, rotation and translation in a 0xA0-byte block
+(quaternion at +0, scale at +0x10, translation at +0x20) plus the bind world
+matrix. A bone's local matrix is `Scale * Rotation * Translation` and its world
+matrix is `local * parent world`.
+
+Animation_Z: duration, then arrays of rotation keys (`f32 time`, four int16
+divided by 2000, xyzw), scale and translation keys (`f32 time`, three int16
+divided by 4096, plus tangents) and per-bone tracks (28 bytes: bone name CRC,
+then 16-bit start/count pairs into the translation, rotation and scale arrays).
+Bones without a track keep their bind transform. Animation slots come in
+blocks, one per vehicle archetype (the last word of `AddVehicleInfo` in
+VehiclesDef.tsc: for example QUAD, MBIKE_CHOPPER, BUGGY_ROAD, TRUCK); this port
+picks the neutral seated pose of the block (hips centred between the hands,
+both feet off the ground). The rider sits in the vehicle's own space, so it
+needs no offset.
+
+Livery: batch materials named `LIVERY_XX_<PART>` (and `LIVERY_XX_BODY` for the
+suit) take their diffuse and specular bitmaps (slots 0 and 4) from the
+Material_Z that the MaterialAnim_Z `LIVERY_<nn>_<PART>` points to (body +0x3C).
+The default rider uses livery 01 throughout.

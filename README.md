@@ -34,13 +34,18 @@ Early. What works today:
   races from the game's mission scripts: start line, ordered checkpoints shown
   as glowing beacons, laps, finish and a timer. N / Shift-N picks the next or
   previous race, Return restarts.
+- **The rider**: every vehicle in `--assemble` and `--drive` carries FUEL's
+  rider (default livery), skinned on the CPU into the seated pose of the
+  vehicle's archetype from the game's own animations and drawn with the
+  vehicle. The pose is static for now. `--no-rider` hides it. `fuelrider DATA
+  VARIANT [REF.obj]` bakes it and compares vertices with a reference export.
 - **`fuelscene`** lists the vehicle variants in an archive and prints how each
   one is assembled.
 - **`fuelcheck`**, a format checker. It decodes every texture, mesh and
   material in the game data and reports what parses (all of them, for the
   archive version the game loads).
 
-Next steps, roughly in order: knock-aside props, sound, AI opponents, ground textures and roads, the rider and skinning, streaming the world's objects and world streaming, then game
+Next steps, roughly in order: knock-aside props, sound, AI opponents, ground textures and roads, rider animation, streaming the world's objects and world streaming, then game
 logic, audio, video and input. See `docs/formats.md` for the file formats
 decoded so far.
 
