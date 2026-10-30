@@ -32,6 +32,8 @@
 #import "drive.h"
 #import "recorder.h"
 #include "rider_view.h"
+#include "hubcheck.h"
+#include "core/hubs.hpp"
 #import <GameController/GameController.h>
 #include "audio/drive_audio.h"
 #include "core/races.hpp"
@@ -70,6 +72,8 @@ constexpr MTLPixelFormat kColorFormat = fuel::kOutputColorFormat;
 constexpr NSUInteger kSamples = 4;  // the scene's MSAA
 
 fuel::Recorder gRecorder;  // --record
+std::vector<fuel::Hub> gHubs;  // the 19 hubs (--hub, --hub-check, the T key)
+const fuel::Heightfield* gTerrain = nullptr;  // for the T key
 
 struct Options {
     std::string dataDir;
@@ -88,7 +92,9 @@ struct Options {
     bool aiCheck = false;  // --ai-check: race headless and report the opponents' progress
     float driveTime = 4.0f;
     bool haveAt = false;
-    float atX = 0, atZ = 0;
+    float atX = 0, atZ = 0, atYaw = 0;
+    std::string hub;       // --hub NAME: start at that hub's camp (free roam)
+    bool hubCheck = false;  // --hub-check: spawn at every hub point and report
     std::string assemble;
     int lod = 1;
     int width = 1600, height = 1000;
@@ -174,6 +180,8 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--opponents") o.opponents = std::clamp(std::stoi(next()), 0, 11);
         else if (a == "--ai-check") o.aiCheck = true;
         else if (a == "--at") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.atX, &o.atZ) != 2) die("bad --at (use X,Z in metres)"); o.haveAt = true; o.terrain = true; }
+        else if (a == "--hub") { o.hub = next(); o.terrain = true; }
+        else if (a == "--hub-check") { o.hubCheck = true; o.drive = true; o.terrain = true; }
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
         else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
@@ -197,6 +205,11 @@ Options parseArgs(int argc, const char** argv) {
     }
     if (!o.assemble.empty() && (!o.scene.empty() || o.haveMeshId)) die("--assemble cannot be combined with --scene or --mesh");
     if (!o.assemble.empty() && !o.vehicle.empty()) die("with --assemble the paint follows the variant; drop --vehicle");
+    if (o.hubCheck) {  // headless: spawn everywhere and report
+        if (o.shot.empty()) o.shot = "-";
+        if (o.assemble.empty()) o.assemble = "QUAD_ROAD_2";
+        o.opponents = 0;
+    }
     if (o.propCheck && o.shot.empty()) o.shot = "-";  // headless: drive and report, no picture
     if (o.propCheck) o.opponents = 0;                  // the player alone among the props
     if (o.aiCheck) {
@@ -943,6 +956,21 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     }
 }
 
+// T / Shift-T: the nearest hub's next teleport / vista point (placed on a clear spot nearby).
+- (void)hubJump:(bool)vista {
+    static std::map<std::string, size_t> next;  // per hub and kind: the point to visit next
+    const simd_float3 at = _drive->position();
+    const fuel::Hub* h = fuel::nearestHub(gHubs, at.x, at.z);
+    if (h == nullptr) return;
+    const auto& list = vista ? h->vistas : h->teleports;
+    if (list.empty() || gTerrain == nullptr) return;
+    size_t& k = next[h->id + (vista ? "/v" : "/t")];
+    const fuel::HubPoint& p = list[k % list.size()];
+    k = (k + 1) % list.size();
+    const HubSpawn s = placeAtHubPoint(*_drive, *_streamer, *_renderer, *gTerrain, p);
+    std::printf("%s: %s at (%.0f, %.0f)%s\n", vista ? "vista" : "teleport", p.name.c_str(), s.x, s.z, s.nudged ? " (nudged)" : "");
+}
+
 - (void)keyDown:(NSEvent*)e {
     if (_drive) {
         if ([self driveKey:e.keyCode]) {
@@ -959,6 +987,10 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
         }
         if (e.keyCode == 15) {  // R
             _drive->reset();
+            return;
+        }
+        if (e.keyCode == 17 && !gHubs.empty() && _streamer && !_race) {  // T: next teleport of the nearest hub (Shift-T: next vista point)
+            [self hubJump:(e.modifierFlags & NSEventModifierFlagShift) != 0];
             return;
         }
         if (_race && (e.keyCode == 45 || e.keyCode == 36)) {  // N (Shift-N back): another race; Return: restart
@@ -1109,7 +1141,23 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
 
 int main(int argc, const char** argv) {
     @autoreleasepool {
-        const Options opt = parseArgs(argc, argv);
+        Options opt = parseArgs(argc, argv);
+        if (!opt.hub.empty() || opt.hubCheck || (opt.drive && opt.shot.empty())) {  // hubs: --hub, --hub-check and the T key
+            try {
+                gHubs = fuel::loadHubs(opt.dataDir);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "fuelview: hubs: %s\n", e.what());
+            }
+        }
+        if (!opt.hub.empty()) {
+            const fuel::Hub* h = fuel::findHub(gHubs, opt.hub);
+            if (h == nullptr) {
+                std::string list;
+                for (const fuel::Hub& x : gHubs) list += " \"" + x.id + "\"";
+                die("no hub '" + opt.hub + "'; hubs:" + list);
+            }
+            opt.atX = h->camp.x, opt.atZ = h->camp.z, opt.atYaw = h->camp.yaw, opt.haveAt = true;
+        }
 
         fuel::ResourceLibrary library;
         for (const std::string& rel : opt.dpcs) {
@@ -1153,6 +1201,7 @@ int main(int argc, const char** argv) {
                 fuel::DpcFile usa1(world.string());
                 terrain = std::make_unique<fuel::Heightfield>(fuel::loadLevelledHeightfield(usa1));
                 renderer.setTerrain(*terrain);
+                gTerrain = terrain.get();
                 gGround = fuel::buildGroundMaps(usa1, *terrain, 2334);
                 renderer.setGround(gGround, usa1);
                 gSurfaces.ground = &gGround;
@@ -1230,7 +1279,7 @@ int main(int argc, const char** argv) {
                     const fuel::AssembledVehicle av = assembly->assembler->assemble(assembly->variant(), assembly->lod);
                     const fuel::VehicleSetup setup = fuel::makeVehicleSetup(subject, name, it->second, assembledHubs(av));
                     drive = std::make_unique<DriveSession>(av, setup, *terrain, opt.haveAt ? opt.atX : -51358.0, opt.haveAt ? opt.atZ : -30043.0,
-                                                           0.0f, riders ? riders->parts(name) : std::vector<uint32_t>{});
+                                                           opt.haveAt ? opt.atYaw : 0.0f, riders ? riders->parts(name) : std::vector<uint32_t>{});
                 } catch (const std::exception& e) {
                     die(name + ": " + e.what());
                 }
@@ -1324,6 +1373,12 @@ int main(int argc, const char** argv) {
                     garage->archives.push_back(std::move(am));
                 }
                 std::printf("garage: %zu drivable variants (Tab to switch)\n", garage->entries.size());
+                if (!opt.hub.empty()) {  // free roam: on the camp, or the nearest clear spot
+                    const fuel::HubPoint camp{"", opt.atX, opt.atZ, opt.atYaw};
+                    const HubSpawn s = placeAtHubPoint(*drive, *streamer, renderer, *terrain, camp);
+                    std::printf("hub %s: camp at (%.0f, %.0f) heading %.0f%s\n", opt.hub.c_str(), s.x, s.z, s.yaw * 57.2958f, s.nudged ? " (nudged to a clear spot)" : "");
+                }
+                if (opt.hubCheck) return runHubCheck(gHubs, *drive, *streamer, renderer, *terrain);
                 if (!opt.race.empty()) {
                     race = std::make_unique<RaceSession>();
                     race->races = loadRaces(opt.dataDir);

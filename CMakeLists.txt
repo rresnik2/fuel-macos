@@ -53,6 +53,7 @@ add_executable(fuelview
   src/viewer/renderer.mm
   src/viewer/drive.mm
   src/viewer/recorder.mm
+  src/viewer/hubcheck.mm
   src/audio/drive_audio.mm
 )
 target_compile_options(fuelview PRIVATE -fobjc-arc)
