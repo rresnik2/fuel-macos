@@ -16,8 +16,9 @@
 class DriveSession {
 public:
     // Builds the physics vehicle for `vehicle`'s parts and places it at (x, z).
+    // `riders`: extra meshes (the baked rider, in vehicle space) that follow the chassis.
     DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain, double x,
-                 double z, float yaw);
+                 double z, float yaw, const std::vector<uint32_t>& riders = {});
 
     // The parts in vehicle space, for MeshRenderer::setScene.
     const std::vector<fuel::MeshInstance>& parts() const { return parts_; }

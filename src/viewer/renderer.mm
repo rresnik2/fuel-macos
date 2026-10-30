@@ -850,7 +850,7 @@ id<MTLTexture> MeshRenderer::texture(uint32_t bitmapId, bool srgb, uint8_t* alph
     return result;
 }
 
-MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId) {
+MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId, uint32_t diffuseOverride, uint32_t specularOverride) {
     GpuMaterial gm;
     gm.textures.fill(white_);
     auto hit = library_.find(materialId, cls::Material);
@@ -858,7 +858,9 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId) {
     try {
         const auto body = hit.file->body(*hit.entry);
         if (!body) return gm;
-        const Material m = parseMaterialBody(*body);
+        Material m = parseMaterialBody(*body);
+        if (diffuseOverride) m.textures[kDiffuse] = diffuseOverride;
+        if (specularOverride) m.textures[kSpecular] = specularOverride;
         const std::vector<uint8_t> link = hit.file->link(*hit.entry);
         uint32_t name = 0;
         if (link.size() >= 4) std::memcpy(&name, link.data(), 4);
@@ -916,6 +918,7 @@ void MeshRenderer::setPaint(const Paint& paint) {
 }
 
 const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string* error) {
+    if (auto it = bakedMeshes_.find(meshId); it != bakedMeshes_.end()) return it->second.get();
     if (auto it = meshes_.find(meshId); it != meshes_.end()) return it->second.get();
     auto hit = library_.find(meshId, cls::Mesh);
     if (!hit) {
@@ -978,6 +981,49 @@ const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string
     gm->boundsMin = simd_make_float3(stats.boundsMin[0], stats.boundsMin[1], stats.boundsMin[2]);
     gm->boundsMax = simd_make_float3(stats.boundsMax[0], stats.boundsMax[1], stats.boundsMax[2]);
     return (meshes_[meshId] = std::move(gm)).get();
+}
+
+bool MeshRenderer::addBakedMesh(uint32_t key, const BakedMesh& mesh, std::string* error) {
+    if (mesh.vertices.empty() || mesh.indices.empty() || mesh.vertices.size() % BakedMesh::kStride != 0) {
+        *error = "empty baked mesh";
+        return false;
+    }
+    const uint32_t vertexCount = mesh.vertexCount();
+    for (uint32_t i : mesh.indices)
+        if (i >= vertexCount) {
+            *error = "baked mesh index out of range";
+            return false;
+        }
+    for (const BakedBatch& b : mesh.batches)
+        if (b.material >= mesh.materials.size() || uint64_t(b.firstIndex) + b.indexCount > mesh.indices.size()) {
+            *error = "baked mesh batch out of range";
+            return false;
+        }
+    auto gm = std::make_unique<GpuMesh>();
+    gm->vbs.push_back([device_ newBufferWithBytes:mesh.vertices.data() length:mesh.vertices.size() options:MTLResourceStorageModeShared]);
+    gm->vbStrides.push_back(BakedMesh::kStride);
+    gm->indices = [device_ newBufferWithBytes:mesh.indices.data() length:mesh.indices.size() * 4 options:MTLResourceStorageModeShared];
+    GpuMaterial none;
+    none.textures.fill(white_);
+    gm->materials.push_back(none);
+    for (const BakedMaterial& m : mesh.materials) gm->materials.push_back(makeMaterial(m.materialId, m.diffuseTex, m.specularTex));
+    for (const BakedBatch& b : mesh.batches) {
+        const uint32_t mat = b.material + 1;
+        if (gm->materials[mat].skip) continue;
+        gm->draws[uint32_t(gm->materials[mat].alpha)].push_back({0, b.firstIndex, b.indexCount, mat, false});
+        gm->triangles += b.indexCount / 3;
+    }
+    simd_float3 lo = simd_make_float3(1e30f, 1e30f, 1e30f), hi = -lo;
+    for (uint32_t i = 0; i < vertexCount; ++i) {
+        const auto p = mesh.position(i);
+        const simd_float3 v = simd_make_float3(p[0], p[1], p[2]);
+        lo = simd_min(lo, v);
+        hi = simd_max(hi, v);
+    }
+    gm->boundsMin = lo;
+    gm->boundsMax = hi;
+    bakedMeshes_[key] = std::move(gm);
+    return true;
 }
 
 bool MeshRenderer::setMesh(uint32_t meshId, std::string* error) {
