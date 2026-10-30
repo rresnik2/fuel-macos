@@ -8,6 +8,7 @@
 #pragma once
 
 #include "dpc.hpp"
+#include "surface.hpp"
 #include "terrain.hpp"
 
 #include <array>
@@ -23,6 +24,9 @@ struct Species {
 
 struct Vegetation {
     std::vector<Species> trees, bushes;
+    // Ground clutter prototypes: small plants for grassy ground, a rock cluster that,
+    // shrunk, makes stones on dirt and rock.
+    std::vector<uint32_t> tufts, stones;
     Raster forest, humidity;  // GenWorld maps 7 and 2
 };
 
@@ -38,5 +42,10 @@ Vegetation loadVegetation(const DpcFile& world);  // throws if the world has no 
 // with `impostors` they use the species' distant cards (bushes are skipped).
 void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, float z, float radius, std::vector<Plant>& out,
                    bool impostors = false, float inner = 0);
+
+// Dense, small ground detail (grass tufts, scrub, stones) within `radius` of (x, z),
+// picked by the surface type under each spot; none on roads or tarmac.
+void scatterClutter(const Vegetation& v, const Heightfield& terrain, const SurfaceQuery& surface, float x, float z, float radius,
+                    std::vector<Plant>& out);
 
 }  // namespace fuel

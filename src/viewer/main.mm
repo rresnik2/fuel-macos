@@ -1268,6 +1268,7 @@ int main(int argc, const char** argv) {
                         try {
                             vegetation = std::make_unique<fuel::Vegetation>(fuel::loadVegetation(*f));
                             streamer->setVegetation(vegetation.get(), terrain.get());
+                            streamer->setSurfaces([](double x, double z) { return gSurfaces.at(x, z); });
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
                             streamer->setRoads(roads.get());
                             gSurfaces.roads = roads.get();

@@ -213,6 +213,7 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         std::vector<fuel::Plant> plants;
         fuel::scatterPlants(*vegetation_, *terrain_, player.x, player.z, kPlantRadius, plants);
         fuel::scatterPlants(*vegetation_, *terrain_, player.x, player.z, kImpostorRadius, plants, true, kPlantRadius);
+        fuel::scatterClutter(*vegetation_, *terrain_, surfaces_, player.x, player.z, kClutterRadius, plants);
         bg.plants.reserve(plants.size());
         for (const fuel::Plant& p : plants) {
             const float c = std::cos(p.yaw) * p.scale, s = std::sin(p.yaw) * p.scale;

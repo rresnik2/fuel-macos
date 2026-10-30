@@ -93,6 +93,8 @@ public:
     size_t placementCount() const { return placed_.size(); }
     // Procedural trees and bushes within kPlantRadius (drawn, not solid).
     void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) { vegetation_ = v, terrain_ = terrain; }
+    // Surface types for ground clutter (grass tufts, stones); must be thread-safe.
+    void setSurfaces(fuel::SurfaceQuery q) { surfaces_ = std::move(q); }
     // Road ribbons within kRoadRadius (needs the terrain from setVegetation).
     void setRoads(const fuel::RoadNetwork* roads) { roads_ = roads; }
     // Call every frame; refreshes after the player has moved a little.
@@ -113,6 +115,8 @@ private:
     static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f, kPlantRadius = 700.0f, kImpostorRadius = 2500.0f;
     static constexpr float kPropRadius = 120.0f, kPropForget = 300.0f;  // dynamic within, state reset beyond
     const fuel::Vegetation* vegetation_ = nullptr;
+    fuel::SurfaceQuery surfaces_;
+    static constexpr float kClutterRadius = 150.0f;
     const fuel::RoadNetwork* roads_ = nullptr;
     static constexpr float kRoadRadius = 1200.0f;
     struct RoadMesh {
