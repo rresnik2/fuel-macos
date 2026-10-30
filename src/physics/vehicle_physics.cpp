@@ -187,10 +187,10 @@ VehicleSetup makeVehicleSetup(const DpcFile& dpc, const std::string& variant, co
     s.reverseGear = -std::fabs(param(vp::ReverseGear));
     s.finalDrive = param(vp::FinalDrive);
     s.topSpeedKmh = param(vp::TopSpeedKmh);
-    // FUEL's torque scale (P327) is in unknown units; size the engine for a
-    // lively 0.9 g launch in first gear instead.
+    // FUEL's torque scale (P327) is in unknown units; size the engine for an
+    // arcade 1.3 g launch in first gear instead (0.9 g felt sluggish).
     const float r = s.wheels.back().radius;
-    s.peakTorque = 0.9f * kGravity * s.mass * r / (s.finalDrive * s.gears[0]);
+    s.peakTorque = 1.3f * kGravity * s.mass * r / (s.finalDrive * s.gears[0]);
     return s;
 }
 
@@ -447,9 +447,14 @@ struct DriveWorld::Impl {
         cs->mEngine.mAngularDamping = s.peakTorque * 0.0004f;
         cs->mEngine.mInertia = std::max(0.02f, s.peakTorque * 0.002f);
         cs->mEngine.mNormalizedTorque.Clear();
-        for (int i = 0; i < 11; ++i)  // FUEL cuts torque to 0 at the limiter; keep a little so Jolt can hold redline
-            cs->mEngine.mNormalizedTorque.AddPoint(i * 0.1f, std::max(s.torqueCurve[size_t(i)], i == 10 ? 0.3f : 0.0f));
+        for (int i = 0; i < 11; ++i)  // FUEL cuts torque to 0 at the limiter; keep some so Jolt can hold redline
+            // and a floor so the mid-range pulls (the raw curves sag and the auto box lands there).
+            cs->mEngine.mNormalizedTorque.AddPoint(i * 0.1f, std::max(s.torqueCurve[size_t(i)], i == 10 ? 0.5f : i >= 2 ? 0.7f : 0.4f));
         cs->mTransmission.mMode = ETransmissionMode::Auto;
+        // Jolt's car defaults take ~0.8 s per shift with no drive; arcade shifts are near instant.
+        cs->mTransmission.mSwitchTime = 0.12f;
+        cs->mTransmission.mClutchReleaseTime = 0.08f;
+        cs->mTransmission.mSwitchLatency = 0.3f;
         cs->mTransmission.mClutchStrength = std::max(10.0f, s.peakTorque * 0.2f);  // grip in proportion to the engine
         cs->mTransmission.mGearRatios.clear();
         for (float g : s.gears) cs->mTransmission.mGearRatios.push_back(g);
