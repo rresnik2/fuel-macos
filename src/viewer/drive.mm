@@ -173,7 +173,6 @@ fuel::OrbitCamera ChaseCamera::update(float dt, const DriveSession& drive, float
     cam.yaw = yaw_;
     cam.pitch = std::atan2(up, back);
     cam.distance = std::hypot(back, up) / std::max(sceneRadius, 0.05f);
-    if (std::getenv("FUEL_CAM_TRACE")) std::printf("chase: radius %.2f back %.2f up %.2f fov %.0f\n", sceneRadius, back, up, cam.fovY * 57.3f);
     cam.fovY = (56.0f + 12.0f * fast) * float(M_PI) / 180.0f;
     cam.aim = base * 0.2f;
     return cam;

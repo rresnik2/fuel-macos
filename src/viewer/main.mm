@@ -724,12 +724,23 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     td.usage = MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModePrivate;
     id<MTLTexture> image = [device newTextureWithDescriptor:td];
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    renderer.render(cb, image, cam);
-    [cb commit];
-    [cb waitUntilCompleted];
-    writePng(device, queue, image, o.shot);
-    return (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    // FUEL_GPU_BENCH=N: render the frame N more times first and report the GPU time.
+    const int bench = std::getenv("FUEL_GPU_BENCH") ? std::max(0, std::atoi(std::getenv("FUEL_GPU_BENCH"))) : 0;
+    double total = 0, best = 1e9;
+    for (int k = 0; k <= bench; ++k) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        renderer.render(cb, image, cam);
+        [cb commit];
+        [cb waitUntilCompleted];
+        const double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        if (k == bench) {
+            if (bench > 0) std::printf("gpu bench %s: %d frames at %dx%d, mean %.2f ms, best %.2f ms\n", o.shot.c_str(), bench, o.width, o.height, total / bench, best);
+            writePng(device, queue, image, o.shot);
+            return ms;
+        }
+        total += ms, best = std::min(best, ms);
+    }
+    return 0;
 }
 
 }  // namespace
@@ -975,6 +986,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     if ([ch isEqualToString:@"c"]) _renderer->cullBackFaces = !_renderer->cullBackFaces;
     else if ([ch isEqualToString:@"w"]) _renderer->wireframe = !_renderer->wireframe;
     else if ([ch isEqualToString:@"r"]) _cam = fuel::OrbitCamera{};
+    else if ([ch isEqualToString:@"o"]) _renderer->postEffects = !_renderer->postEffects;
     else if ([ch isEqualToString:@"d"]) _renderer->dirt = _renderer->dirt >= 1.0f ? 0.0f : _renderer->dirt + 0.5f;
     else if ([ch isEqualToString:@"g"]) { _renderer->showGround = !_renderer->showGround; _renderer->showTerrain = !_renderer->showTerrain; }
     else if ([ch isEqualToString:@"q"]) [NSApp terminate:nil];
@@ -1131,6 +1143,7 @@ int main(int argc, const char** argv) {
         if (device == nil) die("no Metal device");
         if (!device.supportsBCTextureCompression) die("this GPU cannot sample DXT (BC) textures");
         fuel::MeshRenderer renderer(device, kSamples, library);
+        renderer.postEffects = std::getenv("FUEL_NO_POST") == nullptr;  // FUEL_NO_POST=1: plain tone mapping (O toggles in the window)
         renderer.cullBackFaces = opt.cull;
         renderer.dirt = std::clamp(opt.dirt, 0.0f, 1.0f);
         std::unique_ptr<fuel::Heightfield> terrain;
