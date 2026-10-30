@@ -214,10 +214,12 @@ public:
 
 private:
     const fuel::GroundGenerator* ground_ = nullptr;
-    // FUEL builds grass for decor chunks of at most 30 m (W+0x5af98); how far those reach
-    // was not decoded, so the radius is a guess. Rebuilt on a worker after kGrassStep of travel.
-    static constexpr float kGrassRadius = 60.0f, kGrassStep = 4.0f;
-    static constexpr int kGrassChunk = 16;  // metres; generated tufts are cached per chunk
+    // FUEL builds grass for decor chunks of at most 30 m (W+0x5af98), i.e. the 24 m leaves
+    // of the decor quadtree (decorChunkSize): they exist while the camera is within
+    // 2.0625 x 48 m of their parent's centre, so grass reaches 65..133 m depending on
+    // where the chunks fall. Rebuilt on a worker after kGrassStep of travel.
+    static constexpr float kGrassReach = 2.0625f * 48.0f + 24.0f * 1.4143f, kGrassStep = 4.0f;
+    static constexpr int kGrassChunk = 24;  // metres, FUEL's smallest decor chunk; tufts are cached per chunk
     using GrassCache = std::unordered_map<uint64_t, std::vector<fuel::GrassTuft>>;
     struct GrassJob {
         std::vector<fuel::GrassTuft> tufts;

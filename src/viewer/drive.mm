@@ -720,8 +720,8 @@ WorldStreamer::GrassJob WorldStreamer::buildGrass(simd_float3 player, GrassCache
     GrassJob job;
     const auto t0 = std::chrono::steady_clock::now();
     size_t built = 0;
-    const int32_t c0x = int32_t(std::floor((player.x - kGrassRadius) / kGrassChunk)), c1x = int32_t(std::floor((player.x + kGrassRadius) / kGrassChunk));
-    const int32_t c0z = int32_t(std::floor((player.z - kGrassRadius) / kGrassChunk)), c1z = int32_t(std::floor((player.z + kGrassRadius) / kGrassChunk));
+    const int32_t c0x = int32_t(std::floor((player.x - kGrassReach) / kGrassChunk)), c1x = int32_t(std::floor((player.x + kGrassReach) / kGrassChunk));
+    const int32_t c0z = int32_t(std::floor((player.z - kGrassReach) / kGrassChunk)), c1z = int32_t(std::floor((player.z + kGrassReach) / kGrassChunk));
     // Forget chunks well outside the radius.
     for (auto it = cache.begin(); it != cache.end();) {
         const int32_t cx = int32_t(uint32_t(it->first >> 32)), cz = int32_t(uint32_t(it->first));
@@ -730,10 +730,8 @@ WorldStreamer::GrassJob WorldStreamer::buildGrass(simd_float3 player, GrassCache
     }
     for (int32_t cz = c0z; cz <= c1z; ++cz)
         for (int32_t cx = c0x; cx <= c1x; ++cx) {
-            // Chunk centre distance (to its nearest point) against the radius.
-            const float nx = std::clamp(player.x, float(cx * kGrassChunk), float((cx + 1) * kGrassChunk));
-            const float nz = std::clamp(player.z, float(cz * kGrassChunk), float((cz + 1) * kGrassChunk));
-            if (std::hypot(nx - player.x, nz - player.z) > kGrassRadius) continue;
+            // Grass only where this 24 m chunk is a leaf of the decor quadtree.
+            if (decorChunkSize((cx + 0.5) * kGrassChunk, (cz + 0.5) * kGrassChunk, player.x, player.z) > 30.0) continue;
             const uint64_t key = (uint64_t(uint32_t(cx)) << 32) | uint32_t(cz);
             auto it = cache.find(key);
             if (it == cache.end()) {
@@ -754,7 +752,7 @@ void WorldStreamer::updateGrass(simd_float3 player, fuel::MeshRenderer& renderer
     if (ground_ == nullptr) return;
     auto apply = [&](GrassJob&& job) {
         grassCache_ = std::move(job.cache);
-        renderer.grassRadius = kGrassRadius;
+        renderer.grassRadius = kGrassReach;
         renderer.setGrass(job.tufts);
     };
     if (grassJob_.valid() && (force || grassJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) apply(grassJob_.get());
