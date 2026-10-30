@@ -141,6 +141,7 @@ private:
         uint32_t firstIndex = 0;
         uint32_t indexCount = 0;
         uint32_t material = 0;
+        bool sprite = false;  // camera-facing sprite batch
     };
     // GPU copy of one Mesh_Z, cached by ID.
     struct GpuMesh {

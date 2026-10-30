@@ -138,6 +138,15 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
                 solid.push_back({p.meshId, m});
             }
         }
+    if (vegetation_ && terrain_) {
+        std::vector<fuel::Plant> plants;
+        fuel::scatterPlants(*vegetation_, *terrain_, player.x, player.z, kPlantRadius, plants);
+        for (const fuel::Plant& p : plants) {
+            const float c = std::cos(p.yaw) * p.scale, s = std::sin(p.yaw) * p.scale;
+            draw.push_back({p.meshId, simd_matrix(simd_make_float4(c, 0, -s, 0), simd_make_float4(0, p.scale, 0, 0), simd_make_float4(s, 0, c, 0),
+                                                  simd_make_float4(p.position[0], p.position[1], p.position[2], 1))});
+        }
+    }
     renderer.setWorldInstances(draw);
     physics.setStaticObjects(solid);
 }

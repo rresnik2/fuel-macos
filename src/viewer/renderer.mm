@@ -25,6 +25,7 @@ struct VertexIn {
     float4 tangent  [[attribute(1)]];  // D3DCOLOR read as BGRA: xyz direction, w handedness
     float4 normal   [[attribute(2)]];
     float2 uv       [[attribute(3)]];
+    float2 corner   [[attribute(4)]];  // sprite batches: corner offset in metres (else uv1, unused)
 };
 
 struct FrameUniforms {
@@ -39,6 +40,8 @@ struct FrameUniforms {
     float4 terrain;       // origin x, origin z, sample spacing, metres per texel value 1.0
     float4 terrainGrid;   // grid centre x, z, radius, vertices per side
     float4 fog;           // x haze density per metre (0 = none), y = 1 when ground maps are loaded
+    float4 camRight;      // camera axes in world space, for sprites
+    float4 camUp;
 };
 
 struct MaterialUniforms {
@@ -126,13 +129,20 @@ float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float
 
 // Instanced: one world matrix per instance in buffer 2.
 vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
-                        const device float4x4* models [[buffer(2)]], uint iid [[instance_id]]) {
+                        const device float4x4* models [[buffer(2)]], constant uint& sprite [[buffer(3)]],
+                        uint iid [[instance_id]]) {
     const float4x4 model = models[iid];
     VertexOut o;
     o.m0 = model[0].xyz;
     o.m1 = model[1].xyz;
     o.m2 = model[2].xyz;
     float4 w = model * float4(in.position, 1.0);
+    if (sprite != 0) {
+        // Leaf and impostor sprites: all four corners share one position; expand
+        // them towards the camera by the stored offsets (scaled with the instance).
+        float scale = length(model[1].xyz);
+        w.xyz += (f.camRight.xyz * in.corner.x + f.camUp.xyz * in.corner.y) * scale;
+    }
     o.position = f.viewProj * w;
     o.world = w.xyz;
     o.normal = (model * float4(in.normal.xyz * 2.0 - 1.0, 0.0)).xyz;
@@ -393,6 +403,8 @@ struct FrameUniforms {
     simd_float4 terrain;
     simd_float4 terrainGrid;
     simd_float4 fog;
+    simd_float4 camRight;
+    simd_float4 camUp;
 };
 
 constexpr uint32_t kTerrainGridSize = 512;  // vertices per side
@@ -478,7 +490,9 @@ MTLVertexDescriptor* meshVertexDescriptor(uint32_t stride) {
     vd.attributes[2].offset = 16;
     vd.attributes[3].format = MTLVertexFormatFloat2;
     vd.attributes[3].offset = 20;
-    for (int i = 0; i < 4; ++i) vd.attributes[i].bufferIndex = 0;
+    vd.attributes[4].format = MTLVertexFormatFloat2;
+    vd.attributes[4].offset = 28;
+    for (int i = 0; i < 5; ++i) vd.attributes[i].bufferIndex = 0;
     vd.layouts[0].stride = stride;
     return vd;
 }
@@ -882,7 +896,12 @@ const MeshRenderer::GpuMesh* MeshRenderer::loadMesh(uint32_t meshId, std::string
         const uint32_t mat = b.material < mesh.materials.size() ? b.material + 1u : 0u;
         if (gm->materials[mat].skip) continue;
         const std::vector<uint32_t> tris = batchTriangles(mesh, b);
-        Draw d{b.vb, uint32_t(indices.size()), uint32_t(tris.size()), mat};
+        Draw d{b.vb, uint32_t(indices.size()), uint32_t(tris.size()), mat, false};
+        // Sprite batches (leaves, impostors): vertex type 7 whose triangle corners share a position.
+        if (b.vertexType == 7 && tris.size() >= 3) {
+            const VertexBuffer& vb = mesh.vbs[b.vb];
+            d.sprite = std::memcmp(&vb.data[size_t(tris[0]) * vb.stride], &vb.data[size_t(tris[1]) * vb.stride], 12) == 0;
+        }
         indices.insert(indices.end(), tris.begin(), tris.end());
         gm->draws[uint32_t(gm->materials[mat].alpha)].push_back(d);
         gm->triangles += uint32_t(tris.size() / 3);
@@ -1020,6 +1039,12 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     const float zf = terrain ? std::max(120000.0f, dist * 4.0f) : radius_ * 40.0f;
     fu.viewProj = simd_mul(perspectiveRH(0.70f, aspect, zn, zf), lookAtRH(eye, center_, simd_make_float3(0, 1, 0)));
     fu.invViewProj = simd_inverse(fu.viewProj);
+    {
+        const simd_float3 fwd = simd_normalize(center_ - eye);
+        const simd_float3 right = simd_normalize(simd_cross(fwd, simd_make_float3(0, 1, 0)));
+        fu.camRight = simd_make_float4(right, 0);
+        fu.camUp = simd_make_float4(simd_cross(right, fwd), 0);
+    }
     fu.sunViewProj = sunViewProj();
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
@@ -1052,6 +1077,8 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                 const GpuMaterial& m = gm.materials[d.material];
                 [enc setRenderPipelineState:pipeline(gm.vbStrides[d.vb], mode)];
                 [enc setVertexBuffer:gm.vbs[d.vb] offset:0 atIndex:0];
+                const uint32_t sprite = d.sprite ? 1u : 0u;
+                [enc setVertexBytes:&sprite length:sizeof sprite atIndex:3];
                 MaterialUniforms mu{m.diffuse, m.specular, m.emissive, m.fresnel, uint32_t(m.alpha), m.lit ? 1u : 0u, m.code,
                                     m.features};
                 [enc setFragmentBytes:&mu length:sizeof mu atIndex:2];

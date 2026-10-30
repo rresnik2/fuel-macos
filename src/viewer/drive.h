@@ -4,6 +4,7 @@
 #include <simd/simd.h>
 
 #include "core/assembly.hpp"
+#include "core/vegetation.hpp"
 #include "physics/vehicle_physics.hpp"
 #include "renderer.h"
 
@@ -48,11 +49,15 @@ class WorldStreamer {
 public:
     WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup);
     size_t placementCount() const { return placed_.size(); }
+    // Procedural trees and bushes within kPlantRadius (drawn, not solid).
+    void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) { vegetation_ = v, terrain_ = terrain; }
     // Call every frame; refreshes after the player has moved a little.
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
 
 private:
-    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f;
+    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f, kPlantRadius = 700.0f;
+    const fuel::Vegetation* vegetation_ = nullptr;
+    const fuel::Heightfield* terrain_ = nullptr;
     struct Placed {
         uint32_t meshId;
         std::array<float, 16> world;  // row-vector convention
