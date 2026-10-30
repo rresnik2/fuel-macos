@@ -128,6 +128,7 @@ public:
     WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup);
     ~WorldStreamer() {
         if (job_.valid()) job_.wait();
+        if (grassJob_.valid()) grassJob_.wait();
     }
     size_t placementCount() const { return placed_.size(); }
     // Procedural trees and bushes within kPlantRadius (drawn, not solid).
@@ -198,6 +199,28 @@ private:
     std::unordered_map<uint32_t, Prop> props_;
     std::unordered_map<uint32_t, float> meshRadius_;  // collision radius per mesh (-1: none)
     void updateProps(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool dirty);
+
+    // ---- Grass and the ground generator (p14) ----
+public:
+    // The decoded ground generator: grass tufts near the player and the trees' ground tests.
+    void setGround(const fuel::GroundGenerator* g) { ground_ = g; }
+
+private:
+    const fuel::GroundGenerator* ground_ = nullptr;
+    // FUEL builds grass for decor chunks of at most 30 m (W+0x5af98); how far those reach
+    // was not decoded, so the radius is a guess. Rebuilt on a worker after kGrassStep of travel.
+    static constexpr float kGrassRadius = 60.0f, kGrassStep = 4.0f;
+    static constexpr int kGrassChunk = 16;  // metres; generated tufts are cached per chunk
+    using GrassCache = std::unordered_map<uint64_t, std::vector<fuel::GrassTuft>>;
+    struct GrassJob {
+        std::vector<fuel::GrassTuft> tufts;
+        GrassCache cache;
+    };
+    GrassJob buildGrass(simd_float3 player, GrassCache cache) const;
+    void updateGrass(simd_float3 player, fuel::MeshRenderer& renderer, bool force);
+    GrassCache grassCache_;  // handed to the worker and back, never shared
+    std::future<GrassJob> grassJob_;
+    simd_float3 grassAt_ = {1e30f, 0, 1e30f};
     std::vector<const fuel::DpcFile*> lookup_;
     std::vector<Placed> placed_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cells_;

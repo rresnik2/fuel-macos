@@ -14,6 +14,7 @@
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
 #include "core/ground.hpp"
+#include "core/ground_point.hpp"
 #include "core/rider.hpp"
 #include "core/terrain.hpp"
 #include "core/vehicle.hpp"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <string>
@@ -165,6 +167,11 @@ public:
     // GPU time of the last completed frame, in milliseconds (0 until one finished).
     double lastGpuMs() const { return gpuMs_; }
 
+    // ---- Grass tufts (p14): FUEL's 1 m-grid grass cards (core/ground_point.hpp).
+    void setGrassAtlas(uint32_t bitmapId);                 // the Grass material's 4x4 atlas
+    void setGrass(const std::vector<GrassTuft>& tufts);    // replaces the list
+    float grassRadius = 60.0f;                             // tufts shrink away towards it
+
     // Renders a frame into `target` (kOutputColorFormat, single-sample, any size):
     // shadows, the scene in HDR with MSAA, dust, then the post chain.
     void render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const OrbitCamera& cam);
@@ -177,6 +184,14 @@ private:
     void ensureTargets(NSUInteger width, NSUInteger height);
     void encodeDust(id<MTLCommandBuffer> cb);
     void encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target);
+    // ---- Grass tufts (p14)
+    void createGrassPipeline();
+    void encodeGrass(id<MTLRenderCommandEncoder> enc);
+    id<MTLRenderPipelineState> grassPipeline_;
+    id<MTLBuffer> grassBuffer_;
+    id<MTLTexture> grassAtlas_;
+    size_t grassCount_ = 0;
+    std::chrono::steady_clock::time_point grassEpoch_;
 
     enum class AlphaMode : uint32_t { Opaque = 0, Test = 1, Blend = 2 };
     enum Feature : uint32_t {

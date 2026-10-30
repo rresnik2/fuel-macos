@@ -1,5 +1,7 @@
 #import "renderer.h"
 
+#include <chrono>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -673,6 +675,83 @@ fragment float4 fsComposite(FullOut in [[stage_in]], texture2d<float> hdr [[text
 }
 )METAL";
 
+// ---- Grass tufts (p14) -------------------------------------------------------
+// FUEL's Grass_EmitTuft (0x7dce50): a 5-vertex card (3 triangles) per tuft from a
+// cell of the Grass material's 4x4 atlas; 1.5 x size wide, size tall, facing the
+// camera around the vertical; the two upper-left vertices sway with the wind.
+// Appended to kShaderSource (it uses its helpers and FrameUniforms).
+const char* kGrassShaderSource = R"METAL(
+struct GrassInstance {
+    float4 posSize;  // base xyz, card height
+    uchar4 info;     // atlas cell, wind amplitude x 100, road weight x 255, unused
+};
+
+struct GrassParams {
+    float4 a;  // x time (s), y draw radius, z fade start, w wind strength
+};
+
+struct GrassOut {
+    float4 position [[position]];
+    float3 world;
+    float2 uv;
+    float3 tint;
+    float4 sunPos;
+};
+
+constant uint kGrassCorner[9] = {0, 1, 2, 0, 2, 3, 0, 3, 4};
+constant float2 kGrassOffset[5] = {float2(-0.75, 0), float2(-0.75, 0.5), float2(0, 1), float2(0.75, 0.5), float2(0.75, 0)};
+constant float2 kGrassUv[5] = {float2(0, 0.25), float2(0, 0.125), float2(0.125, 0), float2(0.25, 0.125), float2(0.25, 0.25)};
+
+vertex GrassOut vsGrass(uint vid [[vertex_id]], uint iid [[instance_id]], constant FrameUniforms& f [[buffer(1)]],
+                        const device GrassInstance* tufts [[buffer(2)]], constant GrassParams& g [[buffer(3)]],
+                        texture2d<float> groundColour [[texture(0)]]) {
+    const GrassInstance t = tufts[iid];
+    const uint c = kGrassCorner[vid];
+    const float3 base = t.posSize.xyz;
+    // Shrink into the ground towards the edge of the grass radius instead of popping.
+    const float dist = distance(base.xz, f.eye.xz);
+    const float size = t.posSize.w * (1.0 - smoothstep(g.a.z, g.a.y, dist));
+    float3 right = float3(f.camRight.x, 0.0, f.camRight.z);
+    right = dot(right, right) > 1e-6 ? normalize(right) : float3(1, 0, 0);
+    float3 w = base + right * (kGrassOffset[c].x * size) + float3(0, kGrassOffset[c].y * size, 0);
+    if (c == 1 || c == 2) {
+        // Engine wind weights: wb from sin(x+z) and sin(0.25(x+z)); amplitude (r/255+1)/2 x 2.25.
+        const float s = base.x + base.z;
+        const float wb = 0.25 * (sin(s) + 1.0) + 0.25 * (sin(0.25 * s) + 1.0);
+        const float amp = float(t.info.y) * 0.01 * size * g.a.w;
+        const float sway = wb * sin(g.a.x * 1.9 + s * 0.31) + (1.0 - wb) * sin(g.a.x * 1.3 + s * 0.17);
+        w += float3(0.8, 0.0, 0.6) * (sway * amp);
+    }
+    GrassOut o;
+    o.position = f.viewProj * float4(w, 1.0);
+    o.world = w;
+    const uint tile = t.info.x;
+    o.uv = float2(float(tile & 3u), float(tile >> 2u)) * 0.25 + kGrassUv[c];
+    o.tint = float3(1.0);
+    if (f.fog.y > 0.0) {
+        constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
+        o.tint = groundGrade(groundColour.sample(lin, (base.xz + 70000.0) / 140000.0, level(0)).rgb) * 2.0;
+    }
+    // The engine lerps two ground colours by the road weight; dirt tracks get drier grass.
+    o.tint = mix(o.tint, o.tint * float3(1.15, 1.0, 0.75), float(t.info.z) / 255.0);
+    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    return o;
+}
+
+fragment float4 fsGrass(GrassOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], texture2d<float> atlas [[texture(0)]],
+                        depth2d<float> shadowMap [[texture(7)]]) {
+    constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge, max_anisotropy(4));
+    float4 d = atlas.sample(smp, in.uv);
+    if (d.a < 0.4) discard_fragment();
+    const float lum = max(dot(in.tint, float3(0.3, 0.55, 0.15)), 1e-3);
+    d.rgb *= in.tint / lum * clamp(lum, 0.6, 1.0);
+    const float shadow = mix(0.55, 1.0, shadowFactor(shadowMap, in.sunPos));
+    const float3 V = normalize(f.eye.xyz - in.world);
+    const float3 rgb = lighting(d.rgb, float3(0, 1, 0), V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
+    return float4(haze(rgb, in.world, f), d.a);
+}
+)METAL";
+
 }  // namespace
 
 struct FrameUniforms {
@@ -803,7 +882,7 @@ ResourceLibrary::Hit ResourceLibrary::find(uint32_t id, uint32_t classCrc) const
 MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const ResourceLibrary& library)
     : device_(device), sampleCount_(sampleCount), library_(library) {
     NSError* err = nil;
-    shaders_ = [device newLibraryWithSource:@(kShaderSource) options:nil error:&err];
+    shaders_ = [device newLibraryWithSource:[NSString stringWithFormat:@"%s\n%s", kShaderSource, kGrassShaderSource] options:nil error:&err];
     if (shaders_ == nil) [NSException raise:@"shader" format:@"%@", err];
 
     MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
@@ -893,6 +972,7 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         if (markerPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
     }
     skyPipeline_ = makeSimple(@"vsSky", @"fsSky");
+    createGrassPipeline();
     ds.depthCompareFunction = MTLCompareFunctionAlways;
     ds.depthWriteEnabled = NO;
     depthAlways_ = [device newDepthStencilStateWithDescriptor:ds];
@@ -1680,6 +1760,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     // Terrain and roads first, so vehicles and objects cover the road ribbons.
     drawPass(0);
     drawPass(1);
+    if (terrain) encodeGrass(enc);
     if (!terrain && showGround) {
         [enc setRenderPipelineState:groundPipeline_];
         [enc setDepthStencilState:depthWrite_];
@@ -1821,6 +1902,66 @@ void MeshRenderer::encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target) {
         for (int i = kBloomLevels - 1; i > 0; --i) pass(bloom_[size_t(i - 1)], MTLLoadActionLoad, upPipeline_, {bloom_[size_t(i)]}, bloom_[size_t(i)]);
     }
     pass(target, MTLLoadActionDontCare, compositePipeline_, {hdr_, bloom_[0], shafts_, bloom_[kBloomLevels - 1]}, nil);
+}
+
+
+// ---- Grass tufts (p14) -------------------------------------------------------
+
+void MeshRenderer::createGrassPipeline() {
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [shaders_ newFunctionWithName:@"vsGrass"];
+    d.fragmentFunction = [shaders_ newFunctionWithName:@"fsGrass"];
+    d.rasterSampleCount = sampleCount_;
+    d.alphaToCoverageEnabled = sampleCount_ > 1;
+    d.colorAttachments[0].pixelFormat = kRenderColorFormat;
+    d.depthAttachmentPixelFormat = kRenderDepthFormat;
+    NSError* e = nil;
+    grassPipeline_ = [device_ newRenderPipelineStateWithDescriptor:d error:&e];
+    if (grassPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
+    grassEpoch_ = std::chrono::steady_clock::now();
+}
+
+void MeshRenderer::setGrassAtlas(uint32_t bitmapId) {
+    uint8_t alpha = 0;
+    grassAtlas_ = texture(bitmapId, true, &alpha);
+}
+
+void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
+    struct Gpu {
+        simd_float4 posSize;
+        uint8_t info[4];
+    };
+    static_assert(sizeof(Gpu) == 32, "matches GrassInstance");
+    grassCount_ = tufts.size();
+    if (tufts.empty()) return;
+    const size_t bytes = tufts.size() * sizeof(Gpu);
+    if (grassBuffer_ == nil || grassBuffer_.length < bytes || grassBuffer_.length > bytes * 4)
+        grassBuffer_ = [device_ newBufferWithLength:std::max<size_t>(bytes + bytes / 2, 4096) options:MTLResourceStorageModeShared];
+    auto* out = static_cast<Gpu*>(grassBuffer_.contents);
+    for (size_t i = 0; i < tufts.size(); ++i) {
+        const GrassTuft& t = tufts[i];
+        out[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}};
+    }
+}
+
+void MeshRenderer::encodeGrass(id<MTLRenderCommandEncoder> enc) {
+    static const bool disabled = std::getenv("FUEL_NO_GRASS") != nullptr;  // FUEL_NO_GRASS=1: measure without
+    if (disabled || grassCount_ == 0 || grassAtlas_ == nil || grassPipeline_ == nil) return;
+    struct {
+        simd_float4 a;
+    } params;
+    const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - grassEpoch_).count();
+    params.a = simd_make_float4(std::fmod(t, 1000.0f), grassRadius, grassRadius * 0.75f, 0.06f);
+    [enc setRenderPipelineState:grassPipeline_];
+    [enc setDepthStencilState:depthWrite_];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+    [enc setVertexBuffer:grassBuffer_ offset:0 atIndex:2];
+    [enc setVertexBytes:&params length:sizeof params atIndex:3];
+    [enc setVertexTexture:groundColour_ != nil ? groundColour_ : white_ atIndex:0];
+    [enc setFragmentTexture:grassAtlas_ atIndex:0];
+    [enc setFragmentTexture:shadowMap_ atIndex:7];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:9 instanceCount:grassCount_];
 }
 
 }  // namespace fuel
