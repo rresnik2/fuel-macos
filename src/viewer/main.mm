@@ -31,6 +31,7 @@
 #import "renderer.h"
 #import "drive.h"
 #import "recorder.h"
+#import "game_settings.h"
 #include "rider_view.h"
 #include "hubcheck.h"
 #include "core/hubs.hpp"
@@ -111,6 +112,7 @@ struct Options {
     bool noRider = false;
     float film = 0;      // --film S: with --shot, a chase-camera frame every S seconds of the drive
     std::string record;  // --record DIR: frame log and grabs of a window session
+    bool settings = false;  // --settings: size, fullscreen, post effects, grass, volume (and data) from the settings file; --game implies it
 };
 
 // Paint and liveries available for the chosen vehicle.
@@ -192,6 +194,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--dirt") o.dirt = std::stof(next());
         else if (a == "--no-rider") o.noRider = true;
         else if (a == "--record") o.record = next();
+        else if (a == "--settings") o.settings = true;
         else if (a == "--film") o.film = std::stof(next());
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
@@ -217,6 +220,7 @@ Options parseArgs(int argc, const char** argv) {
         if (o.shot.empty()) o.shot = "-";
         if (o.driveTime <= 4.0f) o.driveTime = 120.0f;
     }
+    if (o.dataDir.empty() && o.settings) o.dataDir = fuel::loadSettings().dataDir;
     if (o.dataDir.empty()) o.dataDir = defaultDataDir();
     if (o.dpcs.empty()) o.dpcs.push_back("CommonComponent/DATAS/QUAD.DPC");
     return o;
@@ -823,6 +827,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
         _race = race;
         if (drive && garage && !garage->entries.empty()) {
             _audio = std::make_unique<fuel::DriveAudio>();
+            _audio->setMasterVolume(gGameVolume);
             [self loadAudio];
             for (size_t i = 1; race && i < race->racers.size(); ++i) {
                 const size_t entry = race->racers[i].entry;
@@ -1106,7 +1111,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
         // Quiet, and only within ~150 m (no panning).
         const int i = int(k) + 1;
         const float near = std::clamp(1.0f - simd_distance(_drive->position(), _drive->position(i)) / 150.0f, 0.0f, 1.0f);
-        _rivalAudio[k]->setMasterVolume(_audio && _audio->muted() ? 0.0f : 0.45f * near * near);
+        _rivalAudio[k]->setMasterVolume(_audio && _audio->muted() ? 0.0f : 0.45f * near * near * gGameVolume);
         _rivalAudio[k]->update(dt, _drive->state(i), _drive->input(i).throttle);
     }
     self.window.title = [NSString stringWithFormat:@"FUEL — %s", _scene.variant.c_str()];
@@ -1192,6 +1197,11 @@ int main(int argc, const char** argv) {
         if (!device.supportsBCTextureCompression) die("this GPU cannot sample DXT (BC) textures");
         fuel::MeshRenderer renderer(device, kSamples, library);
         renderer.postEffects = std::getenv("FUEL_NO_POST") == nullptr;  // FUEL_NO_POST=1: plain tone mapping (O toggles in the window)
+        fuel::Settings playerSettings;
+        if (opt.settings) {
+            playerSettings = fuel::loadSettings();
+            applySettings(playerSettings, renderer);
+        }
         renderer.cullBackFaces = opt.cull;
         renderer.dirt = std::clamp(opt.dirt, 0.0f, 1.0f);
         std::unique_ptr<fuel::Heightfield> terrain;
@@ -1597,7 +1607,8 @@ int main(int argc, const char** argv) {
         AppDelegate* appDelegate = [AppDelegate new];
         NSApp.delegate = appDelegate;
 
-        const NSRect frame = NSMakeRect(0, 0, 1280, 800);
+        const NSSize windowSize = opt.settings ? gameWindowSize(playerSettings) : NSMakeSize(1280, 800);
+        const NSRect frame = NSMakeRect(0, 0, windowSize.width, windowSize.height);
         NSWindow* window = [[NSWindow alloc] initWithContentRect:frame
                                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                                  NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
@@ -1632,6 +1643,7 @@ int main(int argc, const char** argv) {
         [window makeFirstResponder:view];
         [view showMesh:start];
         [NSApp activateIgnoringOtherApps:YES];
+        if (opt.settings) applyWindowSettings(playerSettings, window, view);
         [NSApp run];
     }
     return 0;

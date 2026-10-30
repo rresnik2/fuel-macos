@@ -54,6 +54,7 @@ add_executable(fuelview
   src/viewer/drive.mm
   src/viewer/recorder.mm
   src/viewer/hubcheck.mm
+  src/viewer/game_settings.mm
   src/audio/drive_audio.mm
 )
 target_compile_options(fuelview PRIVATE -fobjc-arc)
@@ -92,3 +93,42 @@ target_link_libraries(fuelphysics PUBLIC fuelcore Jolt)
 # Drives a vehicle headless and prints the result.
 add_executable(fueldrive src/tools/fueldrive.cpp)
 target_link_libraries(fueldrive PRIVATE fuelphysics)
+
+# ---- FUEL.app: the double-clickable launcher (P20) -------------------------------------------
+# build/FUEL.app = Contents/MacOS/FUEL (launcher) + Contents/MacOS/fuelview (the game) + an
+# icon drawn by fuelicon at build time, ad-hoc signed. No game data goes into the bundle.
+add_executable(fuellauncher src/launcher/main.mm)
+target_compile_options(fuellauncher PRIVATE -fobjc-arc)
+target_link_libraries(fuellauncher PRIVATE fuelcore "-framework Cocoa")
+
+add_executable(fuelicon src/launcher/icon.mm)
+target_compile_options(fuelicon PRIVATE -fobjc-arc)
+target_link_libraries(fuelicon PRIVATE "-framework Foundation" "-framework CoreGraphics"
+  "-framework ImageIO" "-framework UniformTypeIdentifiers")
+
+# LSMinimumSystemVersion: the deployment target, which defaults to the macOS the build runs on.
+if(CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(FUEL_MIN_MACOS "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+else()
+  execute_process(COMMAND sw_vers -productVersion OUTPUT_VARIABLE FUEL_HOST_MACOS OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REGEX MATCH "^[0-9]+(\\.[0-9]+)?" FUEL_MIN_MACOS "${FUEL_HOST_MACOS}")
+endif()
+configure_file(src/launcher/Info.plist.in ${CMAKE_BINARY_DIR}/launcher/Info.plist @ONLY)
+
+set(FUEL_APP ${CMAKE_BINARY_DIR}/FUEL.app)
+add_custom_command(
+  OUTPUT ${CMAKE_BINARY_DIR}/launcher/FUEL.icns
+  COMMAND fuelicon ${CMAKE_BINARY_DIR}/launcher/FUEL.iconset
+  COMMAND iconutil -c icns -o ${CMAKE_BINARY_DIR}/launcher/FUEL.icns ${CMAKE_BINARY_DIR}/launcher/FUEL.iconset
+  DEPENDS fuelicon
+  COMMENT "Drawing the app icon")
+add_custom_target(FUEL_app ALL
+  COMMAND ${CMAKE_COMMAND} -E rm -rf ${FUEL_APP}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${FUEL_APP}/Contents/MacOS ${FUEL_APP}/Contents/Resources
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fuellauncher> ${FUEL_APP}/Contents/MacOS/FUEL
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fuelview> ${FUEL_APP}/Contents/MacOS/fuelview
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/launcher/Info.plist ${FUEL_APP}/Contents/Info.plist
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/launcher/FUEL.icns ${FUEL_APP}/Contents/Resources/FUEL.icns
+  COMMAND codesign --force --deep -s - ${FUEL_APP}
+  DEPENDS fuellauncher fuelview ${CMAKE_BINARY_DIR}/launcher/FUEL.icns
+  COMMENT "Assembling and ad-hoc signing FUEL.app")
