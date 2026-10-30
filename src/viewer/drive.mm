@@ -9,6 +9,8 @@
 #include "core/surface.hpp"
 #include "core/world.hpp"
 
+#include <unordered_set>
+
 namespace {
 
 simd_float4x4 rowsToSimd(const fuel::Mat4& m) {
@@ -420,6 +422,15 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         std::vector<fuel::Plant> plants;
         const fuel::BlockedQuery blocked = [this](double x, double z) { return nearObstacle(x, z, kPlantClearance); };
         fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kPlantRadius, plants);
+        // Trees are solid near the player: a trunk cylinder sized with the tree.
+        std::unordered_set<uint32_t> trees;
+        for (const fuel::Species& sp : vegetation_->trees) trees.insert(sp.full);
+        for (const fuel::Plant& p : plants) {
+            if (!trees.count(p.meshId) || std::hypot(p.position[0] - player.x, p.position[2] - player.z) > kCollideRadius) continue;
+            const float size = std::hypot(p.axes[1][0], p.axes[1][1], p.axes[1][2]);
+            const double r = std::clamp(0.07f * size, 0.2f, 0.5f);
+            bg.trunks.push_back({r, 0, 0, 0, 0, 5.0, 0, 0, 0, 0, r, 0, p.position[0], p.position[1] - 0.5, p.position[2], 1});
+        }
         fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kImpostorRadius, plants, true, kPlantRadius);
         fuel::scatterClutter(*vegetation_, *terrain_, surfaces_, player.x, player.z, kClutterRadius, plants);
         bg.plants.reserve(plants.size());
@@ -435,7 +446,31 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
     return bg;
 }
 
-void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& renderer) {
+// A unit cylinder (radius 1, y from 0 to 1) for tree trunks.
+constexpr uint32_t kTrunkShape = 0x7E0E0001u;
+
+void WorldStreamer::applySolids(fuel::DriveWorld& physics) {
+    if (!physics.hasStaticShape(kTrunkShape)) {
+        std::vector<float> pos;
+        std::vector<uint32_t> idx;
+        constexpr int kSides = 8;
+        for (int k = 0; k < kSides; ++k) {
+            const float a = float(k) / kSides * 6.2831853f;
+            pos.insert(pos.end(), {std::cos(a), 0.0f, std::sin(a), std::cos(a), 1.0f, std::sin(a)});
+            const uint32_t i = uint32_t(k * 2), j = uint32_t(((k + 1) % kSides) * 2);
+            idx.insert(idx.end(), {i, i + 1, j, j, i + 1, j + 1});
+        }
+        physics.addStaticShape(kTrunkShape, pos, idx);
+    }
+    std::vector<std::pair<uint32_t, std::array<double, 16>>> solid = cellSolid_;
+    for (const auto& m : trunks_) solid.push_back({kTrunkShape, m});
+    if (std::getenv("FUEL_STREAM_TRACE")) std::printf("solids: %zu placed, %zu trunks\n", cellSolid_.size(), trunks_.size());
+    physics.setStaticObjects(solid);
+}
+
+void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics) {
+    trunks_ = std::move(bg.trunks);
+    applySolids(physics);
     plantDraw_ = std::move(bg.plants);
     std::vector<fuel::MeshInstance> draw = cellDraw_;
     draw.insert(draw.end(), plantDraw_.begin(), plantDraw_.end());
@@ -443,9 +478,9 @@ void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& rendere
     if (bg.haveRoads) renderer.setRoads(bg.roads.vertices, bg.roads.indices, bg.roads.batches);
 }
 
-void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer) {
+void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics) {
     if (!job_.valid() || job_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
-    applyBackground(job_.get(), renderer);
+    applyBackground(job_.get(), renderer, physics);
     if (rerun_) {  // catch up with where the player is now
         rerun_ = false;
         job_ = std::async(std::launch::async, [this, at = last_] { return buildBackground(at); });
@@ -453,7 +488,7 @@ void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer) {
 }
 
 void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force) {
-    pollBackground(renderer);
+    pollBackground(renderer, physics);
     if (!force && simd_distance(player, last_) < 40.0f) {
         updateProps(renderer, physics, false);
         return;
@@ -523,7 +558,7 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
     if (force) {  // teleports and the first frame: build everything now
         if (job_.valid()) (void)job_.get();
         rerun_ = false;
-        applyBackground(buildBackground(player), renderer);
+        applyBackground(buildBackground(player), renderer, physics);
     } else if (job_.valid()) {
         rerun_ = true;
     } else {
@@ -551,7 +586,8 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
         ++it;
     }
     updateProps(renderer, physics, true);
-    physics.setStaticObjects(solid);
+    cellSolid_ = std::move(solid);
+    applySolids(physics);
 }
 
 WorldStreamer::RoadMesh WorldStreamer::buildRoads(simd_float3 player) const {

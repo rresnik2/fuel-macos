@@ -169,12 +169,16 @@ private:
     // per update on the main thread); the renderer gets them when ready.
     struct Background {
         std::vector<fuel::MeshInstance> plants;
+        std::vector<std::array<double, 16>> trunks;  // solid cylinders for nearby trees (row-vector matrices)
         RoadMesh roads;
         bool haveRoads = false;
     };
     Background buildBackground(simd_float3 player) const;
-    void applyBackground(Background&& bg, fuel::MeshRenderer& renderer);
-    void pollBackground(fuel::MeshRenderer& renderer);
+    void applyBackground(Background&& bg, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
+    void pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
+    void applySolids(fuel::DriveWorld& physics);
+    std::vector<std::pair<uint32_t, std::array<double, 16>>> cellSolid_;  // placed objects near the player
+    std::vector<std::array<double, 16>> trunks_;
     std::future<Background> job_;
     bool rerun_ = false;      // the player moved on while the job ran
     std::vector<fuel::MeshInstance> cellDraw_, plantDraw_;  // the static world's draw list, in two halves
