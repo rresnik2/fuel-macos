@@ -31,7 +31,10 @@ int main(int argc, char** argv) {
                     hf.height, hf.spacing, hf.originX, hf.originZ, hf.metresPerUnit, lo * hf.metresPerUnit, hi * hf.metresPerUnit, secs);
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
-            if (a == "--at" && i + 2 < argc) {
+            if (a == "--levelled") {  // apply the flat surfaces to later --at queries
+                fuel::Heightfield& h = const_cast<fuel::Heightfield&>(hf);
+                std::printf("flat surfaces applied: %zu\n", fuel::applyFlatSurfaces(h, dpc));
+            } else if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
                 std::printf("height at (%.1f, %.1f) = %.2f m\n", x, z, hf.heightAt(x, z));
                 i += 2;

@@ -2,6 +2,7 @@
 
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -111,6 +112,66 @@ Raster decodeRaster(const std::vector<uint8_t>& b) {
     return r;
 }
 
+size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world) {
+    const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
+    if (gens.empty()) return 0;
+    const auto body = world.body(*world.find(gens.front()));
+    if (!body) return 0;
+    const std::vector<uint8_t>& b = *body;
+    // Skip to the flat surfaces: u32 x3; maps; ground textures; materials; u32;
+    // groups {u32 len, name, u32, u32 n, ids[n]}; then u32 n and n 0x83-byte records.
+    size_t p = 12;
+    for (int list = 0; list < 3; ++list) p += 4 + size_t(rd32(b, p)) * 4;
+    p += 4;
+    const uint32_t groups = rd32(b, p);
+    p += 4;
+    for (uint32_t g = 0; g < groups; ++g) {
+        p += 4 + rd32(b, p) + 4;
+        p += 4 + size_t(rd32(b, p)) * 4;
+    }
+    const uint32_t n = rd32(b, p);
+    p += 4;
+    auto f32 = [&](size_t o) {
+        if (o + 4 > b.size()) throw std::runtime_error("flat surface overruns");
+        float v;
+        std::memcpy(&v, &b[o], 4);
+        return v;
+    };
+    size_t applied = 0;
+    for (uint32_t i = 0; i < n; ++i, p += 0x83) {
+        // Record: u32 id; axis x (3 floats + pad), axis y, axis z, centre; then parameters
+        // (+0x4c = blend margin in metres).
+        const float ax[3] = {f32(p + 4), f32(p + 8), f32(p + 12)};
+        const float az[3] = {f32(p + 36), f32(p + 40), f32(p + 44)};
+        const float c[3] = {f32(p + 52), f32(p + 56), f32(p + 60)};
+        const float margin = std::clamp(f32(p + 0x4c), 0.0f, 100.0f);
+        // Solve point = centre + u*axisX + v*axisZ in the ground plane.
+        const float det = ax[0] * az[2] - ax[2] * az[0];
+        if (std::fabs(det) < 1e-3f) continue;
+        const float reach = std::fabs(ax[0]) + std::fabs(az[0]) + margin, reachZ = std::fabs(ax[2]) + std::fabs(az[2]) + margin;
+        const int c0 = std::max(0, int((c[0] - reach - hf.originX) / hf.spacing)), c1 = std::min(int(hf.width) - 1, int((c[0] + reach - hf.originX) / hf.spacing) + 1);
+        const int r0 = std::max(0, int((c[2] - reachZ - hf.originZ) / hf.spacing)), r1 = std::min(int(hf.height) - 1, int((c[2] + reachZ - hf.originZ) / hf.spacing) + 1);
+        const float lenX = std::hypot(ax[0], ax[2]), lenZ = std::hypot(az[0], az[2]);
+        for (int r = r0; r <= r1; ++r) {
+            for (int col = c0; col <= c1; ++col) {
+                const float dx = hf.originX + col * hf.spacing - c[0], dz = hf.originZ + r * hf.spacing - c[2];
+                const float u = (dx * az[2] - dz * az[0]) / det, v = (ax[0] * dz - ax[2] * dx) / det;
+                // Distance outside the rectangle, in metres.
+                const float out = std::hypot(std::max(0.0f, std::fabs(u) - 1) * lenX, std::max(0.0f, std::fabs(v) - 1) * lenZ);
+                if (out > margin) continue;
+                const float w = margin > 0 ? 1 - std::clamp(out / margin, 0.0f, 1.0f) : 1.0f;
+                const float target = c[1] + std::clamp(u, -1.0f, 1.0f) * ax[1] + std::clamp(v, -1.0f, 1.0f) * az[1];
+                uint16_t& raw = hf.raw[size_t(r) * hf.width + size_t(col)];
+                const float h = raw * hf.metresPerUnit;
+                const float blended = h + (target - h) * (w * w * (3 - 2 * w));
+                raw = uint16_t(std::clamp(std::lround(blended / hf.metresPerUnit), 0L, 65535L));
+            }
+        }
+        ++applied;
+    }
+    return applied;
+}
+
 Heightfield loadWorldHeightfield(const DpcFile& world) {
     const std::vector<uint32_t> maps = genWorldMaps(world);
     if (maps.empty()) throw std::runtime_error("GenWorld_Z lists no maps");
@@ -128,6 +189,12 @@ Heightfield loadWorldHeightfield(const DpcFile& world) {
     hf.originX = -float(hf.width / 2) * hf.spacing;
     hf.originZ = -float(hf.height / 2) * hf.spacing;
     hf.metresPerUnit = kHeightRange / r.maxValue;
+    return hf;
+}
+
+Heightfield loadLevelledHeightfield(const DpcFile& world) {
+    Heightfield hf = loadWorldHeightfield(world);
+    applyFlatSurfaces(hf, world);
     return hf;
 }
 

@@ -864,7 +864,7 @@ int main(int argc, const char** argv) {
             const fs::path world = fs::path(opt.dataDir) / "CommonComponent/WORLD/USA1.DPC";
             try {
                 fuel::DpcFile usa1(world.string());
-                terrain = std::make_unique<fuel::Heightfield>(fuel::loadWorldHeightfield(usa1));
+                terrain = std::make_unique<fuel::Heightfield>(fuel::loadLevelledHeightfield(usa1));
                 renderer.setTerrain(*terrain);
                 renderer.setGround(fuel::buildGroundMaps(usa1, *terrain, 2334), usa1);
                 if (opt.haveAt && !opt.world && !opt.drive)

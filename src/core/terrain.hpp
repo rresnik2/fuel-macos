@@ -41,8 +41,15 @@ Raster decodeRaster(const std::vector<uint8_t>& binaryBody);
 // The Binary_Z map IDs listed by the world's GenWorld_Z (index 0 = heights).
 std::vector<uint32_t> genWorldMaps(const DpcFile& world);
 
+// FUEL levels the ground under hubs, camps and other structures ("flat
+// surfaces" in GenWorld_Z: oriented, possibly sloped rectangles with a blend
+// margin). Bakes them into `hf`; returns how many were applied.
+size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world);
+
 // Decodes the heightfield of a world DPC (WORLD/USA1.DPC). Throws when the
 // file has no GenWorld_Z or the map does not decode.
 Heightfield loadWorldHeightfield(const DpcFile& world);
+// The heightfield with the flat surfaces applied (what the game drives on).
+Heightfield loadLevelledHeightfield(const DpcFile& world);
 
 }  // namespace fuel
