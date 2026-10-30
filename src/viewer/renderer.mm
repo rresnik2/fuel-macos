@@ -40,7 +40,8 @@ struct FrameUniforms {
     float4 footprint;     // xy scene centre (x, z), zw half extents
     float4 terrain;       // origin x, origin z, sample spacing, metres per texel value 1.0
     float4 terrainGrid;   // grid centre x, z, radius, vertices per side
-    float4 fog;           // x haze density per metre (0 = none), y = 1 when ground maps are loaded
+    float4 fog;           // x haze density per metre (0 = none), y = 1 when ground maps are loaded,
+                          // z near plane, w projection q = far / (near - far) (for view distances from depth)
     float4 camRight;      // camera axes in world space, for sprites
     float4 camUp;
 };
@@ -84,35 +85,46 @@ float shadowFactor(depth2d<float> map, float4 sunPos) {
     return s / 9.0;
 }
 
-float3 skyColor(float3 d) {
-    float3 zenith = float3(0.18, 0.34, 0.68), horizon = float3(0.68, 0.74, 0.80), ground = float3(0.20, 0.18, 0.15);
-    if (d.y >= 0.0) return mix(horizon, zenith, sqrt(d.y));
-    return mix(horizon * 0.6, ground, saturate(-d.y * 4.0));
+// A late-afternoon sky like FUEL's: a warm, hazy horizon under a dusty blue
+// zenith, with a broad glow around the low sun. Linear HDR; the post pass tone maps.
+constant float3 kSunColour = float3(1.0, 0.74, 0.46);
+
+float3 skyColor(float3 d, float3 sun) {
+    float3 zenith = float3(0.16, 0.24, 0.40), horizon = float3(0.92, 0.70, 0.46), ground = float3(0.20, 0.15, 0.10);
+    float3 c = d.y >= 0.0 ? mix(horizon, zenith, pow(d.y, 0.5)) : mix(horizon * 0.75, ground, saturate(-d.y * 4.0));
+    float mu = saturate(dot(d, sun));
+    return c + float3(1.0, 0.62, 0.30) * (pow(mu, 6.0) * 0.55 + pow(mu, 48.0) * 1.2);
 }
 
-float3 tonemap(float3 x) {  // ACES fit (Narkowicz)
-    return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+// The world palette is a bright spring green; FUEL's evening ground reads olive
+// and brown. Pull greens towards their luminance and warm them a little.
+float3 groundGrade(float3 c) {
+    float l = dot(c, float3(0.30, 0.59, 0.11));
+    float green = saturate((c.g - max(c.r, c.b)) / max(c.g, 1e-3) * 2.0);
+    return mix(float3(l), c, mix(0.75, 0.45, green)) * float3(1.06, 0.98, 0.84);
 }
 
+// Aerial perspective: distance haze in the colour of the sky near the horizon in
+// that direction, so it glows warm towards the sun.
 float3 haze(float3 rgb, float3 world, constant FrameUniforms& f) {
     if (f.fog.x <= 0.0) return rgb;
     float3 d = world - f.eye.xyz;
-    float k = 1.0 - exp(-length(d) * f.fog.x);
-    return mix(rgb, skyColor(normalize(float3(d.x, max(d.y, 0.0) * 0.3, d.z))) * 1.4, k);
+    float k = (1.0 - exp(-length(d) * f.fog.x)) * 0.92;
+    return mix(rgb, skyColor(normalize(float3(d.x, max(d.y, 0.0) * 0.15, d.z)), normalize(f.sunDir.xyz)), k);
 }
 
 // Sun (GGX highlight, shadowed), hemispheric sky light and sky reflections.
 float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float specStrength, float rough,
                 float2 fresnel, bool reflective, constant FrameUniforms& f) {
     float3 L = normalize(f.sunDir.xyz);
-    float3 sun = float3(1.0, 0.95, 0.86) * f.sunDir.w;
+    float3 sun = kSunColour * f.sunDir.w;
     float NdotL = saturate(dot(N, L));
     float NdotV = saturate(dot(N, V)) + 1e-4;
     float3 H = normalize(L + V);
     float NdotH = saturate(dot(N, H));
     float VdotH = saturate(dot(V, H));
 
-    float3 ambient = mix(float3(0.14, 0.12, 0.10), float3(0.40, 0.47, 0.58), N.y * 0.5 + 0.5) * ao;
+    float3 ambient = mix(float3(0.13, 0.10, 0.07), float3(0.30, 0.31, 0.34), N.y * 0.5 + 0.5) * ao;
     float3 color = albedo * (sun * NdotL * shadow + ambient);
 
     float a2 = pow(rough, 4.0);
@@ -124,7 +136,7 @@ float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float
     float F = f0 + (1.0 - f0) * pow(1.0 - VdotH, 5.0);
     color += sun * (D * G * F / max(4.0 * NdotV, 1e-3)) * shadow * specStrength;
 
-    float3 env = mix(skyColor(reflect(-V, N)), float3(0.42, 0.47, 0.53), rough);
+    float3 env = mix(skyColor(reflect(-V, N), L), float3(0.40, 0.38, 0.36), rough);
     float fr = reflective ? mix(fresnel.x, fresnel.y, pow(1.0 - NdotV, 5.0)) * 2.0
                           : (f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0)) * (1.0 - rough) * specStrength;
     return color + env * saturate(fr) * ao * mix(0.5, 1.0, shadow);
@@ -142,7 +154,7 @@ vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[bu
         // Like FUEL's ground, foliage and rocks take the palette colour under them
         // (ground x 2; the fragment shader decides how to apply it).
         constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
-        o.tint = groundColour.sample(lin, (model[3].xz + 70000.0) / 140000.0, level(0)).rgb * 2.0;
+        o.tint = groundGrade(groundColour.sample(lin, (model[3].xz + 70000.0) / 140000.0, level(0)).rgb) * 2.0;
     }
     o.m0 = model[0].xyz;
     o.m1 = model[1].xyz;
@@ -204,7 +216,7 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     float4 c = d * m.diffuse;
     if (m.alphaMode == 1 && c.a < 0.5) discard_fragment();
     float alpha = m.alphaMode == 2 ? c.a : 1.0;
-    if (m.lit == 0) return float4(tonemap((c.rgb + m.emissive.rgb) * f.params.y), alpha);
+    if (m.lit == 0) return float4(c.rgb + m.emissive.rgb, alpha);
 
     // Some foliage stores no normal at all: fall back to up.
     const float3 n0 = dot(in.normal, in.normal) > 1e-8 ? normalize(in.normal) : float3(0, 1, 0);
@@ -234,7 +246,7 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     if (foliage) shadow = mix(0.55, 1.0, shadow);  // leaves let light through
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(c.rgb, N, V, ao, shadow, specStrength, rough, m.fresnel, (m.features & Reflective) != 0, f);
-    return float4(tonemap(haze(rgb + m.emissive.rgb, in.world, f) * f.params.y), alpha);
+    return float4(haze(rgb + m.emissive.rgb, in.world, f), alpha);
 }
 
 struct GroundOut {
@@ -262,7 +274,7 @@ fragment float4 fsGround(GroundOut in [[stage_in]], constant FrameUniforms& f [[
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(float3(0.30, 0.27, 0.23), float3(0, 1, 0), V, ao, shadow, 0.0, 1.0, float2(0), false, f);
     float fade = smoothstep(1.0, 0.55, length(rel) / f.params.w);
-    return float4(tonemap(rgb * f.params.y), fade);
+    return float4(rgb, fade);
 }
 
 constexpr sampler heightSampler(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -343,7 +355,7 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
         float2 uv = (xz + 70000.0) / 140000.0;
-        c = groundColour.sample(lin, uv).rgb;
+        c = groundGrade(groundColour.sample(lin, uv).rgb);
         float dist = length(f.eye.xyz - in.world);
         float near = 1.0 - smoothstep(150.0, 600.0, dist);
         if (near > 0.0) {
@@ -375,7 +387,7 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
     float shadow = shadowFactor(shadowMap, in.sunPos);
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(c, N, V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
-    return float4(tonemap(haze(rgb, in.world, f) * f.params.y), 1.0);
+    return float4(haze(rgb, in.world, f), 1.0);
 }
 
 struct SkyOut {
@@ -394,8 +406,9 @@ vertex SkyOut vsSky(uint vid [[vertex_id]]) {
 fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]]) {
     float4 w = f.invViewProj * float4(in.ndc, 1.0, 1.0);
     float3 dir = normalize(w.xyz / w.w - f.eye.xyz);
-    float3 c = skyColor(dir) * 1.4 + float3(1.0, 0.9, 0.7) * pow(saturate(dot(dir, normalize(f.sunDir.xyz))), 800.0) * 30.0;
-    return float4(tonemap(c * f.params.y), 1.0);
+    const float3 sun = normalize(f.sunDir.xyz);
+    float3 c = skyColor(dir, sun) * 1.3 + float3(1.0, 0.85, 0.6) * smoothstep(0.99975, 0.99990, dot(dir, sun)) * 40.0;
+    return float4(c, 1.0);
 }
 
 struct RoadVertex {
@@ -433,7 +446,7 @@ fragment float4 fsRoad(RoadOut in [[stage_in]], constant FrameUniforms& f [[buff
     float shadow = shadowFactor(shadowMap, in.sunPos);
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(albedo, float3(0, 1, 0), V, 1.0, shadow, 0.1, 0.8, float2(0), false, f);
-    return float4(tonemap(haze(rgb, in.world, f) * f.params.y), in.opacity * edge);
+    return float4(haze(rgb, in.world, f), in.opacity * edge);
 }
 
 struct MarkerOut {
@@ -461,7 +474,200 @@ fragment float4 fsMarker(MarkerOut in [[stage_in]]) {
     float g = in.glow * in.glow;
     return float4(in.color * g, g * 0.7);
 }
+
+// ---- dust: soft camera-facing sprites over the resolved scene ----
+
+struct DustParticle {
+    float4 position;  // xyz, w radius in metres
+    float4 colour;    // linear albedo, a opacity
+    float4 extra;     // x rotation (radians), y noise seed
+};
+
+struct DustOut {
+    float4 position [[position]];
+    float2 uv;
+    float3 rgb;
+    float alpha;
+    float depth;   // view-space distance of the sprite
+    float radius;
+    float seed;
+};
+
+vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const device DustParticle* ps [[buffer(0)]],
+                      constant FrameUniforms& f [[buffer(1)]]) {
+    const DustParticle p = ps[iid];
+    float2 c = float2(vid & 1, vid >> 1) * 2.0 - 1.0;
+    float s = sin(p.extra.x), k = cos(p.extra.x);
+    float2 r = float2(c.x * k - c.y * s, c.x * s + c.y * k);
+    float3 w = p.position.xyz + (f.camRight.xyz * r.x + f.camUp.xyz * r.y) * p.position.w;
+    DustOut o;
+    o.position = f.viewProj * float4(w, 1.0);
+    o.uv = c;
+    const float3 fwd = cross(f.camUp.xyz, f.camRight.xyz);
+    o.depth = dot(p.position.xyz - f.eye.xyz, fwd);
+    o.radius = p.position.w;
+    o.seed = p.extra.y;
+    // Lit by the sun through the cloud: strong forward scattering (Henyey-Greenstein,
+    // g = 0.55) makes plumes glow when the camera looks towards the low sun.
+    const float3 L = normalize(f.sunDir.xyz);
+    const float mu = dot(normalize(p.position.xyz - f.eye.xyz), L);
+    const float g = 0.55;
+    const float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5) / (4.0 * M_PI_F);
+    float3 light = kSunColour * f.sunDir.w * (0.18 + hg * 1.6) + float3(0.28, 0.27, 0.27);
+    o.rgb = haze(p.colour.rgb * light, p.position.xyz, f);
+    o.alpha = p.colour.a;
+    return o;
+}
+
+fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0)]], constant FrameUniforms& f [[buffer(1)]]) {
+    float r2 = dot(in.uv, in.uv);
+    if (r2 >= 1.0) discard_fragment();
+    // Lumpy edges: a little value noise over the round falloff.
+    float n = valueNoise(in.uv * 2.3 + in.seed * 17.0) * 0.6 + valueNoise(in.uv * 5.1 - in.seed * 9.0) * 0.4;
+    float blob = pow(1.0 - r2, 1.5) * mix(0.55, 1.25, n);
+    // Soft particles: fade out where the sprite meets the scene, and near the camera.
+    // The resolved depth turns back into a view distance with zn and q (fog.zw).
+    float d = depth.read(uint2(in.position.xy));
+    float scene = f.fog.z * f.fog.w / (d + f.fog.w);
+    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 0.6) / 1.5);
+    float a = saturate(in.alpha * blob * fade);
+    return float4(in.rgb, a);
+}
+
+// ---- post-processing: bloom, light shafts, radial blur, tone mapping and grade ----
+
+struct PostUniforms {
+    float4 sun;      // xy the sun in uv, z 0..1 how far it is on screen and in front, w glare strength
+    float4 texel;    // xy 1 / source size, z aspect (width / height), w frame number
+    float4 params;   // x exposure, y radial blur strength, z bloom strength, w light shaft strength
+    float4 grade;    // x saturation, y contrast, z vignette, w 1 = grade (0: plain tone map)
+};
+
+struct FullOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex FullOut vsFull(uint vid [[vertex_id]]) {
+    const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    FullOut o;
+    o.position = float4(p[vid], 0.0, 1.0);
+    o.uv = p[vid] * float2(0.5, -0.5) + 0.5;
+    return o;
+}
+
+constexpr sampler postLin(coord::normalized, filter::linear, address::clamp_to_edge);
+
+// Half resolution: a 4x4 box of the scene above a soft threshold; alpha is the
+// share of sky (depth at the far plane), which the shafts and the glare use.
+fragment float4 fsBright(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], depth2d<float> depth [[texture(1)]],
+                         constant PostUniforms& u [[buffer(0)]]) {
+    float2 t = u.texel.xy;
+    float3 c = 0.0;
+    float sky = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        float2 o = float2((k & 1) ? 1.0 : -1.0, (k & 2) ? 1.0 : -1.0) * t;
+        c += min(src.sample(postLin, in.uv + o).rgb, float3(60.0));
+        sky += depth.sample(postLin, in.uv + o) >= 1.0 ? 0.25 : 0.0;
+    }
+    c *= 0.25;
+    const float threshold = 0.9, knee = 0.6;
+    float lum = max(c.r, max(c.g, c.b));
+    float soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee + 1e-4);
+    float w = max(soft, lum - threshold) / max(lum, 1e-4);
+    return float4(c * w, sky);
+}
+
+fragment float4 fsDown(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    float2 t = u.texel.xy;
+    return 0.25 * (src.sample(postLin, in.uv + float2(-t.x, -t.y)) + src.sample(postLin, in.uv + float2(t.x, -t.y)) +
+                   src.sample(postLin, in.uv + float2(-t.x, t.y)) + src.sample(postLin, in.uv + float2(t.x, t.y)));
+}
+
+// A 3x3 tent of the smaller level, added onto the larger one (rgb only).
+fragment float4 fsUp(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    float2 t = u.texel.xy;
+    float3 c = src.sample(postLin, in.uv).rgb * 4.0;
+    c += (src.sample(postLin, in.uv + float2(-t.x, 0)).rgb + src.sample(postLin, in.uv + float2(t.x, 0)).rgb +
+          src.sample(postLin, in.uv + float2(0, -t.y)).rgb + src.sample(postLin, in.uv + float2(0, t.y)).rgb) * 2.0;
+    c += src.sample(postLin, in.uv + float2(-t.x, -t.y)).rgb + src.sample(postLin, in.uv + float2(t.x, -t.y)).rgb +
+         src.sample(postLin, in.uv + float2(-t.x, t.y)).rgb + src.sample(postLin, in.uv + float2(t.x, t.y)).rgb;
+    return float4(c / 16.0, 0.0);
+}
+
+// Quarter resolution: light shafts, marching from each pixel towards the sun
+// through the sky mask (sky near the sun shines through gaps in the trees).
+fragment float4 fsShafts(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    if (u.sun.z <= 0.0) return float4(0.0);
+    const int n = 28;
+    float2 aspect = float2(u.texel.z, 1.0);
+    float2 delta = (u.sun.xy - in.uv) / float(n) * 0.9;
+    float2 p = in.uv + delta * hash12(in.position.xy + u.texel.w);  // jitter against banding
+    float sum = 0.0, decay = 1.0;
+    for (int i = 0; i < n; ++i) {
+        float near = exp(-length((p - u.sun.xy) * aspect) * 3.5);
+        sum += src.sample(postLin, p).a * near * decay;
+        decay *= 0.965;
+        p += delta;
+    }
+    return float4(kSunColour * sum / float(n) * u.sun.z, 0.0);
+}
+
+float3 acesFitted(float3 x) {  // Narkowicz
+    return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+}
+
+fragment float4 fsComposite(FullOut in [[stage_in]], texture2d<float> hdr [[texture(0)]], texture2d<float> bloom [[texture(1)]],
+                            texture2d<float> shafts [[texture(2)]], texture2d<float> skyShare [[texture(3)]],
+                            constant PostUniforms& u [[buffer(0)]]) {
+    float2 uv = in.uv;
+    float2 fromCentre = uv - float2(0.5, 0.48);
+    float radial = length(fromCentre * float2(u.texel.z, 1.0)) / (0.5 * u.texel.z);  // ~1 at the side edges
+    // Speed blur: samples along the ray from the centre, longer towards the edges.
+    float blur = u.params.y * smoothstep(0.15, 1.0, radial);
+    float3 c;
+    if (blur > 0.002) {
+        const int n = 10;
+        c = 0.0;
+        float j = hash12(in.position.xy + u.texel.w) - 0.5;
+        for (int i = 0; i < n; ++i) c += hdr.sample(postLin, uv - fromCentre * blur * ((float(i) + j) / float(n))).rgb;
+        c /= float(n);
+    } else {
+        c = hdr.sample(postLin, uv).rgb;
+    }
+    if (u.params.z > 0.0) c += bloom.sample(postLin, uv).rgb * u.params.z;
+    if (u.params.w > 0.0) c += shafts.sample(postLin, uv).rgb * u.params.w;
+    if (u.sun.z > 0.0) {
+        // Glare around the sun, as strong as there is open sky round it.
+        float vis = skyShare.sample(postLin, u.sun.xy).a;
+        float d = length((uv - u.sun.xy) * float2(u.texel.z, 1.0));
+        c += kSunColour * vis * u.sun.z * u.sun.w * (exp(-d * 5.0) * 0.5 + exp(-d * 22.0) * 1.5);
+    }
+    c *= u.params.x;
+    if (u.grade.w > 0.0) {
+        c *= float3(1.07, 1.0, 0.86);  // warm white balance
+        c = acesFitted(c);
+        // Grade in display space: contrast around mid grey, lift the blacks a touch
+        // towards brown, golden highlights, then saturation.
+        float3 g = pow(c, 1.0 / 2.2);
+        g = saturate((g - 0.45) * u.grade.y + 0.45);
+        g = g * float3(1.03, 0.99, 0.90) + float3(0.018, 0.012, 0.004) * (1.0 - g);
+        float l = dot(g, float3(0.2126, 0.7152, 0.0722));
+        g = mix(float3(l), g, u.grade.x);
+        // Vignette: dark corners and edges.
+        float v = smoothstep(1.25, 0.35, length(fromCentre * float2(1.0, 1.15)) * 1.6);
+        g *= mix(1.0, v, u.grade.z);
+        g += (hash12(in.position.xy * 1.37 + u.texel.w * 7.0) - 0.5) / 255.0;  // dither
+        c = pow(saturate(g), 2.2);
+    } else {
+        c = acesFitted(c);
+    }
+    return float4(c, 1.0);
+}
 )METAL";
+
+}  // namespace
 
 struct FrameUniforms {
     simd_float4x4 viewProj;
@@ -479,6 +685,8 @@ struct FrameUniforms {
     simd_float4 camUp;
 };
 
+namespace {
+
 constexpr uint32_t kTerrainGridSize = 1024;  // vertices per side
 
 struct MaterialUniforms {
@@ -490,6 +698,13 @@ struct MaterialUniforms {
     uint32_t lit;
     uint32_t code;
     uint32_t features;
+};
+
+struct PostUniforms {
+    simd_float4 sun;
+    simd_float4 texel;
+    simd_float4 params;
+    simd_float4 grade;
 };
 
 // Right-handed view and projection with clip z in [0, 1]. FUEL's data is
@@ -676,7 +891,38 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     ds.depthWriteEnabled = NO;
     depthAlways_ = [device newDepthStencilStateWithDescriptor:ds];
 
-    sunDir_ = simd_normalize(simd_make_float3(0.55f, 0.80f, 0.45f));
+    // Dust and post passes: single-sample, no depth attachment.
+    auto makePost = [&](NSString* vs, NSString* fs, MTLPixelFormat format, int blend) {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [shaders_ newFunctionWithName:vs];
+        d.fragmentFunction = [shaders_ newFunctionWithName:fs];
+        d.colorAttachments[0].pixelFormat = format;
+        if (blend == 1) {  // alpha blending
+            d.colorAttachments[0].blendingEnabled = YES;
+            d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+            d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+        } else if (blend == 2) {  // added to the colour, alpha kept
+            d.colorAttachments[0].blendingEnabled = YES;
+            d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+            d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+            d.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+        }
+        NSError* e = nil;
+        id<MTLRenderPipelineState> ps = [device newRenderPipelineStateWithDescriptor:d error:&e];
+        if (ps == nil) [NSException raise:@"pipeline" format:@"%@", e];
+        return ps;
+    };
+    dustPipeline_ = makePost(@"vsDust", @"fsDust", kRenderColorFormat, 1);
+    brightPipeline_ = makePost(@"vsFull", @"fsBright", kRenderColorFormat, 0);
+    downPipeline_ = makePost(@"vsFull", @"fsDown", kRenderColorFormat, 0);
+    upPipeline_ = makePost(@"vsFull", @"fsUp", kRenderColorFormat, 2);
+    shaftsPipeline_ = makePost(@"vsFull", @"fsShafts", kRenderColorFormat, 0);
+    compositePipeline_ = makePost(@"vsFull", @"fsComposite", kOutputColorFormat, 0);
+
+    // A low, warm evening sun (about 18 degrees up), as in most of FUEL's races.
+    sunDir_ = simd_normalize(simd_make_float3(0.736f, 0.31f, 0.602f));
 }
 
 void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
@@ -1300,10 +1546,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     const bool terrain = showTerrain && heightTex_ != nil;
     const float zn = terrain ? std::max(0.05f, dist * 0.02f) : radius_ * 0.02f;
     const float zf = terrain ? std::max(120000.0f, dist * 4.0f) : radius_ * 40.0f;
-    fu.viewProj = simd_mul(perspectiveRH(0.70f, aspect, zn, zf), lookAtRH(eye, center_, simd_make_float3(0, 1, 0)));
+    const simd_float3 target = center_ + simd_make_float3(0, cam.aim, 0);
+    fu.viewProj = simd_mul(perspectiveRH(cam.fovY, aspect, zn, zf), lookAtRH(eye, target, simd_make_float3(0, 1, 0)));
     fu.invViewProj = simd_inverse(fu.viewProj);
     {
-        const simd_float3 fwd = simd_normalize(center_ - eye);
+        const simd_float3 fwd = simd_normalize(target - eye);
         const simd_float3 right = simd_normalize(simd_cross(fwd, simd_make_float3(0, 1, 0)));
         fu.camRight = simd_make_float4(right, 0);
         fu.camUp = simd_make_float4(simd_cross(right, fwd), 0);
@@ -1311,12 +1558,13 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.sunViewProj = sunViewProj();
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
-    fu.fog = simd_make_float4(terrain ? 1.0f / 16000.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, 0, 0);
-    fu.sunDir = simd_make_float4(sunDir_, 3.0f);
+    fu.fog = simd_make_float4(terrain ? 1.0f / 2600.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, zn, zf / (zn - zf));
+    fu.sunDir = simd_make_float4(sunDir_, 4.2f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
     fu.eye = simd_make_float4(eye, 1);
     fu.params = simd_make_float4(dirt, 1.0f, sceneMin_.y, radius_ * 4.0f);
     fu.footprint = simd_make_float4(center_.x, center_.z, (sceneMax_.x - sceneMin_.x) * 0.5f, (sceneMax_.z - sceneMin_.z) * 0.5f);
+    lastFrame_ = std::make_shared<FrameUniforms>(fu);
 
     [enc setVertexBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentBytes:&fu length:sizeof fu atIndex:1];
@@ -1441,6 +1689,131 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc setVertexBytes:markers_.data() length:markers_.size() * sizeof(simd_float4) atIndex:2];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:66 instanceCount:markers_.size()];
     }
+}
+
+
+void MeshRenderer::ensureTargets(NSUInteger width, NSUInteger height) {
+    if (width == targetWidth_ && height == targetHeight_) return;
+    targetWidth_ = width, targetHeight_ = height;
+    auto make = [&](MTLPixelFormat pf, NSUInteger w, NSUInteger h, NSUInteger samples, MTLTextureUsage usage) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                      width:std::max<NSUInteger>(w, 1)
+                                                                                     height:std::max<NSUInteger>(h, 1)
+                                                                                  mipmapped:NO];
+        td.textureType = samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
+        td.sampleCount = samples;
+        td.usage = usage;
+        td.storageMode = samples > 1 ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+        return [device_ newTextureWithDescriptor:td];
+    };
+    const MTLTextureUsage rt = MTLTextureUsageRenderTarget, rw = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    hdrMsaa_ = make(kRenderColorFormat, width, height, sampleCount_, rt);
+    depthMsaa_ = make(kRenderDepthFormat, width, height, sampleCount_, rt);
+    hdr_ = make(kRenderColorFormat, width, height, 1, rw);
+    depth_ = make(kRenderDepthFormat, width, height, 1, rw);
+    for (int i = 0; i < kBloomLevels; ++i) bloom_[size_t(i)] = make(kRenderColorFormat, width >> (i + 1), height >> (i + 1), 1, rw);
+    shafts_ = make(kRenderColorFormat, width >> 2, height >> 2, 1, rw);
+}
+
+void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const OrbitCamera& cam) {
+    ensureTargets(target.width, target.height);
+    encodeShadows(cb);
+
+    // The scene, multisampled; colour and depth resolve for the passes after it.
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = hdrMsaa_;
+    rp.colorAttachments[0].resolveTexture = hdr_;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0.02, 0.022, 0.026, 1.0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+    rp.depthAttachment.texture = depthMsaa_;
+    rp.depthAttachment.resolveTexture = depth_;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.clearDepth = 1.0;
+    rp.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
+    rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterMin;  // the nearest sample
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    lastFrame_.reset();
+    encode(enc, float(target.width) / float(std::max<NSUInteger>(target.height, 1)), cam);
+    [enc endEncoding];
+
+    if (lastFrame_ && !dust_.empty()) encodeDust(cb);
+    encodePost(cb, target);
+    ++frame_;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        if (b.GPUEndTime > b.GPUStartTime) gpuMs_ = (b.GPUEndTime - b.GPUStartTime) * 1000.0;
+    }];
+}
+
+void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
+    // Back to front from the camera, for alpha blending.
+    const simd_float3 eye = lastFrame_->eye.xyz;
+    std::vector<std::pair<float, uint32_t>> order;
+    order.reserve(dust_.size());
+    for (uint32_t i = 0; i < dust_.size(); ++i) order.emplace_back(-simd_distance_squared(dust_[i].position.xyz, eye), i);
+    std::sort(order.begin(), order.end());
+    id<MTLBuffer> buf = [device_ newBufferWithLength:order.size() * sizeof(DustParticle) options:MTLResourceStorageModeShared];
+    auto* out = static_cast<DustParticle*>(buf.contents);
+    for (size_t k = 0; k < order.size(); ++k) out[k] = dust_[order[k].second];
+
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = hdr_;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:dustPipeline_];
+    [enc setVertexBuffer:buf offset:0 atIndex:0];
+    [enc setVertexBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentTexture:depth_ atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:order.size()];
+    [enc endEncoding];
+}
+
+void MeshRenderer::encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target) {
+    const float w = float(target.width), h = float(std::max<NSUInteger>(target.height, 1));
+    PostUniforms pu{};
+    pu.texel = simd_make_float4(1.0f / w, 1.0f / h, w / h, float(frame_ % 1024));
+    pu.params = postEffects ? simd_make_float4(1.0f, std::clamp(speedBlur, 0.0f, 1.0f) * 0.11f, 0.10f, 0.55f) : simd_make_float4(1, 0, 0, 0);
+    pu.grade = simd_make_float4(0.86f, 1.12f, 0.75f, postEffects ? 1.0f : 0.0f);
+    if (postEffects && lastFrame_ && lastFrame_->fog.x > 0) {
+        // Where the sun is on screen; glare and shafts fade out as it leaves the frame.
+        const simd_float4 clip = simd_mul(lastFrame_->viewProj, simd_make_float4(lastFrame_->eye.xyz + sunDir_ * 1000.0f, 1.0f));
+        if (clip.w > 0) {
+            const simd_float2 uv = simd_make_float2(clip.x / clip.w * 0.5f + 0.5f, 0.5f - clip.y / clip.w * 0.5f);
+            const float out = std::max(std::max(-uv.x, uv.x - 1.0f), std::max(-uv.y, uv.y - 1.0f));
+            pu.sun = simd_make_float4(uv, std::clamp(1.0f - out / 0.35f, 0.0f, 1.0f), 1.0f);
+        }
+    }
+    auto pass = [&](id<MTLTexture> dst, MTLLoadAction load, id<MTLRenderPipelineState> ps, std::initializer_list<id<MTLTexture>> textures,
+                    id<MTLTexture> texelOf) {
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = load;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        if (ps == nil) {  // just clear
+            [enc endEncoding];
+            return;
+        }
+        [enc setRenderPipelineState:ps];
+        PostUniforms u = pu;
+        if (texelOf != nil) u.texel.x = 1.0f / float(texelOf.width), u.texel.y = 1.0f / float(texelOf.height);
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        NSUInteger slot = 0;
+        for (id<MTLTexture> t : textures) [enc setFragmentTexture:t atIndex:slot++];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+    };
+    if (postEffects) {
+        pass(bloom_[0], MTLLoadActionDontCare, brightPipeline_, {hdr_, depth_}, hdr_);
+        for (int i = 1; i < kBloomLevels; ++i) pass(bloom_[size_t(i)], MTLLoadActionDontCare, downPipeline_, {bloom_[size_t(i - 1)]}, bloom_[size_t(i - 1)]);
+        if (pu.sun.z > 0) pass(shafts_, MTLLoadActionDontCare, shaftsPipeline_, {bloom_[1]}, nil);
+        else pass(shafts_, MTLLoadActionClear, nil, {}, nil);
+        for (int i = kBloomLevels - 1; i > 0; --i) pass(bloom_[size_t(i - 1)], MTLLoadActionLoad, upPipeline_, {bloom_[size_t(i)]}, bloom_[size_t(i)]);
+    }
+    pass(target, MTLLoadActionDontCare, compositePipeline_, {hdr_, bloom_[0], shafts_, bloom_[kBloomLevels - 1]}, nil);
 }
 
 }  // namespace fuel

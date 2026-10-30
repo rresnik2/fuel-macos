@@ -66,9 +66,8 @@ simd_float4x4 matrix_from_translation(float x, float y, float z) {
     return m;
 }
 
-constexpr MTLPixelFormat kColorFormat = fuel::kRenderColorFormat;
-constexpr MTLPixelFormat kDepthFormat = fuel::kRenderDepthFormat;
-constexpr NSUInteger kSamples = 4;
+constexpr MTLPixelFormat kColorFormat = fuel::kOutputColorFormat;
+constexpr NSUInteger kSamples = 4;  // the scene's MSAA
 
 fuel::Recorder gRecorder;  // --record
 
@@ -687,8 +686,6 @@ bool aiCheckVerdict(const RaceSession& race) {
     return ok;
 }
 
-MTLClearColor clearColor() { return MTLClearColorMake(0.13, 0.15, 0.18, 1.0); }
-
 void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> tex, const std::string& path) {
     const NSUInteger w = tex.width, h = tex.height, rowBytes = w * 4;
     id<MTLBuffer> buf = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
@@ -718,37 +715,18 @@ void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> te
 
 void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Options& o, const fuel::OrbitCamera& cam) {
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    auto makeTarget = [&](MTLPixelFormat pf, NSUInteger samples) {
-        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:NSUInteger(o.width) height:NSUInteger(o.height) mipmapped:NO];
-        td.textureType = samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
-        td.sampleCount = samples;
-        td.usage = MTLTextureUsageRenderTarget;
-        td.storageMode = MTLStorageModePrivate;
-        return [device newTextureWithDescriptor:td];
-    };
-    id<MTLTexture> msaa = makeTarget(kColorFormat, kSamples);
-    id<MTLTexture> resolved = makeTarget(kColorFormat, 1);
-    id<MTLTexture> depth = makeTarget(kDepthFormat, kSamples);
-
-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = msaa;
-    rp.colorAttachments[0].resolveTexture = resolved;
-    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rp.colorAttachments[0].clearColor = clearColor();
-    rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
-    rp.depthAttachment.texture = depth;
-    rp.depthAttachment.loadAction = MTLLoadActionClear;
-    rp.depthAttachment.clearDepth = 1.0;
-    rp.depthAttachment.storeAction = MTLStoreActionDontCare;
-
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kColorFormat
+                                                                                  width:NSUInteger(o.width)
+                                                                                 height:NSUInteger(o.height)
+                                                                              mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> image = [device newTextureWithDescriptor:td];
     id<MTLCommandBuffer> cb = [queue commandBuffer];
-    renderer.encodeShadows(cb);
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-    renderer.encode(enc, float(o.width) / float(o.height), cam);
-    [enc endEncoding];
+    renderer.render(cb, image, cam);
     [cb commit];
     [cb waitUntilCompleted];
-    writePng(device, queue, resolved, o.shot);
+    writePng(device, queue, image, o.shot);
 }
 
 }  // namespace
@@ -840,10 +818,9 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         _steer = 0;
         _camYawOffset = 0;
         _sceneMode = assembly != nullptr || !scene.parts.empty();
-        self.colorPixelFormat = kColorFormat;
-        self.depthStencilPixelFormat = kDepthFormat;
-        self.sampleCount = kSamples;
-        self.clearColor = clearColor();
+        self.colorPixelFormat = kColorFormat;  // the renderer draws offscreen and finishes into the drawable
+        self.depthStencilPixelFormat = MTLPixelFormatInvalid;
+        self.sampleCount = 1;
         self.delegate = self;
         if (gRecorder.active()) self.framebufferOnly = NO;  // frame grabs read the drawable
     }
@@ -1085,25 +1062,18 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
 
 - (void)drawInMTKView:(MTKView*)view {
     if (_drive) [self driveStep];
+    id<CAMetalDrawable> drawable = view.currentDrawable;
+    if (drawable == nil) return;
     id<MTLCommandBuffer> cb = [_queue commandBuffer];
-    _renderer->encodeShadows(cb);
-    MTLRenderPassDescriptor* rp = view.currentRenderPassDescriptor;
-    if (rp == nil) {
-        [cb commit];
-        return;
-    }
     const double t0 = CACurrentMediaTime();
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-    const CGSize s = view.drawableSize;
-    _renderer->encode(enc, s.height > 0 ? float(s.width / s.height) : 1.0f, _cam);
-    [enc endEncoding];
+    _renderer->render(cb, drawable.texture, _cam);
     if (gRecorder.active()) {
         _frame.encodeMs = (CACurrentMediaTime() - t0) * 1000.0;
         gRecorder.watchGpu(cb);
-        if (gRecorder.frame(_frame)) gRecorder.grab(cb, view.currentDrawable.texture);
+        if (gRecorder.frame(_frame)) gRecorder.grab(cb, drawable.texture);
         _frame = {};
     }
-    [cb presentDrawable:view.currentDrawable];
+    [cb presentDrawable:drawable];
     [cb commit];
 }
 @end

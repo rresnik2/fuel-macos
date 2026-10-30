@@ -3,7 +3,9 @@
 // A modern forward renderer driven by the game's material data: physically
 // based shading of the diffuse, normal, specular, occlusion and dirt texture
 // slots, car paint and liveries, a sun with a shadow map, sky lighting and
-// reflections, a ground plane, and HDR tone mapping into an sRGB target.
+// reflections, a ground plane and soft dust particles, drawn in linear HDR and
+// finished by a post pass (bloom, sun glare and shafts, speed blur, filmic tone
+// mapping and a warm grade, vignette) into an sRGB target.
 #pragma once
 
 #import <Metal/Metal.h>
@@ -18,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -48,6 +51,8 @@ struct OrbitCamera {
     float yaw = 0.65f;     // radians around +y; 0 looks at the model from +z
     float pitch = 0.30f;   // radians above the horizon
     float distance = 2.1f; // in model radii
+    float fovY = 0.70f;    // vertical field of view, radians
+    float aim = 0;         // the camera looks this many metres above the focus
 };
 
 // Vehicle paint: the colour mixed in where the diffuse alpha is 0, and the
@@ -64,9 +69,20 @@ struct MeshInstance {
     simd_float4x4 world = matrix_identity_float4x4;
 };
 
-// Render target formats the renderer's pipelines are built for.
-inline constexpr MTLPixelFormat kRenderColorFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+// The scene renders into offscreen HDR targets of these formats; MeshRenderer::render
+// writes the finished frame into a single-sample kOutputColorFormat texture.
+inline constexpr MTLPixelFormat kRenderColorFormat = MTLPixelFormatRGBA16Float;
 inline constexpr MTLPixelFormat kRenderDepthFormat = MTLPixelFormatDepth32Float;
+inline constexpr MTLPixelFormat kOutputColorFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+
+// One dust particle, a soft sprite facing the camera.
+struct DustParticle {
+    simd_float4 position;  // xyz, w radius in metres
+    simd_float4 colour;    // linear albedo, a opacity
+    simd_float4 extra;     // x rotation (radians), y noise seed 0..1
+};
+
+struct FrameUniforms;  // renderer.mm
 
 class MeshRenderer {
 public:
@@ -140,12 +156,28 @@ public:
     void setGround(const GroundMaps& maps, const DpcFile& world);
     bool showTerrain = true;
 
-    // Call before the main pass each frame: renders the sun's shadow map.
+    // Dust drawn with the next frames (replaces the earlier list).
+    void setDust(const std::vector<DustParticle>& particles) { dust_ = particles; }
+    // Speed effects for this frame, 0..1: radial blur towards the screen edges.
+    float speedBlur = 0;
+    bool postEffects = true;  // false: plain tone mapping (no bloom, glare, blur, grade)
+    float sceneRadius() const { return radius_; }
+    // GPU time of the last completed frame, in milliseconds (0 until one finished).
+    double lastGpuMs() const { return gpuMs_; }
+
+    // Renders a frame into `target` (kOutputColorFormat, single-sample, any size):
+    // shadows, the scene in HDR with MSAA, dust, then the post chain.
+    void render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const OrbitCamera& cam);
+
+private:
+    // Renders the sun's shadow map.
     void encodeShadows(id<MTLCommandBuffer> cb);
     // Draws the scene into a pass with kRenderColorFormat/kRenderDepthFormat.
     void encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam);
+    void ensureTargets(NSUInteger width, NSUInteger height);
+    void encodeDust(id<MTLCommandBuffer> cb);
+    void encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target);
 
-private:
     enum class AlphaMode : uint32_t { Opaque = 0, Test = 1, Blend = 2 };
     enum Feature : uint32_t {
         PaintOnly = 1u << 0,
@@ -256,6 +288,16 @@ private:
     };
     std::vector<OtherVehicle> vehicles_;
     std::map<std::pair<uint32_t, std::array<uint32_t, 3>>, std::unique_ptr<GpuMesh>> liveryMeshes_;
+    // Offscreen targets (rebuilt when the output size changes) and post pipelines.
+    static constexpr int kBloomLevels = 5;  // 1/2 .. 1/32 of the output
+    NSUInteger targetWidth_ = 0, targetHeight_ = 0;
+    id<MTLTexture> hdrMsaa_, depthMsaa_, hdr_, depth_, shafts_;
+    std::array<id<MTLTexture>, kBloomLevels> bloom_;
+    id<MTLRenderPipelineState> dustPipeline_, brightPipeline_, downPipeline_, upPipeline_, shaftsPipeline_, compositePipeline_;
+    std::vector<DustParticle> dust_;
+    std::shared_ptr<FrameUniforms> lastFrame_;  // the uniforms of the last encode, for dust and the post pass
+    std::atomic<double> gpuMs_{0};
+    uint32_t frame_ = 0;
     simd_float3 center_ = {0, 0, 0};
     simd_float3 sceneMin_ = {0, 0, 0}, sceneMax_ = {0, 0, 0};
     float radius_ = 1.0f;
