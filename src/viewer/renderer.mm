@@ -1934,14 +1934,13 @@ void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
     static_assert(sizeof(Gpu) == 32, "matches GrassInstance");
     grassCount_ = tufts.size();
     if (tufts.empty()) return;
-    const size_t bytes = tufts.size() * sizeof(Gpu);
-    if (grassBuffer_ == nil || grassBuffer_.length < bytes || grassBuffer_.length > bytes * 4)
-        grassBuffer_ = [device_ newBufferWithLength:std::max<size_t>(bytes + bytes / 2, 4096) options:MTLResourceStorageModeShared];
-    auto* out = static_cast<Gpu*>(grassBuffer_.contents);
+    // A fresh buffer each time: frames in flight may still read the previous one.
+    std::vector<Gpu> data(tufts.size());
     for (size_t i = 0; i < tufts.size(); ++i) {
         const GrassTuft& t = tufts[i];
-        out[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}};
+        data[i] = {simd_make_float4(t.x, t.y, t.z, t.size), {t.tile, t.windAmp, t.tint, 0}};
     }
+    grassBuffer_ = [device_ newBufferWithBytes:data.data() length:data.size() * sizeof(Gpu) options:MTLResourceStorageModeShared];
 }
 
 void MeshRenderer::encodeGrass(id<MTLRenderCommandEncoder> enc) {

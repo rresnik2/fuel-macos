@@ -674,6 +674,8 @@ WorldStreamer::RoadMesh WorldStreamer::buildRoads(simd_float3 player) const {
 
 WorldStreamer::GrassJob WorldStreamer::buildGrass(simd_float3 player, GrassCache cache) const {
     GrassJob job;
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t built = 0;
     const int32_t c0x = int32_t(std::floor((player.x - kGrassRadius) / kGrassChunk)), c1x = int32_t(std::floor((player.x + kGrassRadius) / kGrassChunk));
     const int32_t c0z = int32_t(std::floor((player.z - kGrassRadius) / kGrassChunk)), c1z = int32_t(std::floor((player.z + kGrassRadius) / kGrassChunk));
     // Forget chunks well outside the radius.
@@ -693,11 +695,14 @@ WorldStreamer::GrassJob WorldStreamer::buildGrass(simd_float3 player, GrassCache
             if (it == cache.end()) {
                 std::vector<fuel::GrassTuft> tufts;
                 ground_->grass(cx * kGrassChunk, cz * kGrassChunk, (cx + 1) * kGrassChunk, (cz + 1) * kGrassChunk, tufts);
+                ++built;
                 it = cache.emplace(key, std::move(tufts)).first;
             }
             job.tufts.insert(job.tufts.end(), it->second.begin(), it->second.end());
         }
     job.cache = std::move(cache);
+    if (std::getenv("FUEL_STREAM_TRACE"))
+        std::printf("grass: %zu tufts, %zu new chunks in %.1f ms\n", job.tufts.size(), built, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return job;
 }
 
