@@ -35,6 +35,15 @@ add_library(fuelcore STATIC
 )
 target_include_directories(fuelcore PUBLIC src)
 
+# FUEL's menus: script reader, page model, text tables, fonts and images (no Metal).
+add_library(fuelui STATIC
+  src/ui/tsc.cpp
+  src/ui/menu_model.cpp
+  src/ui/menu_assets.cpp
+  src/ui/menu_check.cpp
+)
+target_link_libraries(fuelui PUBLIC fuelcore)
+
 # Parses every resource in a data directory and reports what decodes.
 add_executable(fuelcheck src/tools/fuelcheck.cpp)
 target_link_libraries(fuelcheck PRIVATE fuelcore)
@@ -58,7 +67,7 @@ add_executable(fuelview
   src/audio/drive_audio.mm
 )
 target_compile_options(fuelview PRIVATE -fobjc-arc)
-target_link_libraries(fuelview PRIVATE fuelphysics "-framework GameController"
+target_link_libraries(fuelview PRIVATE fuelphysics fuelui "-framework GameController"
   "-framework Cocoa" "-framework AVFoundation" "-framework Metal" "-framework MetalKit"
   "-framework QuartzCore" "-framework ImageIO" "-framework CoreGraphics"
   "-framework UniformTypeIdentifiers")
