@@ -36,7 +36,7 @@ std::vector<std::array<float, 3>> assembledHubs(const fuel::AssembledVehicle& ve
 }
 
 DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain,
-                           double x, double z, float yaw)
+                           double x, double z, float yaw, const std::vector<uint32_t>& riders)
     : world_(terrain), setup_(setup) {
     for (const fuel::PlacedPart& p : vehicle.parts) {
         if (!p.drawn()) continue;
@@ -55,6 +55,10 @@ DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::Ve
         }
         parts_.push_back({p.meshId, m});
         links_.push_back(link);
+    }
+    for (uint32_t id : riders) {
+        parts_.push_back({id, matrix_identity_float4x4});
+        links_.push_back({-1, matrix_identity_float4x4});
     }
     for (const auto& w : setup.wheels) focusHeight_ = std::max(focusHeight_, w.hub[1] + w.radius * 0.6f);
     world_.spawn(setup, x, z, yaw);

@@ -12,6 +12,7 @@
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
 #include "core/ground.hpp"
+#include "core/rider.hpp"
 #include "core/terrain.hpp"
 #include "core/vehicle.hpp"
 
@@ -67,6 +68,12 @@ inline constexpr MTLPixelFormat kRenderDepthFormat = MTLPixelFormatDepth32Float;
 class MeshRenderer {
 public:
     MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const ResourceLibrary& library);
+
+    // Registers CPU-built geometry (the baked rider) under `key`, which then works
+    // as a meshId in setScene. Materials are drawn like a Mesh_Z's, with their
+    // livery bitmaps substituted. Replaces an earlier mesh with the same key;
+    // pick keys that are not Mesh_Z IDs. Returns false (and says why) on bad data.
+    bool addBakedMesh(uint32_t key, const BakedMesh& mesh, std::string* error);
 
     // Shows one Mesh_Z at the origin; returns false with a reason on failure.
     bool setMesh(uint32_t meshId, std::string* error);
@@ -173,7 +180,7 @@ private:
     id<MTLTexture> texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind);
     id<MTLRenderPipelineState> pipeline(uint32_t stride, AlphaMode mode);
     id<MTLRenderPipelineState> shadowPipeline(uint32_t stride);
-    GpuMaterial makeMaterial(uint32_t materialId);
+    GpuMaterial makeMaterial(uint32_t materialId, uint32_t diffuseOverride = 0, uint32_t specularOverride = 0);
     simd_float4x4 sunViewProj() const;
 
     id<MTLDevice> device_;
@@ -199,6 +206,7 @@ private:
     std::unordered_map<uint64_t, id<MTLTexture>> textures_;  // key: id << 1 | srgb
     std::unordered_map<uint32_t, uint8_t> textureAlpha_;
     std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> meshes_;
+    std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> bakedMeshes_;  // addBakedMesh; survive setPaint
 
     Paint paint_;
     simd_float3 sunDir_;

@@ -30,6 +30,7 @@
 
 #import "renderer.h"
 #import "drive.h"
+#include "rider_view.h"
 #import <GameController/GameController.h>
 #include "core/races.hpp"
 #include "core/vehicle_params.hpp"
@@ -91,6 +92,7 @@ struct Options {
     int color = 0;
     bool havePaint = false;
     int paint[3] = {60, 60, 60};
+    bool noRider = false;
 };
 
 // Paint and liveries available for the chosen vehicle.
@@ -164,6 +166,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--distance") o.distance = std::stof(next());
         else if (a == "--no-cull") o.cull = false;
         else if (a == "--dirt") o.dirt = std::stof(next());
+        else if (a == "--no-rider") o.noRider = true;
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
         else if (a == "--color") o.color = std::stoi(next());
@@ -288,12 +291,16 @@ struct AssemblyMode {
     size_t index = 0;
     int lod = 1;
     Palettes palettes;
+    RiderView* riders = nullptr;  // null: no rider
 
     const fuel::VehicleVariant& variant() const { return assembler->variants()[index]; }
     // Assembles the current variant; on failure the scene is empty and the reason is printed.
     SceneFile scene() const {
         try {
-            return sceneFromAssembly(assembler->assemble(variant(), lod), variant().label);
+            SceneFile sf = sceneFromAssembly(assembler->assemble(variant(), lod), variant().label);
+            if (riders)
+                for (uint32_t id : riders->parts(variant().label)) sf.parts.push_back({id, matrix_identity_float4x4});
+            return sf;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "fuelview: %s: %s\n", variant().label.c_str(), e.what());
             return SceneFile{variant().label, {}};
@@ -311,6 +318,7 @@ struct Garage {
     size_t current = 0;
     std::map<std::string, std::vector<float>> params;     // Param/VehiclesParam.tsc
     const fuel::Heightfield* terrain = nullptr;
+    RiderView* riders = nullptr;
 
     // Builds entry `i` at (x, z) facing `yaw`; nullptr (with a message) if it cannot drive.
     std::unique_ptr<DriveSession> build(size_t i, double x, double z, float yaw) const {
@@ -322,7 +330,7 @@ struct Garage {
             if (it == params.end()) throw std::runtime_error("no driving parameters");
             const fuel::AssembledVehicle av = am.assembler->assemble(am.variant(), am.lod);
             const fuel::VehicleSetup setup = fuel::makeVehicleSetup(am.assembler->dpc(), name, it->second, assembledHubs(av));
-            return std::make_unique<DriveSession>(av, setup, *terrain, x, z, yaw);
+            return std::make_unique<DriveSession>(av, setup, *terrain, x, z, yaw, riders ? riders->parts(name) : std::vector<uint32_t>{});
         } catch (const std::exception& e) {
             std::fprintf(stderr, "fuelview: %s: %s\n", name.c_str(), e.what());
             return nullptr;
@@ -843,6 +851,20 @@ int main(int argc, const char** argv) {
             }
         }
 
+        // The rider (PILOT.DPC) lives in the library so its materials and textures resolve.
+        std::unique_ptr<RiderView> riders;
+        if (!opt.assemble.empty() && !opt.noRider) {
+            try {
+                library.add(std::make_unique<fuel::DpcFile>((fs::path(opt.dataDir) / "CommonComponent/DATAS/PILOT.DPC").string()));
+                std::ifstream f(fs::path(opt.dataDir) / "LocalizedComponent/GameTsc/Story/VehiclesDef.tsc");
+                std::stringstream text;
+                text << f.rdbuf();
+                riders = std::make_unique<RiderView>(*library.files().back(), text.str(), renderer);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "fuelview: no rider: %s\n", e.what());
+            }
+        }
+
         VehicleLook prefs;
         prefs.livery = std::clamp(opt.livery, 0, 9);
         prefs.color = std::max(0, opt.color);
@@ -878,6 +900,7 @@ int main(int argc, const char** argv) {
             assembly->index = size_t(v - variants.data());
             assembly->lod = opt.lod;
             assembly->palettes = loadPalettes(opt.dataDir);
+            assembly->riders = riders.get();
             scene = assembly->scene();
             look = assembly->look(prefs);
             renderer.setPaint(look.paint());
@@ -893,7 +916,7 @@ int main(int argc, const char** argv) {
                     const fuel::AssembledVehicle av = assembly->assembler->assemble(assembly->variant(), assembly->lod);
                     const fuel::VehicleSetup setup = fuel::makeVehicleSetup(subject, name, it->second, assembledHubs(av));
                     drive = std::make_unique<DriveSession>(av, setup, *terrain, opt.haveAt ? opt.atX : -51358.0, opt.haveAt ? opt.atZ : -30043.0,
-                                                           0.0f);
+                                                           0.0f, riders ? riders->parts(name) : std::vector<uint32_t>{});
                 } catch (const std::exception& e) {
                     die(name + ": " + e.what());
                 }
@@ -935,6 +958,7 @@ int main(int argc, const char** argv) {
                 garage = std::make_unique<Garage>();
                 garage->params = params;
                 garage->terrain = terrain.get();
+                garage->riders = riders.get();
                 for (const char* name : {"QUAD", "BIKE", "BUGGY", "MUSCLE", "SUV", "TRUCK", "VEH", "BONUS1"}) {
                     const fs::path path = fs::path(opt.dataDir) / "CommonComponent/DATAS" / (std::string(name) + ".DPC");
                     const fuel::DpcFile* dpc = nullptr;
@@ -952,6 +976,7 @@ int main(int argc, const char** argv) {
                     auto am = std::make_unique<AssemblyMode>();
                     am->assembler = std::make_unique<fuel::VehicleAssembler>(*dpc);
                     am->palettes = assembly->palettes;
+                    am->riders = riders.get();
                     am->lod = 1;
                     for (size_t v = 0; v < am->assembler->variants().size(); ++v) {
                         const std::string& label = am->assembler->variants()[v].label;
