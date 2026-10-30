@@ -58,6 +58,7 @@ public:
     void replacePlayer(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const std::vector<uint32_t>& riders = {});
     // Input for vehicle `i` > 0 from the next update on (the player's comes with update).
     void setInput(int i, const fuel::DriveInput& input);
+    const fuel::DriveInput& input(int i) const { return inputs_[size_t(i)]; }
 
     // The parts of vehicle `i` in vehicle space, for MeshRenderer::setScene.
     const std::vector<fuel::MeshInstance>& parts(int i = 0) const { return rigs_[size_t(i)].parts(); }

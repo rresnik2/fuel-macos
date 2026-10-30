@@ -408,6 +408,7 @@ struct RaceSession {
     // Everyone in the race: [0] is the player, the others match the session's vehicles 1...
     struct Racer {
         std::string name;        // variant label
+        size_t entry = 0;        // in the garage
         size_t next = 0;         // index of the target it heads for (route.size() once finished)
         double finished = -1;    // race clock at the finish, -1 while racing
         fuel::RaceDriver ai;     // opponents (and the player's autopilot)
@@ -615,6 +616,7 @@ void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int co
     std::mt19937 rng(fuel::asoboCrc(race.race().name));
     race.racers.resize(1);
     race.racers[0].name = garage.label(garage.current);
+    race.racers[0].entry = garage.current;
     std::vector<std::vector<fuel::MeshInstance>> parts;
     std::vector<fuel::Paint> paints;
     const simd_float3 at = drive.position();
@@ -626,6 +628,7 @@ void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int co
         const int i = drive.addVehicle(av, setup, at.x, at.z + 30.0 * drive.vehicleCount(), 0, rider);  // the grid comes with RaceSession::begin
         RaceSession::Racer racer;
         racer.name = garage.label(entry);
+        racer.entry = entry;
         const float lanes[3] = {3.5f, -3.5f, 0.0f};  // matching the grid: right, left, centre
         racer.ai = fuel::RaceDriver(std::uniform_real_distribution<float>(0.85f, 1.0f)(rng), lanes[race.racers.size() % 3]);
         race.racers.push_back(racer);
@@ -764,6 +767,7 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     Garage* _garage;          // --drive: vehicles to switch between
     RaceSession* _race;       // --drive: the current race
     std::unique_ptr<fuel::DriveAudio> _audio; // --drive in a window: engine, tyre, wind, impact sounds
+    std::vector<std::unique_ptr<fuel::DriveAudio>> _rivalAudio;  // the opponents' sounds, louder as they come near
     NSTextField* _hud;        // --drive: speed, gear, race
     std::set<unsigned short> _keys;
     double _lastTime;
@@ -802,6 +806,15 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
         if (drive && garage && !garage->entries.empty()) {
             _audio = std::make_unique<fuel::DriveAudio>();
             [self loadAudio];
+            for (size_t i = 1; race && i < race->racers.size(); ++i) {
+                const size_t entry = race->racers[i].entry;
+                const AssemblyMode& am = *garage->archives[garage->entries[entry].first];
+                const auto it = garage->params.find(race->racers[i].name);
+                auto audio = std::make_unique<fuel::DriveAudio>();
+                audio->setMasterVolume(0);
+                if (it != garage->params.end()) audio->setVehicle(am.assembler->dpc(), race->racers[i].name, it->second);
+                _rivalAudio.push_back(std::move(audio));
+            }
         }
         if (drive) {
             _hud = [NSTextField labelWithString:@""];
@@ -1032,6 +1045,13 @@ void renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Option
     _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
     const fuel::VehicleState st = _drive->state();
     if (_audio) _audio->update(dt, st, in.throttle);
+    for (size_t k = 0; k < _rivalAudio.size() && int(k) + 1 < _drive->vehicleCount(); ++k) {
+        // Quiet, and only within ~150 m (no panning).
+        const int i = int(k) + 1;
+        const float near = std::clamp(1.0f - simd_distance(_drive->position(), _drive->position(i)) / 150.0f, 0.0f, 1.0f);
+        _rivalAudio[k]->setMasterVolume(_audio && _audio->muted() ? 0.0f : 0.45f * near * near);
+        _rivalAudio[k]->update(dt, _drive->state(i), _drive->input(i).throttle);
+    }
     self.window.title = [NSString stringWithFormat:@"FUEL — %s", _scene.variant.c_str()];
     const std::string raceLine = _race ? _race->hud(*_drive) : _scene.variant;
     _hud.stringValue = [NSString stringWithFormat:@"%s\n%3.0f km/h   gear %d   %5.0f rpm   %s", raceLine.c_str(), std::fabs(st.speedKmh),
