@@ -130,7 +130,7 @@ public:
         if (job_.valid()) job_.wait();
     }
     size_t placementCount() const { return placed_.size(); }
-    // Procedural trees and bushes within kPlantRadius (drawn, not solid).
+    // Procedural trees and bushes (drawn; tree trunks solid within kCollideRadius).
     // Also seats the FITTOGROUND objects on `terrain`, as the engine does at load.
     void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain);
     // Surface types for ground clutter (grass tufts, stones); must be thread-safe.
@@ -152,7 +152,14 @@ public:
     bool nearestProp(simd_float3 from, const std::vector<simd_float3>& skip, simd_float3& out) const;
 
 private:
-    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f, kPlantRadius = 700.0f, kImpostorRadius = 2500.0f;
+    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f;
+    // Decor draw distances follow FUEL's decor quadtree (see decorChunkSize in drive.mm):
+    // trees end with the 384 m chunks (camera within 2.0625 x 768 m of the 768 m chunk
+    // centre, so at most ~2130 m away), bushes with the 96 m chunks, full meshes with the
+    // 48 m chunks (~200 m). kPlantRadius only bounds the scatter.
+    static constexpr float kPlantRadius = 1150.0f;  // the 192 m chunks reach ~1100 m (FUEL's 384 m card chunks: ~2130 m)
+    static constexpr double kTreeChunkMax = 600.0, kBushChunkMax = 100.0, kFullMeshChunk = 60.0;
+    static constexpr double kTreeCardStandIn = 300.0;  // see buildBackground: full trees stand in for the cards below this
     static constexpr float kPropRadius = 120.0f, kPropForget = 300.0f;  // dynamic within, state reset beyond
     const fuel::Vegetation* vegetation_ = nullptr;
     fuel::SurfaceQuery surfaces_;
