@@ -90,7 +90,15 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
 
     // Steer at a point ahead on the line (further at speed): pure pursuit.
     const float look = std::clamp(9.0f + std::fabs(speed) * 0.8f, 10.0f, 34.0f);
-    const auto target = line.pointAhead(next, s.x, s.z, look);
+    float lineHeading = 0;
+    auto target = line.pointAhead(next, s.x, s.z, look, &lineHeading);
+    {
+        // Keep to its lane, closing in on the line within 50 m of the gate.
+        const auto& gate = line.points[next + 1];
+        const float lane = lane_ * std::clamp((float(std::hypot(gate[0] - s.x, gate[2] - s.z)) - 10.0f) / 40.0f, 0.0f, 1.0f);
+        target[0] += std::cos(lineHeading) * lane;
+        target[2] -= std::sin(lineHeading) * lane;
+    }
     float want = std::atan2(target[0] - float(s.x), target[2] - float(s.z));
 
     // Obstacles: try headings fanning out from the line (the side picked last time first)

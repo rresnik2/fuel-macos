@@ -626,7 +626,8 @@ void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int co
         const int i = drive.addVehicle(av, setup, at.x, at.z + 30.0 * drive.vehicleCount(), 0, rider);  // the grid comes with RaceSession::begin
         RaceSession::Racer racer;
         racer.name = garage.label(entry);
-        racer.ai = fuel::RaceDriver(std::uniform_real_distribution<float>(0.85f, 1.0f)(rng));
+        const float lanes[3] = {3.5f, -3.5f, 0.0f};  // matching the grid: right, left, centre
+        racer.ai = fuel::RaceDriver(std::uniform_real_distribution<float>(0.85f, 1.0f)(rng), lanes[race.racers.size() % 3]);
         race.racers.push_back(racer);
         // Paint: a random livery the vehicle has (or plain paint) and a random palette colour.
         const AssemblyMode& am = *garage.archives[garage.entries[entry].first];

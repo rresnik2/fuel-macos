@@ -39,7 +39,8 @@ struct RaceLine {
 class RaceDriver {
 public:
     // `skill` 0.85..1: share of the top speed this driver uses (and how late it brakes).
-    explicit RaceDriver(float skill = 1.0f) : skill_(skill) {}
+    // `lane`: metres to the side of the line it keeps between gates (so the field spreads out).
+    explicit RaceDriver(float skill = 1.0f, float lane = 0.0f) : skill_(skill), lane_(lane) {}
 
     struct Sense {
         double x = 0, z = 0;
@@ -64,7 +65,7 @@ public:
     int resets() const { return resets_; }
 
 private:
-    float skill_;
+    float skill_, lane_;
     float stuckTime_ = 0, reverseTime_ = 0, upsideDown_ = 0, stuckTotal_ = 0;  // seconds
     float bestRemaining_ = 1e30f, sinceProgress_ = 0;  // distance to the target, seconds since it last shrank by 5 m
     size_t lastNext_ = size_t(-1);
