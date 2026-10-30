@@ -151,6 +151,7 @@ private:
         HasNormalLocal = 1u << 4,
         HasDirt = 1u << 5,
         Reflective = 1u << 6,
+        GroundTint = 1u << 7,  // grey detail diffuse: multiplied by the local ground colour
     };
     enum Slot { kDiffuse = 0, kOcclusion = 2, kNormal = 3, kSpecular = 4, kNormalLocal = 5, kDirt = 6 };
 
@@ -195,6 +196,12 @@ private:
     std::unique_ptr<GpuMesh> buildMesh(uint32_t meshId, std::string* error);
     float shadowHalfSize() const { return std::max(radius_ * 1.05f, shadowRadius); }
     id<MTLTexture> texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind);
+    struct TextureStats {
+        simd_float3 mean = {0.5f, 0.5f, 0.5f};  // of the DXT colour endpoints, 0..1
+        bool greyDetail = false;  // pure grey around 0.5: takes the ground colour
+    };
+    const TextureStats& textureStats(uint32_t bitmapId);
+    std::unordered_map<uint32_t, TextureStats> textureStats_;
     id<MTLRenderPipelineState> pipeline(uint32_t stride, AlphaMode mode);
     id<MTLRenderPipelineState> shadowPipeline(uint32_t stride);
     GpuMaterial makeMaterial(uint32_t materialId, uint32_t diffuseOverride = 0, uint32_t specularOverride = 0);

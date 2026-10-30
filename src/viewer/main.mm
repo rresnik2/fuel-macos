@@ -103,6 +103,7 @@ struct Options {
     bool havePaint = false;
     int paint[3] = {60, 60, 60};
     bool noRider = false;
+    float film = 0;      // --film S: with --shot, a chase-camera frame every S seconds of the drive
     std::string record;  // --record DIR: frame log and grabs of a window session
 };
 
@@ -183,6 +184,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--dirt") o.dirt = std::stof(next());
         else if (a == "--no-rider") o.noRider = true;
         else if (a == "--record") o.record = next();
+        else if (a == "--film") o.film = std::stof(next());
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
         else if (a == "--color") o.color = std::stoi(next());
@@ -1423,7 +1425,25 @@ int main(int argc, const char** argv) {
                             if (opt.aiCheck && std::all_of(race->racers.begin(), race->racers.end(), [](const RaceSession::Racer& r) { return r.finished >= 0; })) break;
                         }
                         drive->update(1.0f / 60, in);
-                        if (streamer && (opt.propCheck || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
+                        if (streamer && (opt.propCheck || opt.film > 0 || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
+                        if (opt.film > 0 && i % std::max(1, int(opt.film * 60)) == 0) {  // --film: OUT_0001.png ... from the chase camera
+                            renderer.setInstanceWorlds(drive->partWorlds());
+                            showOpponents(*drive, renderer);
+                            if (race) renderer.setMarkers(race->markers());
+                            renderer.setFocus(drive->position());
+                            fuel::OrbitCamera chase = cam;
+                            chase.yaw += drive->heading() + float(M_PI);
+                            Options frame = opt;
+                            const fs::path out(opt.shot);
+                            char suffix[16];
+                            std::snprintf(suffix, sizeof suffix, "_%04d", i / std::max(1, int(opt.film * 60)));
+                            frame.shot = (out.parent_path() / (out.stem().string() + suffix + out.extension().string())).string();
+                            renderShot(device, renderer, frame, chase);
+                            const fuel::VehicleState fs = drive->state();
+                            const simd_float3 fp = drive->position();
+                            std::printf("film %s t=%.1f (%.0f, %.0f, %.0f) %.0f km/h %d wheels down%s\n", frame.shot.c_str(), i / 60.0, fp.x, fp.y, fp.z, fs.speedKmh, fs.wheelsOnGround,
+                                        race ? (" " + race->hud(*drive)).c_str() : "");
+                        }
                         if (streamer && opt.propCheck) {
                             const float v = drive->state().speedKmh;
                             if (i % 20 == 0 && std::getenv("FUEL_PROP_TRACE")) {

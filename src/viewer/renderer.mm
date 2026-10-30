@@ -57,7 +57,7 @@ struct MaterialUniforms {
 };
 
 constant uint PaintOnly = 1, HasOcclusion = 2, HasNormal = 4, HasSpecular = 8, HasNormalLocal = 16, HasDirt = 32,
-              Reflective = 64;
+              Reflective = 64, GroundTint = 128;
 
 struct VertexOut {
     float4 position [[position]];
@@ -67,7 +67,8 @@ struct VertexOut {
     float2 uv;
     float4 sunPos;
     float3 m0, m1, m2;  // the instance's rotation (for object-space normal maps)
-    float3 tint;        // foliage: local ground colour (leaf textures are grey)
+    float3 tint;        // local ground colour x2, for grey foliage and rock textures
+    uint sprite [[flat]];
 };
 
 constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
@@ -136,9 +137,10 @@ vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[bu
     const float4x4 model = models[iid];
     VertexOut o;
     o.tint = float3(1.0);
-    if (sprite != 0 && f.fog.y > 0.0) {
-        // Like FUEL's ground, foliage is a grey detail map coloured by the palette: use the
-        // ground colour under the plant, times 2.
+    o.sprite = sprite;
+    if (f.fog.y > 0.0) {
+        // Like FUEL's ground, foliage and rocks take the palette colour under them
+        // (ground x 2; the fragment shader decides how to apply it).
         constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
         o.tint = groundColour.sample(lin, (model[3].xz + 70000.0) / 140000.0, level(0)).rgb * 2.0;
     }
@@ -181,7 +183,14 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     // right half the damaged one; draw the intact half.
     float2 uvHalf = (m.code == 17 || m.code == 20) ? float2(in.uv.x * 0.5, in.uv.y) : in.uv;
     float4 d = tDiffuse.sample(smp, uvHalf);
-    d.rgb *= in.tint;
+    if (in.sprite != 0) {
+        // Leaves: the ground's hue with only mild darkening; some leaf textures are
+        // already dark, and a plain multiply turns them black.
+        const float lum = max(dot(in.tint, float3(0.3, 0.55, 0.15)), 1e-3);
+        d.rgb *= in.tint / lum * clamp(lum, 0.6, 1.0);
+    }
+    else if (m.features & GroundTint)  // rock: a muted version of the ground colour
+        d.rgb *= mix(float3(dot(in.tint, float3(0.3, 0.55, 0.15))), in.tint, 0.35);
     if (m.code == 17 || m.code == 19) {
         // Car paint shows where the livery's alpha is 0.
         d.rgb = mix(f.paint.rgb, d.rgb, (m.features & PaintOnly) ? 0.0 : d.a);
@@ -197,15 +206,23 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     float alpha = m.alphaMode == 2 ? c.a : 1.0;
     if (m.lit == 0) return float4(tonemap((c.rgb + m.emissive.rgb) * f.params.y), alpha);
 
-    float3 N = normalize(in.normal) * (front ? 1.0 : -1.0);
+    // Some foliage stores no normal at all: fall back to up.
+    const float3 n0 = dot(in.normal, in.normal) > 1e-8 ? normalize(in.normal) : float3(0, 1, 0);
+    float3 N = n0 * (front ? 1.0 : -1.0);
+    // Leaf cards lit as flat quads go black on the side away from the sun (and
+    // many store no useful normal); light cut-outs like a canopy instead:
+    // mostly up, a little of their own direction.
+    const bool foliage = in.sprite != 0 || (m.alphaMode != 0 && !(m.features & Reflective));
+    if (foliage) N = normalize(mix(n0, float3(0, 1, 0), 0.7));
     if (m.features & HasNormalLocal) {
         // Object-space normal map, two channels plus alpha.
         const float3 nl = tNormalLocal.sample(smp, uvHalf).xyw * 2.0 - 1.0;
         N = normalize(in.m0 * nl.x + in.m1 * nl.y + in.m2 * nl.z);
-    } else if (m.features & HasNormal) {
+    } else if ((m.features & HasNormal) && in.sprite == 0) {  // sprites have no usable tangent frame
         // Tangent-space normal map with x in alpha and y in green.
         float2 xy = tNormal.sample(smp, uvHalf).wy * 2.0 - 1.0;
-        float3 T = normalize(in.tangent.xyz - N * dot(N, in.tangent.xyz));
+        float3 T = in.tangent.xyz - N * dot(N, in.tangent.xyz);
+        T = dot(T, T) > 1e-8 ? normalize(T) : normalize(cross(N, abs(N.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0)));
         float3 B = cross(N, T) * in.tangent.w;
         N = normalize(T * xy.x + B * xy.y + N * sqrt(saturate(1.0 - dot(xy, xy))));
     }
@@ -214,6 +231,7 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     float specStrength = saturate(dot(spec, float3(1.0 / 6.0)));
     float rough = clamp(sqrt(2.0 / (max(m.specular.w, 0.0) + 2.0)), 0.08, 1.0);
     float shadow = shadowFactor(shadowMap, in.sunPos);
+    if (foliage) shadow = mix(0.55, 1.0, shadow);  // leaves let light through
     float3 V = normalize(f.eye.xyz - in.world);
     float3 rgb = lighting(c.rgb, N, V, ao, shadow, specStrength, rough, m.fresnel, (m.features & Reflective) != 0, f);
     return float4(tonemap(haze(rgb + m.emissive.rgb, in.world, f) * f.params.y), alpha);
@@ -800,6 +818,38 @@ id<MTLRenderPipelineState> MeshRenderer::shadowPipeline(uint32_t stride) {
     return ps;
 }
 
+// Like the ground's detail maps, some world textures (rocks, cliffs) are pure
+// grey around a mean of 0.5 and take their colour from the ground palette.
+// Photographic grey textures always carry a little colour, so the test is
+// strict: (nearly) every DXT colour endpoint must be grey (textureStats).
+const MeshRenderer::TextureStats& MeshRenderer::textureStats(uint32_t bitmapId) {
+    if (auto it = textureStats_.find(bitmapId); it != textureStats_.end()) return it->second;
+    TextureStats st;
+    if (auto hit = bitmapId ? library_.find(bitmapId, cls::Bitmap) : ResourceLibrary::Hit{}) {
+        try {
+            const BitmapInfo bi = parseBitmapLink(hit.file->link(*hit.entry));
+            const auto body = hit.file->body(*hit.entry);
+            const size_t block = bi.format == PixelFormat::DXT1 ? 8 : bi.format == PixelFormat::DXT5 ? 16 : 0;
+            const size_t blocks = size_t(std::max(1u, bi.width / 4)) * std::max(1u, bi.height / 4);
+            if (block && body && body->size() >= blocks * block) {
+                size_t coloured = 0;
+                simd_float3 sum = 0;
+                for (size_t q = 0; q < blocks; ++q)
+                    for (size_t c = 0; c < 2; ++c) {
+                        const uint8_t* e = body->data() + q * block + (block - 8) + c * 2;
+                        const int v = e[0] | (e[1] << 8), r = v >> 11, g = (v >> 5) & 63, b = v & 31;
+                        if (std::abs(r - b) > 1 || std::abs(g - 2 * r) > 2) ++coloured;
+                        sum += simd_make_float3(r / 31.0f, g / 63.0f, b / 31.0f);
+                    }
+                st.mean = sum / float(blocks * 2);
+                st.greyDetail = coloured * 100 <= blocks * 2 && st.mean.y > 0.4f && st.mean.y < 0.6f;  // at most 1% off-grey
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    return textureStats_[bitmapId] = st;
+}
+
 id<MTLTexture> MeshRenderer::texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind) {
     *alphaKind = 0;
     if (bitmapId == 0) return nil;
@@ -886,6 +936,8 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId, uint32
         }
         uint8_t alphaKind = 0, ignored = 0;
         if (id<MTLTexture> t = texture(diffuseTex, true, &alphaKind)) gm.textures[kDiffuse] = t;
+        const TextureStats& ts = textureStats(diffuseTex);
+        if (ts.greyDetail) gm.features |= GroundTint;
         const struct { Slot slot; bool srgb; uint32_t feature; } maps[] = {
             {kOcclusion, false, HasOcclusion}, {kNormal, false, HasNormal},     {kSpecular, false, HasSpecular},
             {kNormalLocal, false, HasNormalLocal}, {kDirt, true, HasDirt},
@@ -914,6 +966,12 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId, uint32
             gm.alpha = AlphaMode::Blend;
         else if (alphaKind == 1 || (m.flags & 0x180000))
             gm.alpha = AlphaMode::Test;
+        // Some leaf textures are very dark and go black once tinted by the
+        // ground colour; lift dark green cut-outs to a common brightness.
+        if (gm.alpha != AlphaMode::Opaque && ts.mean.y > ts.mean.x && ts.mean.y > ts.mean.z && ts.mean.y < 0.22f) {
+            const float gain = std::min(2.5f, 0.24f / std::max(ts.mean.y, 0.02f));
+            gm.diffuse = simd_make_float4(gm.diffuse.xyz * gain, gm.diffuse.w);
+        }
         gm.lit = (m.flags & 0x3000) == 0;
         gm.skip = m.skipDraw();
         gm.samplerIndex = (m.clampU() ? 1u : 0u) | (m.clampV() ? 2u : 0u);
