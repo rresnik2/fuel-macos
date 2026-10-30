@@ -90,7 +90,7 @@ float shadowFactor(depth2d<float> map, float4 sunPos) {
 constant float3 kSunColour = float3(1.0, 0.74, 0.46);
 
 float3 skyColor(float3 d, float3 sun) {
-    float3 zenith = float3(0.14, 0.21, 0.36), horizon = float3(0.74, 0.57, 0.39), ground = float3(0.20, 0.15, 0.10);
+    float3 zenith = float3(0.11, 0.19, 0.38), horizon = float3(0.70, 0.56, 0.42), ground = float3(0.20, 0.15, 0.10);
     float3 c = d.y >= 0.0 ? mix(horizon, zenith, pow(d.y, 0.5)) : mix(horizon * 0.75, ground, saturate(-d.y * 4.0));
     float mu = saturate(dot(d, sun));
     return c + float3(1.0, 0.62, 0.30) * (pow(mu, 6.0) * 0.40 + pow(mu, 48.0) * 0.9);
@@ -101,7 +101,7 @@ float3 skyColor(float3 d, float3 sun) {
 float3 groundGrade(float3 c) {
     float l = dot(c, float3(0.30, 0.59, 0.11));
     float green = saturate((c.g - max(c.r, c.b)) / max(c.g, 1e-3) * 2.0);
-    return mix(float3(l), c, mix(0.75, 0.45, green)) * float3(1.06, 0.98, 0.84);
+    return mix(float3(l), c, mix(0.75, 0.45, green)) * float3(0.92, 0.86, 0.76);
 }
 
 // Aerial perspective: distance haze in the colour of the sky near the horizon in
@@ -514,7 +514,7 @@ vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const de
     const float mu = dot(normalize(p.position.xyz - f.eye.xyz), L);
     const float g = 0.55;
     const float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5) / (4.0 * M_PI_F);
-    float3 light = kSunColour * f.sunDir.w * (0.4 + hg * 2.5) + float3(0.30, 0.29, 0.29);
+    float3 light = kSunColour * f.sunDir.w * (0.35 + hg * 1.8) + float3(0.28, 0.28, 0.29);
     o.rgb = haze(p.colour.rgb * light, p.position.xyz, f);
     o.alpha = p.colour.a;
     return o;
@@ -647,13 +647,13 @@ fragment float4 fsComposite(FullOut in [[stage_in]], texture2d<float> hdr [[text
     }
     c *= u.params.x;
     if (u.grade.w > 0.0) {
-        c *= float3(1.05, 1.0, 0.90);  // warm white balance
+        c *= float3(1.03, 1.0, 0.94);  // warm white balance
         c = acesFitted(c);
         // Grade in display space: contrast around mid grey, lift the blacks a touch
         // towards brown, golden highlights, then saturation.
         float3 g = pow(c, 1.0 / 2.2);
         g = saturate((g - 0.45) * u.grade.y + 0.45);
-        g = g * float3(1.03, 0.99, 0.90) + float3(0.018, 0.012, 0.004) * (1.0 - g);
+        g = g * mix(float3(0.97, 1.0, 1.02), float3(1.04, 0.99, 0.90), g) + float3(0.016, 0.011, 0.004) * (1.0 - g);
         float l = dot(g, float3(0.2126, 0.7152, 0.0722));
         g = mix(float3(l), g, u.grade.x);
         // Vignette: dark corners and edges.
