@@ -32,6 +32,8 @@
 #import "drive.h"
 #import "recorder.h"
 #import "game_settings.h"
+#include "ui/game_menu.h"
+#include "ui/menu_check.hpp"
 #include "rider_view.h"
 #include "hubcheck.h"
 #include "core/hubs.hpp"
@@ -73,6 +75,7 @@ constexpr MTLPixelFormat kColorFormat = fuel::kOutputColorFormat;
 constexpr NSUInteger kSamples = 4;  // the scene's MSAA
 
 fuel::Recorder gRecorder;  // --record
+std::unique_ptr<fuel::ui::GameOverlay> gOverlay;  // --in-game: pause/results menu and HUD
 std::vector<fuel::Hub> gHubs;  // the 19 hubs (--hub, --hub-check, the T key)
 const fuel::Heightfield* gTerrain = nullptr;  // for the T key
 
@@ -112,6 +115,10 @@ struct Options {
     bool noRider = false;
     float film = 0;      // --film S: with --shot, a chase-camera frame every S seconds of the drive
     std::string record;  // --record DIR: frame log and grabs of a window session
+    bool game = false;      // --game: FUEL's menus (title, top menu, lists, options); sessions run in a new process
+    bool inGame = false;    // --in-game: a session started from the menus (pause/results menu, HUD)
+    std::string menuShot, menuShotOut, menuPage;  // --menu-shot PAGE OUT.png, --menu-page PAGE
+    bool menuCheck = false; // --menu-check
     bool settings = false;  // --settings: size, fullscreen, post effects, grass, volume (and data) from the settings file; --game implies it
 };
 
@@ -195,6 +202,11 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--no-rider") o.noRider = true;
         else if (a == "--record") o.record = next();
         else if (a == "--settings") o.settings = true;
+        else if (a == "--game") { o.game = true; o.settings = true; }
+        else if (a == "--in-game") { o.inGame = true; o.settings = true; }
+        else if (a == "--menu-shot") { o.menuShot = next(); o.menuShotOut = next(); }
+        else if (a == "--menu-page") o.menuPage = next();
+        else if (a == "--menu-check") o.menuCheck = true;
         else if (a == "--film") o.film = std::stof(next());
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
@@ -977,6 +989,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
 }
 
 - (void)keyDown:(NSEvent*)e {
+    if (gOverlay && gOverlay->keyDown(e.keyCode)) return;
     if (_drive) {
         if ([self driveKey:e.keyCode]) {
             _keys.insert(e.keyCode);
@@ -1053,10 +1066,60 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
 
+// --in-game: the race order for the results page and the HUD.
+- (std::vector<fuel::ui::ResultRow>)resultRows {
+    std::vector<fuel::ui::ResultRow> rows;
+    if (!_race) return rows;
+    const std::vector<int> pos = _race->positions(*_drive);
+    for (int p = 1; p <= int(_race->racers.size()); ++p)
+        for (size_t i = 0; i < _race->racers.size(); ++i)
+            if (pos[i] == p) rows.push_back({_race->racers[i].name, float(std::max(0.0, _race->racers[i].finished)), i == 0});
+    return rows;
+}
+
+- (fuel::ui::HudState)hudState {
+    static float odometer = 0;
+    static double last = 0;
+    const double now = CACurrentMediaTime();
+    fuel::ui::HudState h;
+    const fuel::VehicleState st = _drive->state();
+    h.speedKmh = std::fabs(st.speedKmh);
+    if (last > 0 && !gOverlay->open()) odometer += h.speedKmh / 3600.0f * float(std::min(0.1, now - last));
+    last = now;
+    h.odometerKm = odometer;
+    const simd_float3 at = _drive->position();
+    const auto& hubs = gOverlay->menu().hubs();
+    if (const fuel::Hub* hub = fuel::nearestHub(hubs, at.x, at.z))
+        h.hubName = hub->nameText ? gOverlay->menu().textOf(hub->nameText) : hub->id;
+    if (_race && _race->racers.size() > 1) {
+        h.race = true;
+        h.standings = [self resultRows];
+        for (auto& r : h.standings) r.time = 0;
+    }
+    return h;
+}
+
+- (void)mouseDown:(NSEvent*)e {
+    if (!gOverlay || !gOverlay->open()) return;
+    const NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    const CGSize ds = self.drawableSize;
+    gOverlay->pointer(float(p.x * ds.width / self.bounds.size.width), float((self.bounds.size.height - p.y) * ds.height / self.bounds.size.height), true,
+                      float(ds.width), float(ds.height));
+}
+
 - (void)driveStep {
     const double now = CACurrentMediaTime();
     const float dt = _lastTime > 0 ? float(std::min(now - _lastTime, 0.1)) : 0.0f;
     _lastTime = now;
+    if (gOverlay) {  // --in-game: the menu pauses the session
+        gOverlay->pollGamepad();
+        const auto action = gOverlay->update(dt);
+        if (action == fuel::ui::GameOverlay::Restart) {
+            if (_race) _race->begin(*_drive, _streamer, *_renderer);
+            else _drive->reset();
+        }
+        if (gOverlay->open()) return;
+    }
     auto down = [&](unsigned short a, unsigned short b) { return _keys.count(a) || _keys.count(b); };
     fuel::DriveInput in;
     in.throttle = down(13, 126) ? 1.0f : 0.0f;
@@ -1083,6 +1146,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
         if (_race->state == RaceSession::Finished && !_race->reported) {
             _race->reported = true;
             std::printf("%s finished: order\n%s", _race->race().name.c_str(), _race->standings(*_drive).c_str());
+            if (gOverlay) gOverlay->openResults([self resultRows]);
         }
     }
     showOpponents(*_drive, *_renderer);
@@ -1127,6 +1191,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     id<MTLCommandBuffer> cb = [_queue commandBuffer];
     const double t0 = CACurrentMediaTime();
     _renderer->render(cb, drawable.texture, _drive ? _chaseView : _cam);
+    if (gOverlay && _drive) gOverlay->draw(cb, drawable.texture, [self hudState]);
     if (gRecorder.active()) {
         _frame.encodeMs = (CACurrentMediaTime() - t0) * 1000.0;
         gRecorder.watchGpu(cb);
@@ -1147,6 +1212,17 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
 int main(int argc, const char** argv) {
     @autoreleasepool {
         Options opt = parseArgs(argc, argv);
+        if (opt.menuCheck) return fuel::ui::runMenuCheck(opt.dataDir, fuel::loadSettings().language);
+        if (!opt.menuShot.empty()) {
+            fuel::Settings ms = fuel::loadSettings();
+            ms.dataDir = opt.dataDir;
+            return fuel::ui::runMenuShot(opt.dataDir, ms, opt.menuShot, opt.menuShotOut, opt.width > 0 ? opt.width : 1280, opt.height > 0 ? opt.height : 720);
+        }
+        if (opt.game) {
+            fuel::Settings gs = fuel::loadSettings();
+            gs.dataDir = opt.dataDir;
+            return fuel::ui::runGameMenu(argv[0], opt.dataDir, gs, opt.menuPage);
+        }
         if (!opt.hub.empty() || opt.hubCheck || (opt.drive && opt.shot.empty())) {  // hubs: --hub, --hub-check and the T key
             try {
                 gHubs = fuel::loadHubs(opt.dataDir);
@@ -1645,6 +1721,11 @@ int main(int argc, const char** argv) {
                                                   garage:garage.get()
                                                     race:race.get()];
         window.contentView = view;
+        if (opt.inGame && drive) {
+            gOverlay = std::make_unique<fuel::ui::GameOverlay>(device, kColorFormat, argv[0], opt.dataDir, playerSettings, opt.race, opt.hub, opt.assemble);
+            for (NSView* sub in view.subviews)
+                if ([sub isKindOfClass:[NSTextField class]]) sub.hidden = YES;  // the game's HUD pages replace the text line
+        }
         [window center];
         [window makeKeyAndOrderFront:nil];
         [window makeFirstResponder:view];
