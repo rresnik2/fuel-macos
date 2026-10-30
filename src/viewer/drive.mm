@@ -416,22 +416,68 @@ void WorldStreamer::updateProps(fuel::MeshRenderer& renderer, fuel::DriveWorld& 
     renderer.setPropInstances(list);
 }
 
+namespace {
+
+// FUEL's decor quadtree (FUN_007df0e0, FUN_007dfdc0, FUN_007de770): 12288 m root
+// chunks centred on multiples of 12288 m; a chunk splits into four (centres at
+// +-1/4 of its size) while the camera is within 2.0625 x its size of its centre,
+// measured on the ground plane; chunks of 24 m never split. Returns the size of
+// the leaf chunk holding (px, pz), which picks how the engine draws decor there.
+double decorChunkSize(double px, double pz, double camX, double camZ) {
+    constexpr double kRoot = 12288.0, kSplit = 2.0625, kMinChunk = 24.01;
+    double size = kRoot;
+    double ox = std::round(px / kRoot) * kRoot, oz = std::round(pz / kRoot) * kRoot;
+    while (size > kMinChunk) {
+        const double r = size * kSplit;
+        if ((ox - camX) * (ox - camX) + (oz - camZ) * (oz - camZ) >= r * r) break;
+        ox += (px >= ox ? 0.25 : -0.25) * size;
+        oz += (pz >= oz ? 0.25 : -0.25) * size;
+        size *= 0.5;
+    }
+    return size;
+}
+
+}  // namespace
+
 WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) const {
     Background bg;
     if (vegetation_ && terrain_) {
-        std::vector<fuel::Plant> plants;
+        std::vector<fuel::Plant> scattered, plants;
         const fuel::BlockedQuery blocked = [this](double x, double z) { return nearObstacle(x, z, kPlantClearance); };
-        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kPlantRadius, plants);
+        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kPlantRadius, scattered);
         // Trees are solid near the player: a trunk cylinder sized with the tree.
+        std::unordered_map<uint32_t, uint32_t> card;  // full mesh -> distant card (0 = none)
         std::unordered_set<uint32_t> trees;
-        for (const fuel::Species& sp : vegetation_->trees) trees.insert(sp.full);
-        for (const fuel::Plant& p : plants) {
+        for (const fuel::Species& sp : vegetation_->trees) trees.insert(sp.full), card[sp.full] = sp.impostor;
+        for (const fuel::Species& sp : vegetation_->bushes) card.emplace(sp.full, sp.impostor);
+        for (const fuel::Plant& p : scattered) {
             if (!trees.count(p.meshId) || std::hypot(p.position[0] - player.x, p.position[2] - player.z) > kCollideRadius) continue;
             const float size = std::hypot(p.axes[1][0], p.axes[1][1], p.axes[1][2]);
             const double r = std::clamp(0.07f * size, 0.2f, 0.5f);
             bg.trunks.push_back({r, 0, 0, 0, 0, 5.0, 0, 0, 0, 0, r, 0, p.position[0], p.position[1] - 0.5, p.position[2], 1});
         }
-        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kImpostorRadius, plants, true, kPlantRadius);
+        // Mesh or card by the leaf chunk under each plant (decoded from FUEL.exe,
+        // default "GenWorld" settings at 0x74d5b0): trees only in chunks < 600 m,
+        // full meshes in chunks < 60 m (W+0xa68), cards beyond; bushes only in
+        // chunks < 100 m, full meshes below 60 m (W+0xa64). In 30..60 m chunks the
+        // engine also queues the card next to the full mesh; the port draws the mesh.
+        // Port limitation: the renderer does not draw the tree cards correctly yet
+        // (they come out invisible or as dark rectangles; bush cards are fine), so
+        // trees keep their full mesh in the 96 m chunks (to ~200-540 m) and the
+        // 192 / 384 m chunks, where FUEL draws only cards, stay empty.
+        for (fuel::Plant& p : scattered) {
+            const bool tree = trees.count(p.meshId) != 0;
+            const double chunk = decorChunkSize(p.position[0], p.position[2], player.x, player.z);
+            if (chunk >= (tree ? kTreeCardStandIn : kBushChunkMax)) continue;
+            if (!tree && chunk >= kFullMeshChunk) {
+                const auto it = card.find(p.meshId);
+                if (it == card.end() || it->second == 0) continue;
+                p.meshId = it->second;
+            }
+            plants.push_back(p);
+        }
+        if (std::getenv("FUEL_STREAM_TRACE"))
+            std::printf("plants: %zu scattered, %zu drawn (%zu trunks)\n", scattered.size(), plants.size(), bg.trunks.size());
         fuel::scatterClutter(*vegetation_, *terrain_, surfaces_, player.x, player.z, kClutterRadius, plants);
         bg.plants.reserve(plants.size());
         for (const fuel::Plant& p : plants) {

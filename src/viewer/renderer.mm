@@ -310,6 +310,20 @@ float valueNoise(float2 p) {
     return mix(mix(hash12(i), hash12(i + float2(1, 0)), u.x), mix(hash12(i + float2(0, 1)), hash12(i + float2(1, 1)), u.x), u.y);
 }
 
+// Size of the leaf chunk of FUEL's camera-centred quadtree holding xz: 12288 m
+// roots on a 12288 m lattice, split into four while the camera is within 2.0625 x
+// the chunk size of its centre, down to 24 m (FUN_007dfdc0; drive.mm has the same).
+float groundChunk(float2 xz, float2 eye) {
+    float size = 12288.0;
+    float2 o = round(xz / size) * size;
+    for (int k = 0; k < 9 && size > 24.01; ++k) {
+        if (distance(o, eye) >= size * 2.0625) break;
+        o += select(float2(-0.25), float2(0.25), xz >= o) * size;
+        size *= 0.5;
+    }
+    return size;
+}
+
 struct TerrainOut {
     float4 position [[position]];
     float3 world;
@@ -350,32 +364,58 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
     float n = valueNoise(xz * 0.004) * 0.6 + valueNoise(xz * 0.03) * 0.3 + valueNoise(xz * 0.25) * 0.1;
     float3 c;
     if (f.fog.y > 0.0) {
-        // FUEL's ground: palette colour from the world map, modulated by the local
-        // surface's detail texture (B = grey detail x2, R/G/A = normal; y up).
+        // FUEL's ground (ground.phl + the GenWorld patch builder, decoded from FUEL.exe):
+        // albedo = vertex colour x the bump maps' grey detail (B) x 2; the normal is the
+        // lerp of three bump maps lerp(lerp(T0, T1, w1), T2, w2). Which three, and at
+        // what scale, depends on the size C of the terrain chunk under the point
+        // (the decor quadtree, see groundChunk): C <= 48 m the point's surface types
+        // at 0.2 repeats/m, C 96..192 m a fixed set at 0.015/m, C >= 384 m at 0.0015/m.
+        // The bump uv is the world position warped by two sines (FUN_007f9b50).
         constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
         float2 uv = (xz + 70000.0) / 140000.0;
         c = groundGrade(groundColour.sample(lin, uv).rgb);
-        float dist = length(f.eye.xyz - in.world);
-        float near = 1.0 - smoothstep(150.0, 600.0, dist);
-        if (near > 0.0) {
-            float size = float(groundSurface.get_width());
-            float2 t = uv * size - 0.5;
-            float2 i0 = floor(t), a = t - i0;
-            float2 duv = xz / 4.0;  // one repeat per 4 m
-            float4 d = 0.0;
-            for (int k = 0; k < 4; ++k) {
-                uint2 cell = uint2(clamp(i0 + float2(k & 1, k >> 1), 0.0, size - 1.0));
-                float w = ((k & 1) ? a.x : 1.0 - a.x) * ((k >> 1) ? a.y : 1.0 - a.y);
-                const uint layer = groundSurface.read(cell).r;
-                // Two scales (4 m and 17.3 m) so the repeat does not show.
-                d += w * (0.6 * detail.sample(rep, duv, layer) + 0.4 * detail.sample(rep, duv * 0.231 + 0.37, layer));
-            }
-            c *= mix(1.0, d.b * 2.0, near);
-            float3 nt = float3(d.r, d.g, d.a) * 2.0 - 1.0;
-            float3 T = normalize(float3(1, 0, 0) - N * N.x), B = cross(T, N);
-            N = normalize(mix(N, normalize(T * nt.x + N * max(nt.y, 0.2) - B * nt.z), near * 0.8));
+        const float2 warp = float2(xz.x + 5.0 * sin(0.02 * xz.y) + 2.0 * sin(0.2 * xz.y),
+                                   xz.y + 5.0 * sin(0.02 * xz.x) + 2.0 * sin(0.2 * xz.x));
+        // Surface types of the four nearest map samples: the near textures, and the
+        // sand / snow / cracked share that drives the third far layer (FUN_007e4950).
+        float size = float(groundSurface.get_width());
+        float2 t = uv * size - 0.5;
+        float2 i0 = floor(t), a = t - i0;
+        float4 nearDetail = 0.0;
+        float sandy = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            uint2 cell = uint2(clamp(i0 + float2(k & 1, k >> 1), 0.0, size - 1.0));
+            float w = ((k & 1) ? a.x : 1.0 - a.x) * ((k >> 1) ? a.y : 1.0 - a.y);
+            const uint layer = groundSurface.read(cell).r;
+            nearDetail += w * detail.sample(rep, warp * 0.2, layer);
+            sandy += w * float((layer >= 6 && layer <= 9) || layer == 24 || layer >= 36);
         }
+        // Steepness weight of the far sets: a = clamp(2 n.y - 1), s = 2a - 1,
+        // w1 = 1 - ((2 - |s|) s / 2 + 0.5) (FUN_007f7ea0 / FUN_007f8850).
+        const float sa = 2.0 * saturate(2.0 * N.y - 1.0) - 1.0;
+        const float steep = 1.0 - ((2.0 - abs(sa)) * sa * 0.5 + 0.5);
+        // Inferred: the fixed far sets are the large-scale *NL textures (types 17-21).
+        auto farSet = [&](float scale, float extra) {
+            float4 t0 = detail.sample(rep, warp * scale, 21), t1 = detail.sample(rep, warp * scale, 20);
+            float4 t2 = detail.sample(rep, warp * scale, extra > 0.0 ? 19 : 18);
+            return mix(mix(t0, t1, steep), t2, saturate(saturate(sandy + extra) - steep));
+        };
+        // Band of the chunk under this point and its geomorph towards the parent
+        // (start 2.375 C, over C / 2), as the engine tweens fine to coarse vertices.
+        const float chunk = groundChunk(xz, f.eye.xz);
+        const float dist = length(f.eye.xz - xz);
+        const float tween = saturate((dist - 2.375 * chunk) * 2.0 / chunk);
+        auto bandDetail = [&](float c) {
+            return c < 60.0 ? nearDetail : (c < 300.0 ? farSet(0.015, 0.75) : farSet(0.0015, 0.0));
+        };
+        float4 d = bandDetail(chunk);
+        if (tween > 0.0) d = mix(d, bandDetail(chunk * 2.0), tween);
+        c *= d.b * 2.0;
+        float3 nt = normalize(float3(d.r, d.g, d.a) * 2.0 - 1.0);
+        // ground.vhl tangent frame: x = cross(z, N), y = N, z = cross(x, N).
+        float3 T = normalize(cross(float3(0, 0, 1), N)), B = normalize(cross(T, N));
+        N = normalize(T * nt.x + N * nt.y + B * nt.z);
     } else {
         // Procedural fallback: grass and dry ground by altitude, rock on steep slopes, snow up high.
         float3 grass = float3(0.035, 0.060, 0.018), dry = float3(0.11, 0.085, 0.045);
