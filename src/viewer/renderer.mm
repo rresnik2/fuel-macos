@@ -325,6 +325,17 @@ float valueNoise(float2 p) {
 // Size of the leaf chunk of FUEL's camera-centred quadtree holding xz: 12288 m
 // roots on a 12288 m lattice, split into four while the camera is within 2.0625 x
 // the chunk size of its centre, down to 24 m (FUN_007dfdc0; drive.mm has the same).
+// A detail texture without visible tiling: two lookups at offsets chosen by a slow
+// noise index k (0..1), blended where k crosses between them (port addition; the
+// engine's per-vertex surface types vary the ground more than the port's map can).
+float4 detailVaried(texture2d_array<float> tex, sampler s, float2 uv, uint layer, float k, float2 gx, float2 gy) {
+    const float l = k * 8.0, i = floor(l), fr = l - i;
+    const float2 oa = sin(float2(3.0, 7.0) * i), ob = sin(float2(3.0, 7.0) * (i + 1.0));
+    const float4 a = tex.sample(s, uv + oa, layer, gradient2d(gx, gy));
+    const float4 b = tex.sample(s, uv + ob, layer, gradient2d(gx, gy));
+    return mix(a, b, smoothstep(0.2, 0.8, fr - 0.1 * (a.b - b.b)));
+}
+
 float groundChunk(float2 xz, float2 eye) {
     float size = 12288.0;
     float2 o = round(xz / size) * size;
@@ -412,13 +423,22 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         float size = float(groundSurface.get_width());
         float2 t = uv * size - 0.5;
         float2 i0 = floor(t), a = t - i0;
+        // Bands by distance from the camera, blended smoothly. FUEL picks them per terrain chunk
+        // (the decor quadtree, groundChunk): own surface types at 0.2 repeats/m in chunks up to
+        // 48 m (~110-230 m out), fixed sets at 0.015/m in 96-192 m chunks, 0.0015/m beyond. Per
+        // chunk, squares of ground swapped texture as chunks split and merged around the camera,
+        // so the port fades over distance ranges inside those bands instead (port choice).
+        const float dist = length(f.eye.xz - xz);
+        const float wNear = 1.0 - smoothstep(110.0, 150.0, dist), wFar = smoothstep(600.0, 900.0, dist);
+        const float k = valueNoise(xz * 0.03);
+        const float2 uvN = warp * 0.2, gxN = dfdx(uvN), gyN = dfdy(uvN);
         float4 nearDetail = 0.0;
         float sandy = 0.0;
-        for (int k = 0; k < 4; ++k) {
-            uint2 cell = uint2(clamp(i0 + float2(k & 1, k >> 1), 0.0, size - 1.0));
-            float w = ((k & 1) ? a.x : 1.0 - a.x) * ((k >> 1) ? a.y : 1.0 - a.y);
+        for (int q = 0; q < 4; ++q) {
+            uint2 cell = uint2(clamp(i0 + float2(q & 1, q >> 1), 0.0, size - 1.0));
+            float w = ((q & 1) ? a.x : 1.0 - a.x) * ((q >> 1) ? a.y : 1.0 - a.y);
             const uint layer = groundSurface.read(cell).r;
-            nearDetail += w * detail.sample(rep, warp * 0.2, layer);
+            if (wNear > 0.0 && w > 0.0) nearDetail += w * detailVaried(detail, rep, uvN, layer, k, gxN, gyN);
             sandy += w * float((layer >= 6 && layer <= 9) || layer == 24 || layer >= 36);
         }
         // Steepness weight of the far sets: a = clamp(2 n.y - 1), s = 2a - 1,
@@ -427,26 +447,21 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         const float steep = 1.0 - ((2.0 - abs(sa)) * sa * 0.5 + 0.5);
         // Inferred: the fixed far sets are the large-scale *NL textures (types 17-21).
         auto farSet = [&](float scale, float extra) {
-            float4 t0 = detail.sample(rep, warp * scale, 21), t1 = detail.sample(rep, warp * scale, 20);
-            float4 t2 = detail.sample(rep, warp * scale, extra > 0.0 ? 19 : 18);
+            const float2 uvF = warp * scale, gx = dfdx(uvF), gy = dfdy(uvF);
+            float4 t0 = detailVaried(detail, rep, uvF, 21, k, gx, gy), t1 = detailVaried(detail, rep, uvF, 20, k, gx, gy);
+            float4 t2 = detailVaried(detail, rep, uvF, extra > 0.0 ? 19 : 18, k, gx, gy);
             return mix(mix(t0, t1, steep), t2, saturate(saturate(sandy + extra) - steep));
         };
-        // Band of the chunk under this point and its geomorph towards the parent
-        // (start 2.375 C, over C / 2), as the engine tweens fine to coarse vertices.
-        const float chunk = groundChunk(xz, f.eye.xz);
-        const float dist = length(f.eye.xz - xz);
-        const float tween = saturate((dist - 2.375 * chunk) * 2.0 / chunk);
-        auto bandDetail = [&](float c) {
-            return c < 60.0 ? nearDetail : (c < 300.0 ? farSet(0.015, 0.75) : farSet(0.0015, 0.0));
-        };
-        float4 d = bandDetail(chunk);
-        if (tween > 0.0) d = mix(d, bandDetail(chunk * 2.0), tween);
-        // Vertex colour by band (FUN_007f9b50): chunks >= 600 m use ctx+0x90, the colour with the
-        // forest floor (palette 57) by weight k (map alpha); nearer ones ctx+0x70/0x80 (equal on land).
-        if (f.groundFar.w > 0.0) {
-            const float farW = mix(chunk >= 600.0 ? 1.0 : 0.0, chunk * 2.0 >= 600.0 ? 1.0 : 0.0, tween);
-            c = mix(c, f.groundFar.rgb, gc.a * farW);
+        float4 d = nearDetail;
+        if (wNear < 1.0) {
+            float4 mid = wFar < 1.0 ? farSet(0.015, 0.75) : float4(0.0);
+            if (wFar > 0.0) mid = mix(mid, farSet(0.0015, 0.0), wFar);
+            d = mix(mid, nearDetail, wNear);
         }
+        // Vertex colour by band (FUN_007f9b50): chunks >= 600 m (the 768 m leaves, from about
+        // 1.6 km) use ctx+0x90, the colour with the forest floor (palette 57) by weight k (map
+        // alpha); nearer ones ctx+0x70/0x80 (equal on land). Faded by distance like the bands.
+        if (f.groundFar.w > 0.0) c = mix(c, f.groundFar.rgb, gc.a * smoothstep(1400.0, 1800.0, dist));
         // ground.phl: colour x detail.B x 2, in gamma space for the decoded map (see vsGrass).
         if (f.groundFar.w > 0.0) c = pow(pow(c, 1.0 / 2.2) * d.b * 2.0, 2.2);
         else c *= d.b * 2.0;
@@ -1843,7 +1858,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                          indexType:MTLIndexTypeUInt32
                        indexBuffer:terrainIndices_
                  indexBufferOffset:0];
-        if (roadVertices_ != nil && roadIndices_ != nil) {
+        if (roadVertices_ != nil && roadIndices_ != nil && !std::getenv("FUEL_NO_ROADS")) {  // FUEL_NO_ROADS=1: hide the road ribbons (diagnostics)
             [enc setRenderPipelineState:roadPipeline_];
             [enc setDepthStencilState:depthNoWrite_];
             [enc setDepthBias:-8.0f slopeScale:-24.0f clamp:0.0f];
