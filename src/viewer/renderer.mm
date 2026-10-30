@@ -311,6 +311,12 @@ vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[
     uint n = uint(f.terrainGrid.w);
     float2 q = float2(vid % n, vid / n) / float(n - 1) * 2.0 - 1.0;
     float2 xz = f.terrainGrid.xy + q * abs(q) * f.terrainGrid.z;
+    // Snap to a world-fixed lattice (power-of-two spacing near the local vertex
+    // spacing) so the ground under a vertex does not change as the grid follows
+    // the camera; otherwise hills visibly swim and ripple while driving.
+    float2 spacing = max(2.0 * abs(q) * f.terrainGrid.z * (2.0 / float(n - 1)), float2(1.0));
+    float2 lattice = exp2(ceil(log2(spacing)));
+    xz = round(xz / lattice) * lattice;
     float3 w = float3(xz.x, terrainHeight(hm, xz, f), xz.y);
     TerrainOut o;
     o.position = f.viewProj * float4(w, 1.0);
@@ -473,7 +479,7 @@ struct FrameUniforms {
     simd_float4 camUp;
 };
 
-constexpr uint32_t kTerrainGridSize = 512;  // vertices per side
+constexpr uint32_t kTerrainGridSize = 1024;  // vertices per side
 
 struct MaterialUniforms {
     simd_float4 diffuse;
