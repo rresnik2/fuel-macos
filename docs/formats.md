@@ -132,6 +132,80 @@ cubic B-spline and adds procedural detail at run time.
 The 82 `USA1_*.DPC` sub-worlds (courses, hubs, dressing sets) hold only
 Node_Z placements whose world matrices are final; their meshes live in
 USA1.DPC. WorldRef_Z objects in USA1 give each sub-world's bounds.
+A Node_Z whose UserDefine_Z (body offset 0x18) has the line `FITTOGROUND`
+(also spelt `FITOGROUND`) is moved at load so its height equals the
+terrain's at its x, z; `GROUNDNORMAL` also tilts it to the terrain normal.
+About 2,700 USA1 nodes and 1,166 sub-world placements carry the flag.
+
+## GenWorld_Z procedural layers
+
+After the map list the GenWorld_Z body continues: `u32 n, ground texture[n]`,
+`u32 n, Material_Z[n]`, `u32 seed`, `u32 groups` of `{u32 len, name, u32,
+u32 n, Node_Z[n]}` (TREES, BUSHES, ROCKS), `u32 n` flat surfaces of 0x83
+bytes, then further tables.
+
+Seeded permutation: the engine shuffles 0..255 from the seed (USA1: 41).
+Start from a fixed 256-entry shuffle P; for d = 0..255 with seed bytes
+s0..s3: `e = P[(d+s0)&255]; e = P[(e+d+s1)&255]; e = P[(e+d+s2)&255];
+k = (e+d+s3)&255`, take the first still-unused entry from k upwards
+(wrapping) as RT[d] and mark it used. Positions hash to RT entries with
+`RT[round(x*12.317513 + z*10.193578 + offset) & 255]`.
+
+Fractal noise (used for forest clearings and flat-surface edges): a
+midpoint-displacement value noise over `levels` halvings of a `size`
+metre cell. Top-cell corners are `RT[...]/255` from a seed-offset hash;
+each edge midpoint is `m + (a*(hi-lo)/255*m + |A-B|/510 + a*lo/255) *
+(RT[h]-127.5)` and each centre the mean of the corners plus a similar
+term, with `a` halving per level; the finest cell is bilinear.
+Clearings: 3 levels of 500 m, amplitudes 0.025 / 0.15, gain 0.5.
+
+Trees and bushes (no positions are stored):
+- One candidate per 20 m cell at (20i, 20j), moved by `(b & 15) * 1.2` m
+  in x and `(b >> 4) * 1.2` m in z, b = RT hash with offset 33.13 (trees)
+  or 37.82 (bushes).
+- Density d = S(2F-1)/2 + 1/2 - 0.95 * (S(2G^2-1)/2 + 1/2), clamped, with
+  F the forest map (slot 7, cubic B-spline), G the clearing noise and
+  S(a) = a <= 0 ? (a+1)^8 - 1 : 1 - (1-a)^8; faded to zero on slopes past
+  45 degrees. A tree is kept if RT[hash]/255 < d; bushes skip this test.
+- Rejected within 10 m of a road closer than the road type's clearance
+  (6-32 m), above 3000 m, on slopes over 30 degrees, on rocky ground and in
+  fields (not ported), and within 5 m of placed objects.
+- Species: each TREES / BUSHES Node_Z leads to a Lod_Z whose last u32 is a
+  UserDefine_Z script `"GenWorld Arbre"` of items `{ "<date key>" min max }`
+  in percent. Keys: `12/11/2007 19:25` size range, `19:29` ground
+  alignment, `19:30` tilt (degrees), `20:01` weight, `19:32` humidity
+  (map 2), `19:34` density d, `17/04/2008 19:32` stormed (map 14),
+  `19:33` incinerated (map 13), `19:34` sanded (map 16), `19:35` flooded
+  (map 15), `19:36` high-ground factor (0 below about 2500 m). Ranges are
+  widened by 0.001 each way. Among the species whose ranges all hold, one
+  is picked by weight with the same RT[hash]/255 value (scaled by the
+  weight total when that exceeds 1, else possibly none).
+- Instance: four chained draws r0..r3 (r0 hashes x + 425.23886, the next
+  ones x + 931.9283 * previous). Scale = 6 * lerp(max, min, r0) times the
+  mesh, so 3..6 for every USA1 species; yaw = r3 * 6.28; up axis blended
+  towards the terrain normal by the alignment, then tilted by
+  (2r-1) * tilt on two axes; set 0.25 m into the ground.
+- LOD: chunks below half the tree view setting draw meshes, below it
+  meshes and impostor cards, beyond it cards only (setting values unknown).
+
+Grass is not a mesh scatter: on a 1 m grid the engine draws camera-facing
+tufts from the Grass material's 4x4 atlas where the per-point ground data
+has enough grass (the port approximates with low meshes by surface type).
+
+Flat surfaces (0x83 bytes): u32 id, axis X (+4), plane normal (+0x14),
+axis Z (+0x24), centre (+0x34) as float4s; +0x4c blend margin (metres,
+inside the shape), +0x50 strength, +0x44/+0x48 scale and offset for an
+optional height map (index u16 at +0x78, 0xffff = none), +0x7d priority
+(default 0x80), +0x7f adds 0.1 of a noise, +0x82 shape (0 rectangle,
+1 ellipse). Distance inside: rectangle `min((1-|u|)|X|, (1-|v|)|Z|)` with
+u, v the coordinates along the half-axes (corners on the -Z side rounded
+off by 15 m), ellipse the distance to the boundary along the radius;
+minus an edge jitter of 5 m times two small fractals. At a point the
+covering surfaces are taken by ascending priority; a priority change
+commits the height so far. Each adds `w((1-w)h + wP)` and `w` to two
+sums, w = (1/2 + c/2) * strength, c the 1.25-power S-curve of
+clamp(distance / margin), P the surface's plane height; the height is
+sum1 / sum2 once the weights exceed 0.01.
 
 ## Races
 

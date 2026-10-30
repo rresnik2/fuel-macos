@@ -1,19 +1,25 @@
 // fuelterrain: decodes the world heightfield and prints its layout.
 //
-//   fuelterrain USA1.DPC [--pgm REFERENCE.pgm] [--at X Z ...]
+//   fuelterrain USA1.DPC [--pgm REFERENCE.pgm] [--at X Z ...] [--seat]
 //
 // --pgm compares every sample with a 16-bit PGM export (raw * 65535 / 4095).
+// --seat measures how many objects the sub-worlds next to USA1.DPC place on the
+// ground, with the raw and the levelled (flat surfaces) heightfield.
 
 #include "core/dpc.hpp"
 #include "core/ground.hpp"
 #include "core/terrain.hpp"
+#include "core/world.hpp"
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <vector>
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -34,6 +40,33 @@ int main(int argc, char** argv) {
             if (a == "--levelled") {  // apply the flat surfaces to later --at queries
                 fuel::Heightfield& h = const_cast<fuel::Heightfield&>(hf);
                 std::printf("flat surfaces applied: %zu\n", fuel::applyFlatSurfaces(h, dpc));
+            } else if (a == "--seat") {
+                std::vector<std::unique_ptr<fuel::DpcFile>> subs;
+                for (const auto& e : std::filesystem::directory_iterator(std::filesystem::path(argv[1]).parent_path())) {
+                    if (e.path().extension() != ".DPC" || e.path().filename() == "USA1.DPC") continue;
+                    try {
+                        auto d = std::make_unique<fuel::DpcFile>(e.path().string());
+                        if (d->isCurrentVersion()) subs.push_back(std::move(d));
+                    } catch (const std::exception&) {
+                    }
+                }
+                fuel::Heightfield levelled = hf;
+                const size_t used = fuel::applyFlatSurfaces(levelled, dpc);
+                size_t total = 0, fit = 0, onRaw = 0, onLevelled = 0, nearRaw = 0, nearLevelled = 0;
+                for (const auto& sub : subs)
+                    for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, {sub.get(), &dpc})) {
+                        const float x = pm.world[12], y = pm.world[13], z = pm.world[14];
+                        if (std::fabs(x) < 50 && std::fabs(z) < 50) continue;
+                        if (pm.fitToGround) {
+                            ++fit;
+                            continue;
+                        }
+                        ++total;
+                        const float r = std::fabs(y - hf.smoothHeightAt(x, z)), l = std::fabs(y - levelled.smoothHeightAt(x, z));
+                        onRaw += r < 0.5f, onLevelled += l < 0.5f, nearRaw += r < 2.0f, nearLevelled += l < 2.0f;
+                    }
+                std::printf("flat surfaces used: %zu; placements: %zu fixed + %zu FITTOGROUND\n", used, total, fit);
+                std::printf("within 0.5 m: raw %zu, levelled %zu; within 2 m: raw %zu, levelled %zu\n", onRaw, onLevelled, nearRaw, nearLevelled);
             } else if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
                 std::printf("height at (%.1f, %.1f) = %.2f m\n", x, z, hf.heightAt(x, z));

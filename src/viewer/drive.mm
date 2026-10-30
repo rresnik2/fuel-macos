@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 
+#include "core/resources.hpp"
 #include "core/surface.hpp"
 #include "core/world.hpp"
 
@@ -284,9 +285,78 @@ WorldStreamer::WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds,
             const float x = pm.world[12], z = pm.world[14];
             if (std::fabs(x) < 50 && std::fabs(z) < 50) continue;  // stray objects at the origin
             const auto index = uint32_t(placed_.size());
-            placed_.push_back({pm.meshId, pm.world});
+            placed_.push_back({pm.meshId, pm.world, pm.fitToGround, pm.groundNormal});
             cells_[cellKey(int64_t(std::floor(x / kCell)), int64_t(std::floor(z / kCell)))].push_back(index);
+            addObstacle(pm);
         }
+}
+
+void WorldStreamer::setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) {
+    vegetation_ = v, terrain_ = terrain;
+    if (terrain == nullptr || seated_) return;
+    seated_ = true;
+    for (Placed& p : placed_) {
+        if (!p.fitToGround) continue;
+        const float x = p.world[12], z = p.world[14];
+        p.world[13] = terrain->smoothHeightAt(x, z);
+        if (!p.groundNormal) continue;
+        // Tilt the object's axes by the rotation that takes +y to the terrain normal.
+        constexpr float e = 2.0f;
+        const float dx = (terrain->smoothHeightAt(x + e, z) - terrain->smoothHeightAt(x - e, z)) / (2 * e);
+        const float dz = (terrain->smoothHeightAt(x, z + e) - terrain->smoothHeightAt(x, z - e)) / (2 * e);
+        const simd_float3 n = simd_normalize(simd_make_float3(-dx, 1, -dz));
+        const simd_float3 axis = simd_cross(simd_make_float3(0, 1, 0), n);
+        if (simd_length(axis) < 1e-5f) continue;
+        const simd_quatf q = simd_quaternion(std::asin(std::min(1.0f, simd_length(axis))), simd_normalize(axis));
+        for (size_t r = 0; r < 3; ++r) {
+            const simd_float3 row = simd_act(q, simd_make_float3(p.world[r * 4], p.world[r * 4 + 1], p.world[r * 4 + 2]));
+            p.world[r * 4] = row.x, p.world[r * 4 + 1] = row.y, p.world[r * 4 + 2] = row.z;
+        }
+    }
+}
+
+// Bounding circle (ground plane) of a placement, from its mesh's bounding sphere.
+void WorldStreamer::addObstacle(const fuel::PlacedMesh& pm) {
+    auto sphere = sphereOf_.find(pm.meshId);
+    if (sphere == sphereOf_.end()) {
+        std::array<float, 4> s{0, 0, 0, -1};
+        for (const fuel::DpcFile* f : lookup_)
+            if (const fuel::DpcFile::Entry* e = f->find(pm.meshId); e != nullptr && e->header != nullptr && e->classCrc == fuel::cls::Mesh) {
+                try {
+                    s = fuel::parseMeshLink(f->link(*e)).sphere;
+                } catch (const std::exception&) {
+                }
+                break;
+            }
+        sphere = sphereOf_.emplace(pm.meshId, s).first;
+    }
+    const std::array<float, 4>& s = sphere->second;
+    if (s[3] <= 0) return;
+    const auto& w = pm.world;
+    float scale = 0;
+    for (int r = 0; r < 3; ++r) scale = std::max(scale, std::hypot(w[size_t(r * 4)], w[size_t(r * 4 + 1)], w[size_t(r * 4 + 2)]));
+    const float radius = s[3] * scale;
+    if (radius > kMaxObstacle) return;  // terrain-sized pieces would clear whole hillsides
+    Obstacle o;
+    o.x = s[0] * w[0] + s[1] * w[4] + s[2] * w[8] + w[12];
+    o.z = s[0] * w[2] + s[1] * w[6] + s[2] * w[10] + w[14];
+    o.r = radius;
+    const auto index = uint32_t(obstacles_.size());
+    obstacles_.push_back(o);
+    const float reach = radius + kPlantClearance;
+    for (int64_t cz = int64_t(std::floor((o.z - reach) / kObstacleCell)); cz <= int64_t(std::floor((o.z + reach) / kObstacleCell)); ++cz)
+        for (int64_t cx = int64_t(std::floor((o.x - reach) / kObstacleCell)); cx <= int64_t(std::floor((o.x + reach) / kObstacleCell)); ++cx)
+            obstacleCells_[cellKey(cx, cz)].push_back(index);
+}
+
+bool WorldStreamer::nearObstacle(double x, double z, float clearance) const {
+    const auto it = obstacleCells_.find(cellKey(int64_t(std::floor(x / kObstacleCell)), int64_t(std::floor(z / kObstacleCell))));
+    if (it == obstacleCells_.end()) return false;
+    for (uint32_t i : it->second) {
+        const Obstacle& o = obstacles_[i];
+        if (std::hypot(x - o.x, z - o.z) < o.r + clearance) return true;
+    }
+    return false;
 }
 
 namespace {
@@ -348,14 +418,14 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
     Background bg;
     if (vegetation_ && terrain_) {
         std::vector<fuel::Plant> plants;
-        fuel::scatterPlants(*vegetation_, *terrain_, player.x, player.z, kPlantRadius, plants);
-        fuel::scatterPlants(*vegetation_, *terrain_, player.x, player.z, kImpostorRadius, plants, true, kPlantRadius);
+        const fuel::BlockedQuery blocked = [this](double x, double z) { return nearObstacle(x, z, kPlantClearance); };
+        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kPlantRadius, plants);
+        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kImpostorRadius, plants, true, kPlantRadius);
         fuel::scatterClutter(*vegetation_, *terrain_, surfaces_, player.x, player.z, kClutterRadius, plants);
         bg.plants.reserve(plants.size());
         for (const fuel::Plant& p : plants) {
-            const float c = std::cos(p.yaw) * p.scale, s = std::sin(p.yaw) * p.scale;
-            bg.plants.push_back({p.meshId, simd_matrix(simd_make_float4(c, 0, -s, 0), simd_make_float4(0, p.scale, 0, 0), simd_make_float4(s, 0, c, 0),
-                                                       simd_make_float4(p.position[0], p.position[1], p.position[2], 1))});
+            auto col = [&](size_t i) { return simd_make_float4(p.axes[i][0], p.axes[i][1], p.axes[i][2], 0); };
+            bg.plants.push_back({p.meshId, simd_matrix(col(0), col(1), col(2), simd_make_float4(p.position[0], p.position[1], p.position[2], 1))});
         }
     }
     if (roads_ && terrain_) {

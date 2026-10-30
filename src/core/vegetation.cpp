@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -15,7 +16,16 @@ namespace fuel {
 namespace {
 
 constexpr uint32_t kGenWorldClass = 0x31FA94AE;
-constexpr float kCell = 20.0f;  // one candidate per 20 m cell
+constexpr uint32_t kUserDefineClass = 0x52F79F96;
+constexpr int kCell = 20;          // one tree and one bush candidate per 20 m cell
+constexpr float kJitter = 1.2f;    // permutation nibble x 1.2 m
+constexpr float kTreeSalt = 33.13f, kBushSalt = 37.82f;
+constexpr float kTreeline = 3000.0f;
+constexpr float kMaxSlopeNy = 0.866f;   // 30 degrees
+constexpr float kFadeNy = 0.707f;       // density fades out within ~0.6 degrees past 45
+constexpr float kRoadQuery = 10.0f;     // the engine looks for roads within 10 m
+constexpr float kSizeScale = 6.0f;      // species size range x 6
+constexpr float kSink = 0.25f;          // plants are set 25 cm into the ground
 
 uint32_t rd32(const std::vector<uint8_t>& b, size_t o) {
     if (o + 4 > b.size()) throw std::runtime_error("GenWorld_Z body too short");
@@ -43,19 +53,212 @@ float valueNoise(float x, float z, uint32_t salt) {
     return (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * tz;
 }
 
-// FUEL's density contrast curve on [-1, 1].
+// FUEL's contrast curve on [-1, 1].
 float sharpen(float a) { return a <= 0 ? std::pow(a + 1, 8.0f) - 1 : 1 - std::pow(1 - a, 8.0f); }
 
-float sampleMap(const Raster& r, float x, float z) {
+// Cubic B-spline sample of a GenWorld map, on the same lattice as the heightfield
+// (sample i at -width/2 * spacing + i * spacing over the 140 km square).
+float sampleMap(const Raster& r, double x, double z) {
     if (r.raw.empty()) return 0;
-    const float fx = std::clamp((x + 70000.0f) / 140000.0f * r.width - 0.5f, 0.0f, float(r.width - 1));
-    const float fz = std::clamp((z + 70000.0f) / 140000.0f * r.height - 0.5f, 0.0f, float(r.height - 1));
-    const uint32_t x0 = uint32_t(fx), z0 = uint32_t(fz);
-    const uint32_t x1 = std::min(x0 + 1, r.width - 1), z1 = std::min(z0 + 1, r.height - 1);
-    const float tx = fx - x0, tz = fz - z0;
-    const float a = r.at(x0, z0) + (r.at(x1, z0) - r.at(x0, z0)) * tx;
-    const float b = r.at(x0, z1) + (r.at(x1, z1) - r.at(x0, z1)) * tx;
-    return a + (b - a) * tz;
+    const double spacing = 140000.0 / r.width;
+    const double tx = x / spacing + r.width / 2, tz = z / spacing + r.height / 2;
+    const double ix = std::floor(tx), iz = std::floor(tz);
+    auto weights = [](double a, double w[4]) {
+        w[0] = (1 - a) * (1 - a) * (1 - a) / 6;
+        w[1] = (4 - 6 * a * a + 3 * a * a * a) / 6;
+        w[3] = a * a * a / 6;
+        w[2] = 1 - w[0] - w[1] - w[3];
+    };
+    double wx[4], wz[4];
+    weights(tx - ix, wx);
+    weights(tz - iz, wz);
+    double v = 0;
+    for (int j = 0; j < 4; ++j) {
+        const auto row = uint32_t(std::clamp<double>(iz - 1 + j, 0, r.height - 1));
+        for (int i = 0; i < 4; ++i) v += wx[i] * wz[j] * r.at(uint32_t(std::clamp<double>(ix - 1 + i, 0, r.width - 1)), row);
+    }
+    return float(v);
+}
+
+float clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
+
+// "GenWorld Arbre": { "<date key>" a [b] } items, values in percent.
+void parseSpeciesScript(const std::vector<uint8_t>& body, Species& sp) {
+    if (body.size() < 4) return;
+    const uint32_t len = std::min<uint32_t>(rd32(body, 0), uint32_t(body.size() - 4));
+    const std::string text(reinterpret_cast<const char*>(&body[4]), len);
+    if (text.find("GenWorld Arbre") == std::string::npos) return;
+    for (size_t q = text.find('"'); q != std::string::npos; q = text.find('"', q + 1)) {
+        const size_t end = text.find('"', q + 1);
+        if (end == std::string::npos) break;
+        const std::string key = text.substr(q + 1, end - q - 1);
+        const size_t close = text.find('}', end);
+        if (close == std::string::npos) break;
+        const char* p = text.c_str() + end + 1;
+        const char* stop = text.c_str() + close;
+        float v[2] = {0, 0};
+        int n = 0;
+        while (p < stop && n < 2) {
+            char* next = nullptr;
+            const float f = std::strtof(p, &next);
+            if (next == p) {
+                ++p;
+                continue;
+            }
+            v[n++] = f;
+            p = next;
+        }
+        q = end;
+        if (n == 0) continue;
+        auto range = [&](Species::Range& r) {
+            if (n < 2) return;
+            r.lo = v[0] * 0.01f - 0.001f;
+            r.hi = v[1] * 0.01f + 0.001f;
+        };
+        if (key == "12/11/2007 19:25") range(sp.size);
+        else if (key == "12/11/2007 19:29") sp.groundAlign = v[0] * 0.01f;
+        else if (key == "12/11/2007 19:30") sp.tilt = v[0] * 0.017453292f;
+        else if (key == "12/11/2007 20:01") sp.weight = v[0] * 0.01f;
+        else if (key == "12/11/2007 19:32") range(sp.humidity);
+        else if (key == "12/11/2007 19:34") range(sp.density);
+        else if (key == "17/04/2008 19:32") range(sp.stormed);
+        else if (key == "17/04/2008 19:33") range(sp.incinerated);
+        else if (key == "17/04/2008 19:34") range(sp.sanded);
+        else if (key == "17/04/2008 19:35") range(sp.flooded);
+        else if (key == "17/04/2008 19:36") range(sp.highGround);
+    }
+}
+
+// Tree exclusion distance around each road type (the engine's road table).
+float roadClearance(int type) {
+    static constexpr float kClear[21] = {/* engine table removed from the published history; read from FUEL.exe at run time */};
+    return type >= 0 && type < 21 ? kClear[type] : 0;
+}
+
+// True when a road passes closer than its clearance (the engine only finds roads within 10 m).
+bool nearRoad(const RoadNetwork& net, double x, double z) {
+    const auto it = net.segCells.find(RoadNetwork::cellKey(int32_t(std::floor(x / RoadNetwork::kSegCell)), int32_t(std::floor(z / RoadNetwork::kSegCell))));
+    if (it == net.segCells.end()) return false;
+    double best = kRoadQuery;
+    int type = -1;
+    for (uint64_t ref : it->second) {
+        const RoadNetwork::Line& line = net.lines[size_t(ref >> 20)];
+        const size_t k = size_t(ref & 0xFFFFF);
+        const double ax = line.points[k][0], az = line.points[k][1];
+        const double bx = line.points[k + 1][0] - ax, bz = line.points[k + 1][1] - az;
+        const double len2 = bx * bx + bz * bz;
+        const double t = len2 > 0 ? std::clamp(((x - ax) * bx + (z - az) * bz) / len2, 0.0, 1.0) : 0.0;
+        const double d = std::hypot(x - (ax + bx * t), z - (az + bz * t));
+        if (d < best) best = d, type = line.type;
+    }
+    return type >= 0 && best < roadClearance(type);
+}
+
+struct Ground {
+    float y = 0;
+    float n[3] = {0, 1, 0};
+};
+
+Ground groundAt(const Heightfield& t, double x, double z) {
+    Ground g;
+    g.y = t.smoothHeightAt(x, z);
+    constexpr double e = 2.0;
+    const double dx = (t.smoothHeightAt(x + e, z) - t.smoothHeightAt(x - e, z)) / (2 * e);
+    const double dz = (t.smoothHeightAt(x, z + e) - t.smoothHeightAt(x, z - e)) / (2 * e);
+    const double len = std::sqrt(dx * dx + 1 + dz * dz);
+    g.n[0] = float(-dx / len), g.n[1] = float(1 / len), g.n[2] = float(-dz / len);
+    return g;
+}
+
+// Forest density 0..1: the sharpened forest map minus the sharpened clearing noise,
+// faded out on slopes past 45 degrees.
+float densityAt(const Vegetation& v, double x, double z, float ny) {
+    const float f = sampleMap(v.forest, x, z);
+    const float g = clamp01(v.clearings.at(x, z));
+    float d = clamp01((sharpen(2 * f - 1) * 0.5f + 0.5f) - 0.95f * (sharpen(2 * g * g - 1) * 0.5f + 0.5f));
+    if (ny < kFadeNy) d *= std::max(0.0f, 1 - (kFadeNy - ny) * 100);
+    return clamp01(d);
+}
+
+// 0 on low ground, 1 above about 2500 m (less on slopes).
+float highGround(float y, const float n[3]) {
+    float a = clamp01(y - (2500.0f + 250.0f * n[2]));
+    a = clamp01(a - 2 * (1 - n[1]));
+    return sharpen(2 * a - 1) * 0.5f + 0.5f;
+}
+
+// Weighted pick among the species whose climate ranges hold; r in 0..1. Index or -1.
+int pickSpecies(const std::vector<Species>& list, const Vegetation& v, double x, double z, const Ground& g, float density, float r,
+                bool needImpostor) {
+    const float hum = clamp01(sampleMap(v.humidity, x, z));
+    const float storm = clamp01(sampleMap(v.stormed, x, z)), incin = clamp01(sampleMap(v.incinerated, x, z));
+    const float sand = clamp01(sampleMap(v.sanded, x, z)), flood = clamp01(sampleMap(v.flooded, x, z));
+    const float high = highGround(g.y, g.n);
+    int ok[128];
+    int n = 0;
+    float total = 0;
+    for (size_t i = 0; i < list.size() && n < 128; ++i) {
+        const Species& s = list[i];
+        if (!s.humidity.has(hum) || !s.density.has(density) || !s.stormed.has(storm) || !s.incinerated.has(incin) || !s.sanded.has(sand) ||
+            !s.flooded.has(flood) || !s.highGround.has(high))
+            continue;
+        ok[n++] = int(i);
+        total += s.weight;
+    }
+    if (n == 0) return -1;
+    if (total > 1) r *= total;
+    float acc = 0;
+    for (int k = 0; k < n; ++k) {
+        acc += list[size_t(ok[k])].weight;
+        if (r <= acc) {
+            const Species& s = list[size_t(ok[k])];
+            if (needImpostor && s.impostor == 0) return -1;
+            return ok[k];
+        }
+    }
+    return -1;
+}
+
+using Mat3 = std::array<std::array<float, 3>, 3>;  // m[row][col]
+
+Mat3 mul(const Mat3& a, const Mat3& b) {
+    Mat3 r{};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+    return r;
+}
+
+Mat3 axisAngle(const float axis[3], float angle) {
+    const float c = std::cos(angle), s = std::sin(angle), t = 1 - c;
+    const float x = axis[0], y = axis[1], z = axis[2];
+    return {{{t * x * x + c, t * x * y - s * z, t * x * z + s * y}, {t * x * y + s * z, t * y * y + c, t * y * z - s * x}, {t * x * z - s * y, t * y * z + s * x, t * z * z + c}}};
+}
+
+// Rotation taking +y to `up` (unit).
+Mat3 alignUp(const float up[3]) {
+    const float axis[3] = {up[2], 0, -up[0]};  // (0,1,0) x up
+    const float s = std::sqrt(axis[0] * axis[0] + axis[2] * axis[2]);
+    if (s < 1e-6f) return {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+    const float a[3] = {axis[0] / s, 0, axis[2] / s};
+    return axisAngle(a, std::atan2(s, up[1]));
+}
+
+// The engine's instance randomness: four chained permutation draws.
+void instance(const Vegetation& v, const Species& s, double x, double z, const Ground& g, Plant& p) {
+    const float r0 = float(positionHash(v.perm, x + double(425.23886f), z)) / 255.0f;
+    const float r1 = float(positionHash(v.perm, double(r0) * double(931.9283f) + x, z)) / 255.0f;
+    const float r2 = float(positionHash(v.perm, double(r1) * double(931.9283f) + x, z)) / 255.0f;
+    const float r3 = float(positionHash(v.perm, double(r2) * double(931.9283f) + x, z)) / 255.0f;
+    const float size = kSizeScale * (s.size.hi * (1 - r0) + s.size.lo * r0);
+    float up[3] = {g.n[0] * s.groundAlign, 1 - s.groundAlign + g.n[1] * s.groundAlign, g.n[2] * s.groundAlign};
+    const float len = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    for (float& c : up) c /= len;
+    static constexpr float kX[3] = {1, 0, 0}, kY[3] = {0, 1, 0}, kZ[3] = {0, 0, 1};
+    Mat3 m = mul(alignUp(up), mul(axisAngle(kX, (2 * r1 - 1) * s.tilt), mul(axisAngle(kZ, (2 * r2 - 1) * s.tilt), axisAngle(kY, r3 * 6.28f))));
+    // Columns of m are the images of the mesh axes.
+    for (int axis = 0; axis < 3; ++axis)
+        for (int c = 0; c < 3; ++c) p.axes[size_t(axis)][size_t(c)] = m[size_t(c)][size_t(axis)] * size;
+    p.position = {float(x), g.y - kSink, float(z)};
 }
 
 }  // namespace
@@ -66,7 +269,7 @@ Vegetation loadVegetation(const DpcFile& world) {
     const auto body = world.body(*world.find(gens.front()));
     if (!body) throw std::runtime_error("GenWorld_Z has no body");
     const std::vector<uint8_t>& b = *body;
-    // u32, u32, u32 roads; u32 n, maps[n]; u32 n, ground textures[n]; u32 n, materials[n]; u32;
+    // u32, u32, u32 roads; u32 n, maps[n]; u32 n, ground textures[n]; u32 n, materials[n]; u32 seed;
     // u32 groups, each {u32 len, name[len], u32, u32 n, Node_Z[n]}.
     size_t p = 12;
     std::vector<uint32_t> maps;
@@ -75,8 +278,11 @@ Vegetation loadVegetation(const DpcFile& world) {
     p += 4 + size_t(nMaps) * 4;
     p += 4 + size_t(rd32(b, p)) * 4;
     p += 4 + size_t(rd32(b, p)) * 4;
-    p += 4;
     Vegetation v;
+    v.perm = buildPermutation(rd32(b, p));
+    p += 4;
+    // Clearing noise: 3 levels under a 500 m cell (finest 62.5 m).
+    v.clearings = Fractal(v.perm, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
     const uint32_t groups = rd32(b, p);
     p += 4;
     for (uint32_t g = 0; g < groups; ++g) {
@@ -90,7 +296,7 @@ Vegetation loadVegetation(const DpcFile& world) {
         for (uint32_t i = 0; i < n; ++i) {
             const uint32_t nodeId = rd32(b, p + size_t(i) * 4);
             if (list == nullptr) continue;
-            try {  // Node_Z -> Lod_Z -> first (full-detail) mesh
+            try {  // Node_Z -> Lod_Z -> [full mesh, impostor], script
                 const DpcFile::Entry* ne = world.find(nodeId);
                 const auto nb = ne ? world.body(*ne) : std::nullopt;
                 if (!nb) continue;
@@ -102,6 +308,11 @@ Vegetation loadVegetation(const DpcFile& world) {
                 Species sp;
                 sp.full = lod.objects[0];
                 if (lod.objects.size() > 1 && world.find(lod.objects[1]) != nullptr) sp.impostor = lod.objects[1];
+                sp.highGround = {-0.001f, 0.501f};  // engine defaults for ranges a script leaves out
+                for (Species::Range* r : {&sp.humidity, &sp.density, &sp.stormed, &sp.incinerated, &sp.sanded, &sp.flooded}) *r = {0.499f, 1.001f};
+                sp.weight = 0.1f;
+                if (const DpcFile::Entry* ue = world.find(lod.userDefine); ue != nullptr && ue->classCrc == kUserDefineClass)
+                    if (const auto ub = world.body(*ue)) parseSpeciesScript(*ub, sp);
                 list->push_back(sp);
             } catch (const std::exception&) {
             }
@@ -115,9 +326,8 @@ Vegetation loadVegetation(const DpcFile& world) {
                 if (const auto mb = world.body(*e)) r = decodeRaster(*mb);
         return r;
     };
-    // Clutter: the bushes (shrunk) and the grass clump among the trees, and FUEL's
+    // Clutter: the low bushes and the grass clump among the trees, and FUEL's
     // grey-detail rock cluster (it takes the ground colour, so it suits any terrain).
-    // Only the genuinely low ones: the BUSHES group also holds saplings.
     auto lowPlant = [&](uint32_t id) {
         try {
             const CollisionMesh cm = loadCollisionMesh({&world}, id);
@@ -132,53 +342,50 @@ Vegetation loadVegetation(const DpcFile& world) {
         if (lowPlant(sp.full)) v.tufts.push_back(sp.full);
     for (uint32_t id : {0x6C1D4E09u})
         if (world.find(id) && lowPlant(id)) v.tufts.push_back(id);
-    for (uint32_t id : {0xD98608D9u}) if (world.find(id)) v.stones.push_back(id);
+    for (uint32_t id : {0xD98608D9u})
+        if (world.find(id)) v.stones.push_back(id);
     v.forest = loadMap(7);
     v.humidity = loadMap(2);
+    v.incinerated = loadMap(13);
+    v.stormed = loadMap(14);
+    v.flooded = loadMap(15);
+    v.sanded = loadMap(16);
     return v;
 }
 
-void scatterPlants(const Vegetation& v, const Heightfield& terrain, float x, float z, float radius, std::vector<Plant>& out,
-                   bool impostors, float inner) {
+void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNetwork* roads, const BlockedQuery& blocked, float x, float z,
+                   float radius, std::vector<Plant>& out, bool impostors, float inner) {
     if (v.trees.empty() && v.bushes.empty()) return;
-    const int32_t c0x = int32_t(std::floor((x - radius) / kCell)), c1x = int32_t(std::floor((x + radius) / kCell));
-    const int32_t c0z = int32_t(std::floor((z - radius) / kCell)), c1z = int32_t(std::floor((z + radius) / kCell));
+    // Candidates sit at multiples of 20 m and only move +x/+z, so widen by a cell.
+    const int32_t c0x = int32_t(std::floor((x - radius) / kCell)) - 1, c1x = int32_t(std::floor((x + radius) / kCell));
+    const int32_t c0z = int32_t(std::floor((z - radius) / kCell)) - 1, c1z = int32_t(std::floor((z + radius) / kCell));
     for (int32_t cz = c0z; cz <= c1z; ++cz) {
         for (int32_t cx = c0x; cx <= c1x; ++cx) {
-            for (int kind = 0; kind < 2; ++kind) {  // a tree candidate, then a bush candidate offset by half a cell
-                const std::vector<Species>& species = kind == 0 ? v.trees : v.bushes;
-                if (species.empty() || (impostors && kind == 1)) continue;
-                const uint32_t h = hash(cx, cz, 17u + uint32_t(kind));
-                const float px = cx * kCell + kind * 10.0f + float(h & 15) * 1.2f;
-                const float pz = cz * kCell + kind * 10.0f + float((h >> 4) & 15) * 1.2f;
-                const float dist = std::hypot(px - x, pz - z);
+            for (int kind = 0; kind < 2; ++kind) {
+                const bool tree = kind == 0;
+                const std::vector<Species>& species = tree ? v.trees : v.bushes;
+                if (species.empty() || (impostors && !tree)) continue;
+                const float gx = float(cx * kCell), gz = float(cz * kCell);
+                // Jitter: the engine rounds this sum in single precision.
+                const float hsum = gz * 10.193578f + gx * 12.317513f + (tree ? kTreeSalt : kBushSalt);
+                const uint8_t jb = v.perm[size_t(int64_t(std::nearbyint(hsum)) & 255)];
+                const double px = gx + float(jb & 15) * kJitter, pz = gz + float(jb >> 4) * kJitter;
+                const double dist = std::hypot(px - x, pz - z);
                 if (dist > radius || dist < inner) continue;
-                // Density: sharpened forest cover minus clearing noise.
-                const float forest = sampleMap(v.forest, px, pz);
-                const float noise = std::clamp(0.65f * valueNoise(px / 400, pz / 400, 3) + 0.35f * valueNoise(px / 90, pz / 90, 4), 0.0f, 1.0f);
-                float d = std::clamp((sharpen(2 * forest - 1) * 0.5f + 0.5f) - 0.95f * (sharpen(2 * noise * noise - 1) * 0.5f + 0.5f), 0.0f, 1.0f);
-                if (kind == 1) d = std::max(d * 0.7f, forest * 0.15f);  // bushes also dot open ground
-                if (unit(hash(cx, cz, 91u + uint32_t(kind))) >= d) continue;
-                const float hum = sampleMap(v.humidity, px, pz);
-                const float y = terrain.smoothHeightAt(px, pz);
-                if (y > 3000.0f - 500.0f * hum) continue;  // treeline
-                const float dx = (terrain.heightAt(px + 4, pz) - terrain.heightAt(px - 4, pz)) / 8;
-                const float dz = (terrain.heightAt(px, pz + 4) - terrain.heightAt(px, pz - 4)) / 8;
-                if (1.0f / std::sqrt(1 + dx * dx + dz * dz) < 0.866f) continue;  // steeper than 30 degrees
-                const uint32_t pick = hash(cx, cz, 33u + uint32_t(kind));
-                const Species* sp = nullptr;
-                for (size_t tries = 0; tries < species.size() && sp == nullptr; ++tries) {
-                    const Species& cand = species[(pick + tries * 7919u) % species.size()];
-                    if (!impostors || cand.impostor != 0) sp = &cand;
-                }
-                if (sp == nullptr) continue;
-                Plant p;
-                p.meshId = impostors ? sp->impostor : sp->full;
-                p.position = {px, y - 0.1f, pz};
-                p.yaw = unit(hash(cx, cz, 57u)) * 6.2831853f;
-                // Species meshes are authored small; the world places similar trees at 2-2.7x.
-                p.scale = (kind == 0 ? 2.0f : 1.4f) + 0.8f * unit(hash(cx, cz, 71u));
-                out.push_back(p);
+                const Ground g = groundAt(terrain, px, pz);
+                const float density = densityAt(v, px, pz, g.n[1]);
+                const float r = float(positionHash(v.perm, px, pz)) / 255.0f;
+                if (tree && !(r < density)) continue;
+                if (roads != nullptr && nearRoad(*roads, px, pz)) continue;
+                if (g.y > kTreeline || g.n[1] < kMaxSlopeNy) continue;
+                if (blocked && blocked(px, pz)) continue;
+                const int pick = pickSpecies(species, v, px, pz, g, density, r, impostors);
+                if (pick < 0) continue;
+                const Species& sp = species[size_t(pick)];
+                Plant plant;
+                plant.meshId = impostors ? sp.impostor : sp.full;
+                instance(v, sp, px, pz, g, plant);
+                out.push_back(plant);
             }
         }
     }
@@ -193,28 +400,32 @@ void scatterClutter(const Vegetation& v, const Heightfield& terrain, const Surfa
     for (int32_t cz = c0z; cz <= c1z; ++cz)
         for (int32_t cx = c0x; cx <= c1x; ++cx) {
             const uint32_t h = hash(cx, cz, 401u);
-            const float px = (cx + unit(h)) * kStep, pz = (cz + unit(hash(cx, cz, 403u))) * kStep;
+            const float px = (float(cx) + unit(h)) * kStep, pz = (float(cz) + unit(hash(cx, cz, 403u))) * kStep;
             if (std::hypot(px - x, pz - z) > radius) continue;
             const int type = surface(px, pz);
             if (type == 11 || type == 13) continue;  // roads (tarmac, dirt tracks)
-            const GripCategory g = gripCategory(type);
+            const GripCategory gc = gripCategory(type);
             // Patchy, not uniform: thin out by a noise field.
             const float patch = valueNoise(px / 25, pz / 25, 7);  // 0..1
             const float r = unit(hash(cx, cz, 409u));
-            const bool grassy = g == GripCategory::Grass || g == GripCategory::Mud;
-            const bool stony = g == GripCategory::Rock || g == GripCategory::Dirt || g == GripCategory::Sand;
-            Plant p;
+            const bool grassy = gc == GripCategory::Grass || gc == GripCategory::Mud;
+            const bool stony = gc == GripCategory::Rock || gc == GripCategory::Dirt || gc == GripCategory::Sand;
+            uint32_t mesh = 0;
+            float scale = 1;
             if (grassy && !v.tufts.empty() && r < 0.25f + 0.45f * patch) {
-                p.meshId = v.tufts[hash(cx, cz, 411u) % v.tufts.size()];
-                p.scale = 0.45f + 0.5f * unit(hash(cx, cz, 413u));
+                mesh = v.tufts[hash(cx, cz, 411u) % v.tufts.size()];
+                scale = 0.45f + 0.5f * unit(hash(cx, cz, 413u));
             } else if ((stony || grassy) && !v.stones.empty() && r > 1.0f - (stony ? 0.18f : 0.03f) * patch) {
-                p.meshId = v.stones[hash(cx, cz, 415u) % v.stones.size()];
-                p.scale = 0.03f + 0.07f * unit(hash(cx, cz, 417u)) * unit(hash(cx, cz, 419u));
+                mesh = v.stones[hash(cx, cz, 415u) % v.stones.size()];
+                scale = 0.03f + 0.07f * unit(hash(cx, cz, 417u)) * unit(hash(cx, cz, 419u));
             } else {
                 continue;
             }
+            Plant p;
+            p.meshId = mesh;
             p.position = {px, terrain.smoothHeightAt(px, pz) - 0.05f, pz};
-            p.yaw = unit(hash(cx, cz, 421u)) * 6.2831853f;
+            const float yaw = unit(hash(cx, cz, 421u)) * 6.2831853f, c = std::cos(yaw) * scale, s = std::sin(yaw) * scale;
+            p.axes = {{{c, 0, -s}, {0, scale, 0}, {s, 0, c}}};
             out.push_back(p);
         }
 }

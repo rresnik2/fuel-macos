@@ -241,7 +241,7 @@ Lod parseLodBody(const std::vector<uint8_t>& body) {
                 if (i == 0) l.animations.push_back({slot, anim});
             }
         }
-    r.u32();
+    l.userDefine = r.u32();
     r.expectEnd();
     return l;
 }

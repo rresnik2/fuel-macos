@@ -6,6 +6,7 @@
 #include "core/assembly.hpp"
 #include "core/roads.hpp"
 #include "core/vegetation.hpp"
+#include "core/world.hpp"
 #include "physics/vehicle_physics.hpp"
 #include "renderer.h"
 
@@ -130,7 +131,8 @@ public:
     }
     size_t placementCount() const { return placed_.size(); }
     // Procedural trees and bushes within kPlantRadius (drawn, not solid).
-    void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) { vegetation_ = v, terrain_ = terrain; }
+    // Also seats the FITTOGROUND objects on `terrain`, as the engine does at load.
+    void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain);
     // Surface types for ground clutter (grass tufts, stones); must be thread-safe.
     void setSurfaces(fuel::SurfaceQuery q) { surfaces_ = std::move(q); }
     // Road ribbons within kRoadRadius (needs the terrain from setVegetation).
@@ -180,7 +182,9 @@ private:
     struct Placed {
         uint32_t meshId;
         std::array<float, 16> world;  // row-vector convention
+        bool fitToGround = false, groundNormal = false;
     };
+    bool seated_ = false;
     // Movable props, keyed by placement index. A prop keeps its state until it is far away.
     struct Prop {
         std::array<float, 16> world;  // current transform (row-vector convention)
@@ -193,6 +197,17 @@ private:
     std::vector<const fuel::DpcFile*> lookup_;
     std::vector<Placed> placed_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cells_;
+    // Ground-plane bounding circles of the placements: FUEL plants no tree or bush
+    // within 5 m of a placed object.
+    struct Obstacle {
+        float x, z, r;
+    };
+    static constexpr float kObstacleCell = 64.0f, kPlantClearance = 5.0f, kMaxObstacle = 60.0f;
+    std::vector<Obstacle> obstacles_;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> obstacleCells_;
+    std::unordered_map<uint32_t, std::array<float, 4>> sphereOf_;  // mesh bounding spheres (load time only)
+    void addObstacle(const fuel::PlacedMesh& pm);
+    bool nearObstacle(double x, double z, float clearance) const;
     simd_float3 last_ = {1e30f, 0, 0};
 };
 

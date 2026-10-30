@@ -21,6 +21,7 @@ add_library(fuelcore STATIC
   src/core/terrain.cpp
   src/core/ground.cpp
   src/core/vegetation.cpp
+  src/core/genworld_noise.cpp
   src/core/roads.cpp
   src/core/surface.cpp
   src/core/vehicle_params.cpp

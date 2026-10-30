@@ -1,4 +1,5 @@
 #include "terrain.hpp"
+#include "genworld_noise.hpp"
 
 
 #include <algorithm>
@@ -118,10 +119,11 @@ size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world) {
     const auto body = world.body(*world.find(gens.front()));
     if (!body) return 0;
     const std::vector<uint8_t>& b = *body;
-    // Skip to the flat surfaces: u32 x3; maps; ground textures; materials; u32;
+    // Skip to the flat surfaces: u32 x3; maps; ground textures; materials; u32 seed;
     // groups {u32 len, name, u32, u32 n, ids[n]}; then u32 n and n 0x83-byte records.
     size_t p = 12;
     for (int list = 0; list < 3; ++list) p += 4 + size_t(rd32(b, p)) * 4;
+    const Permutation perm = buildPermutation(rd32(b, p));
     p += 4;
     const uint32_t groups = rd32(b, p);
     p += 4;
@@ -131,52 +133,107 @@ size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world) {
     }
     const uint32_t n = rd32(b, p);
     p += 4;
+    if (p + size_t(n) * 0x83 > b.size()) throw std::runtime_error("flat surfaces overrun GenWorld_Z");
     auto f32 = [&](size_t o) {
-        if (o + 4 > b.size()) throw std::runtime_error("flat surface overruns");
         float v;
         std::memcpy(&v, &b[o], 4);
         return v;
     };
-    // Overlapping surfaces: the one with the larger value at +0x54 wins (ties: the
-    // later record). Scored against the placed objects, this order seats more of
-    // them on the ground than file order, max or min (camps on ramps, for example).
-    std::vector<size_t> order(n);
-    for (uint32_t i = 0; i < n; ++i) order[i] = p + size_t(i) * 0x83;
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t c) { return f32(a + 0x54) < f32(c + 0x54); });
-    size_t applied = 0;
-    for (const size_t rec : order) {
-        p = rec;
-        // Record: u32 id; axis x (3 floats + pad), axis y, axis z, centre; then parameters
-        // (+0x4c = blend margin in metres).
-        const float ax[3] = {f32(p + 4), f32(p + 8), f32(p + 12)};
-        const float az[3] = {f32(p + 36), f32(p + 40), f32(p + 44)};
-        const float c[3] = {f32(p + 52), f32(p + 56), f32(p + 60)};
-        const float margin = std::clamp(f32(p + 0x4c), 0.0f, 100.0f);
-        // Solve point = centre + u*axisX + v*axisZ in the ground plane.
-        const float det = ax[0] * az[2] - ax[2] * az[0];
-        if (std::fabs(det) < 1e-3f) continue;
-        const float reach = std::fabs(ax[0]) + std::fabs(az[0]) + margin, reachZ = std::fabs(ax[2]) + std::fabs(az[2]) + margin;
-        const int c0 = std::max(0, int((c[0] - reach - hf.originX) / hf.spacing)), c1 = std::min(int(hf.width) - 1, int((c[0] + reach - hf.originX) / hf.spacing) + 1);
-        const int r0 = std::max(0, int((c[2] - reachZ - hf.originZ) / hf.spacing)), r1 = std::min(int(hf.height) - 1, int((c[2] + reachZ - hf.originZ) / hf.spacing) + 1);
-        const float lenX = std::hypot(ax[0], ax[2]), lenZ = std::hypot(az[0], az[2]);
-        for (int r = r0; r <= r1; ++r) {
-            for (int col = c0; col <= c1; ++col) {
-                const float dx = hf.originX + col * hf.spacing - c[0], dz = hf.originZ + r * hf.spacing - c[2];
-                const float u = (dx * az[2] - dz * az[0]) / det, v = (ax[0] * dz - ax[2] * dx) / det;
-                // Distance outside the rectangle, in metres.
-                const float out = std::hypot(std::max(0.0f, std::fabs(u) - 1) * lenX, std::max(0.0f, std::fabs(v) - 1) * lenZ);
-                if (out > margin) continue;
-                const float w = margin > 0 ? 1 - std::clamp(out / margin, 0.0f, 1.0f) : 1.0f;
-                const float target = c[1] + std::clamp(u, -1.0f, 1.0f) * ax[1] + std::clamp(v, -1.0f, 1.0f) * az[1];
-                uint16_t& raw = hf.raw[size_t(r) * hf.width + size_t(col)];
-                const float h = raw * hf.metresPerUnit;
-                const float blended = h + (target - h) * (w * w * (3 - 2 * w));
-                raw = uint16_t(std::clamp(std::lround(blended / hf.metresPerUnit), 0L, 65535L));
-            }
-        }
-        ++applied;
+    struct Surface {
+        double cx, cy, cz;
+        double ax, az, lenX;  // axis X in the ground plane, scaled to its full length
+        double bx, bz, lenZ;  // axis Z likewise
+        double nx, ny, nz;    // plane normal
+        float invMargin, strength;
+        uint8_t priority;
+        bool ellipse;
+    };
+    std::vector<Surface> surfaces;
+    for (uint32_t i = 0; i < n; ++i) {
+        const size_t r = p + size_t(i) * 0x83;
+        Surface s{};
+        const double X[3] = {f32(r + 4), f32(r + 8), f32(r + 12)}, N[3] = {f32(r + 20), f32(r + 24), f32(r + 28)};
+        const double Z[3] = {f32(r + 36), f32(r + 40), f32(r + 44)};
+        s.cx = f32(r + 52), s.cy = f32(r + 56), s.cz = f32(r + 60);
+        auto ground = [](const double v[3], double& gx, double& gz, double& len) {
+            len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            const double h = std::hypot(v[0], v[2]);
+            gx = h > 0 ? v[0] * len / h : 0, gz = h > 0 ? v[2] * len / h : 0;
+        };
+        ground(X, s.ax, s.az, s.lenX);
+        ground(Z, s.bx, s.bz, s.lenZ);
+        if (s.lenX < 1e-3 || s.lenZ < 1e-3 || std::fabs(N[1]) < 1e-3) continue;
+        s.nx = N[0], s.ny = N[1], s.nz = N[2];
+        s.invMargin = 1.0f / std::max(f32(r + 0x4c), 0.1f);
+        s.strength = f32(r + 0x50);
+        s.priority = b[r + 0x7d];
+        s.ellipse = b[r + 0x82] != 0;
+        if (s.strength > 0) surfaces.push_back(s);
     }
-    return applied;
+    // Edge jitter: two small fractals (10 m and 30 m cells) averaged, times 5 m.
+    const Fractal edgeA(perm, 2, 10.0f, 33.129738f, 0.6f, 0.6f, 0.5f), edgeB(perm, 2, 30.0f, 43.129738f, 0.6f, 0.6f, 0.5f);
+    // Signed distance (metres) from the shape's edge, positive inside.
+    auto inside = [](const Surface& s, double x, double z) {
+        const double dx = x - s.cx, dz = z - s.cz;
+        const double u = (dx * s.ax + dz * s.az) / (s.lenX * s.lenX), v = (dx * s.bx + dz * s.bz) / (s.lenZ * s.lenZ);
+        if (s.ellipse) {
+            const double rr = std::hypot(u, v);
+            if (rr == 0) return std::min(s.lenX, s.lenZ);
+            const double ex = s.cx + s.ax * (u / rr) + s.bx * (v / rr) - x, ez = s.cz + s.az * (u / rr) + s.bz * (v / rr) - z;
+            const double d = std::hypot(ex, ez);
+            return rr > 1 ? -d : d;
+        }
+        const double eX = std::max(0.0, 1 - std::fabs(u)) * s.lenX, eZ = std::max(0.0, 1 - std::fabs(v)) * s.lenZ;
+        double d = std::min(eX, eZ);
+        if (v < 0) d -= std::max(0.0, 15.0 - std::hypot(eX, eZ));  // the -Z corners are rounded off
+        return d;
+    };
+    // Every grid vertex inside a surface's bounds gets the list of surfaces to combine.
+    std::vector<std::pair<uint32_t, uint32_t>> hits;  // (vertex, surface)
+    for (uint32_t i = 0; i < surfaces.size(); ++i) {
+        const Surface& s = surfaces[i];
+        const double rx = std::fabs(s.ax) + std::fabs(s.bx), rz = std::fabs(s.az) + std::fabs(s.bz);
+        const int c0 = std::max(0, int(std::floor((s.cx - rx - hf.originX) / hf.spacing)));
+        const int c1 = std::min(int(hf.width) - 1, int(std::ceil((s.cx + rx - hf.originX) / hf.spacing)));
+        const int r0 = std::max(0, int(std::floor((s.cz - rz - hf.originZ) / hf.spacing)));
+        const int r1 = std::min(int(hf.height) - 1, int(std::ceil((s.cz + rz - hf.originZ) / hf.spacing)));
+        for (int r = r0; r <= r1; ++r)
+            for (int c = c0; c <= c1; ++c) hits.push_back({uint32_t(r) * hf.width + uint32_t(c), i});
+    }
+    std::sort(hits.begin(), hits.end(), [&](const auto& a, const auto& c) {
+        if (a.first != c.first) return a.first < c.first;
+        const Surface &sa = surfaces[a.second], &sc = surfaces[c.second];
+        return sa.priority != sc.priority ? sa.priority < sc.priority : sa.cx < sc.cx;
+    });
+    std::vector<uint8_t> used(surfaces.size(), 0);
+    for (size_t k = 0; k < hits.size();) {
+        const uint32_t vtx = hits[k].first;
+        const double x = hf.originX + double(vtx % hf.width) * hf.spacing, z = hf.originZ + double(vtx / hf.width) * hf.spacing;
+        const double jitter = 5.0 * 0.5 * (double(edgeA.at(x, z)) + double(edgeB.at(x, z)));
+        double h = double(hf.raw[vtx]) * hf.metresPerUnit;
+        double acc = 0, wsum = 0;
+        int group = -1;
+        for (; k < hits.size() && hits[k].first == vtx; ++k) {
+            const Surface& s = surfaces[hits[k].second];
+            if (int(s.priority) != group) {  // a higher priority starts over from the result so far
+                if (wsum > 0.01) h = acc / wsum;
+                acc = wsum = 0;
+                group = s.priority;
+            }
+            const double d = inside(s, x, z) - jitter;
+            if (d <= 0) continue;
+            const double t = std::clamp(d * s.invMargin, 0.0, 1.0), e = 2 * t - 1;
+            const double curve = e <= 0 ? std::pow(e + 1, 1.25) - 1 : 1 - std::pow(1 - e, 1.25);
+            const double w = (0.5 + 0.5 * curve) * s.strength;
+            const double plane = s.cy - (s.nx * (x - s.cx) + s.nz * (z - s.cz)) / s.ny;
+            acc += w * ((1 - w) * h + w * plane);
+            wsum += w;
+            used[hits[k].second] = 1;
+        }
+        if (wsum > 0.01) h = acc / wsum;
+        hf.raw[vtx] = uint16_t(std::clamp(std::lround(h / hf.metresPerUnit), 0L, 65535L));
+    }
+    return size_t(std::count(used.begin(), used.end(), uint8_t(1)));
 }
 
 Heightfield loadWorldHeightfield(const DpcFile& world) {
