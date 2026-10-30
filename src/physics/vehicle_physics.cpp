@@ -11,6 +11,7 @@
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayerInterfaceTable.h>
 #include <Jolt/Physics/Collision/BroadPhase/ObjectVsBroadPhaseLayerFilterTable.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/ObjectLayerPairFilterTable.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
@@ -57,6 +58,44 @@ void initJoltOnce() {
 }
 
 Vec3 toVec3(const std::array<float, 3>& a) { return Vec3(a[0], a[1], a[2]); }
+
+SurfaceQuery& defaultSurfaceQuery() {
+    static SurfaceQuery q;
+    return q;
+}
+
+// Notes how the chassis body touches the world (terrain and objects): the fastest sliding
+// speed along a contact and the fastest normal speed of a new contact. Wheels do not count
+// (they are ray casts, not contacts).
+class ChassisContacts : public ContactListener {
+public:
+    BodyID car;
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        scrape_ = impact_ = 0;
+    }
+    void read(float& scrape, float& impact) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        scrape = scrape_;
+        impact = impact_;
+    }
+    void OnContactAdded(const Body& a, const Body& b, const ContactManifold& m, ContactSettings&) override { note(a, b, m, true); }
+    void OnContactPersisted(const Body& a, const Body& b, const ContactManifold& m, ContactSettings&) override { note(a, b, m, false); }
+
+private:
+    void note(const Body& a, const Body& b, const ContactManifold& m, bool added) {
+        if (a.GetID() != car && b.GetID() != car) return;
+        const RVec3 p = m.GetWorldSpaceContactPointOn1(0);
+        const Vec3 v = a.GetPointVelocity(p) - b.GetPointVelocity(p);
+        const float vn = v.Dot(m.mWorldSpaceNormal);
+        const float vt = (v - m.mWorldSpaceNormal * vn).Length();
+        std::lock_guard<std::mutex> lock(mutex_);
+        scrape_ = std::max(scrape_, vt);
+        if (added) impact_ = std::max(impact_, std::fabs(vn));
+    }
+    mutable std::mutex mutex_;
+    float scrape_ = 0, impact_ = 0;
+};
 
 }  // namespace
 
@@ -159,6 +198,12 @@ struct DriveWorld::Impl {
     float accumulator = 0;
     float upsideDownTime = 0;
     int lastWheelsOnGround = 4;
+    // Surfaces: type under each wheel, its smoothed grip scale (read by the tyre callback)
+    // and the suspension length last step (for the compression speed).
+    SurfaceQuery surfaceQuery = defaultSurfaceQuery();
+    std::vector<int> wheelSurface;
+    std::vector<float> wheelGrip, wheelCompression, prevSuspension;
+    ChassisContacts contacts;
 
     explicit Impl(const Heightfield& hf) : terrain(hf) {
         layerPairs.EnableCollision(kMoving, kStatic);
@@ -168,6 +213,7 @@ struct DriveWorld::Impl {
         objectVsBroadPhase = std::make_unique<ObjectVsBroadPhaseLayerFilterTable>(broadPhaseLayers, 2, layerPairs, 2);
         physics.Init(4096, 0, 4096, 4096, broadPhaseLayers, *objectVsBroadPhase, layerPairs);
         physics.SetGravity(Vec3(0, -kGravity, 0));
+        physics.SetContactListener(&contacts);
     }
 
     BodyInterface& bodies() { return physics.GetBodyInterface(); }
@@ -307,6 +353,19 @@ struct DriveWorld::Impl {
         vehicle = new VehicleConstraint(*physics.GetBodyLockInterface().TryGetBody(car), vs);
         tester = new VehicleCollisionTesterCastCylinder(kMoving, s.bike ? 1.0f : 0.1f);  // bikes: rounded tyres
         vehicle->SetVehicleCollisionTester(tester);
+        // Per-wheel tyre grip: the surface under each wheel scales both friction impulses.
+        wheelSurface.assign(s.wheels.size(), -1);
+        wheelGrip.assign(s.wheels.size(), 1.0f);
+        wheelCompression.assign(s.wheels.size(), 0.0f);
+        prevSuspension.assign(s.wheels.size(), -1.0f);
+        contacts.car = car;
+        static_cast<WheeledVehicleController*>(vehicle->GetController())
+            ->SetTireMaxImpulseCallback([this](uint wheel, float& longitudinal, float& lateral, float suspensionImpulse, float longitudinalFriction,
+                                               float lateralFriction, float, float, float) {
+                const float grip = wheel < wheelGrip.size() ? wheelGrip[wheel] : 1.0f;
+                longitudinal = longitudinalFriction * suspensionImpulse * grip;
+                lateral = lateralFriction * suspensionImpulse * grip;
+            });
         physics.AddConstraint(vehicle);
         physics.AddStepListener(vehicle);
     }
@@ -333,6 +392,33 @@ struct DriveWorld::Impl {
         int n = 0;
         for (const Wheel* w : vehicle->GetWheels()) n += w->HasContact() ? 1 : 0;
         return n;
+    }
+
+    // Looks up the surface under each wheel's contact point; the tyre grip follows it
+    // (smoothed over a few steps) and soft ground adds rolling resistance.
+    void updateSurfaces(const Vec3& vel) {
+        const auto& wheels = vehicle->GetWheels();
+        float crr = 0;
+        for (size_t i = 0; i < wheels.size() && i < wheelSurface.size(); ++i) {
+            const Wheel* w = wheels[i];
+            const float len = w->GetSuspensionLength();
+            wheelCompression[i] = prevSuspension[i] >= 0 ? (prevSuspension[i] - len) / kStep : 0.0f;
+            prevSuspension[i] = len;
+            int type = -1;
+            if (w->HasContact()) {
+                const RVec3 c = w->GetContactPosition();
+                type = surfaceQuery ? surfaceQuery(double(c.GetX()), double(c.GetZ())) : -1;
+                crr += rollingResistance(gripCategory(type));
+                wheelGrip[i] += (surfaceGrip(type) - wheelGrip[i]) * 0.25f;
+            }
+            wheelSurface[i] = w->HasContact() ? std::max(type, -1) : -1;
+        }
+        const float horizontal = std::sqrt(vel.GetX() * vel.GetX() + vel.GetZ() * vel.GetZ());
+        if (horizontal > 0.3f && !wheels.empty()) {
+            // crr is summed over wheels on the ground: mean over all wheels = share of the weight carried by them
+            const float drag = setup.mass * kGravity * crr / float(wheels.size()) * std::min(1.0f, horizontal / 2.0f);
+            bodies().AddForce(car, Vec3(-vel.GetX(), 0, -vel.GetZ()) / horizontal * drag);
+        }
     }
 
     void fixedStep(const DriveInput& in) {
@@ -375,6 +461,8 @@ struct DriveWorld::Impl {
             resetUpright();
         }
 
+        updateSurfaces(vel);
+
         // Keep the terrain patch under the vehicle.
         if (std::hypot(double(pos.GetX()) - patchX, double(pos.GetZ()) - patchZ) > 600.0) buildTerrainPatch(pos.GetX(), pos.GetZ());
 
@@ -409,6 +497,7 @@ void DriveWorld::reset() {
 void DriveWorld::update(float dt, const DriveInput& input) {
     if (impl_->car.IsInvalid()) return;
     impl_->accumulator = std::min(impl_->accumulator + dt, 0.25f);
+    if (impl_->accumulator >= kStep) impl_->contacts.reset();
     while (impl_->accumulator >= kStep) {
         impl_->fixedStep(input);
         impl_->accumulator -= kStep;
@@ -481,6 +570,9 @@ void DriveWorld::setStaticObjects(const std::vector<std::pair<uint32_t, std::arr
     impl_->staticBodies = std::move(keep);
 }
 
+void DriveWorld::setSurfaceQuery(SurfaceQuery query) { impl_->surfaceQuery = std::move(query); }
+void DriveWorld::setDefaultSurfaceQuery(SurfaceQuery query) { defaultSurfaceQuery() = std::move(query); }
+
 VehicleState DriveWorld::state() const {
     VehicleState st;
     if (impl_->car.IsInvalid()) return st;
@@ -506,12 +598,19 @@ VehicleState DriveWorld::state() const {
     float skid = 0;
     int touching = 0;
     for (const Wheel* w : impl_->vehicle->GetWheels()) {
-        if (!w->HasContact()) continue;
-        const auto* wv = static_cast<const WheelWV*>(w);
-        ++touching;
-        skid += std::clamp(std::max((std::fabs(wv->mLateralSlip) - 0.12f) / 0.3f, (std::fabs(wv->mLongitudinalSlip) - 0.35f) / 0.5f), 0.0f, 1.0f);
+        float wheelSkid = 0;
+        if (w->HasContact()) {
+            const auto* wv = static_cast<const WheelWV*>(w);
+            ++touching;
+            wheelSkid = std::clamp(std::max((std::fabs(wv->mLateralSlip) - 0.12f) / 0.3f, (std::fabs(wv->mLongitudinalSlip) - 0.35f) / 0.5f), 0.0f, 1.0f);
+            skid += wheelSkid;
+        }
+        st.wheelSkid.push_back(wheelSkid);
     }
     st.skid = touching ? skid / float(touching) : 0.0f;
+    st.wheelSurface = impl_->wheelSurface;
+    st.wheelCompression = impl_->wheelCompression;
+    impl_->contacts.read(st.scrapeSpeed, st.impactSpeed);
     return st;
 }
 

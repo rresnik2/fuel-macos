@@ -26,6 +26,13 @@ struct GroundMaps {
     std::vector<uint8_t> colour;    // sRGB RGBA8, row-major (row = z)
     std::vector<uint8_t> surface;   // surface type index per sample
     std::array<uint32_t, kSurfaceTypes> textures{};  // Bitmap_Z per surface type
+    // Surface type at world (x, z) (nearest sample, clamped to the map).
+    int surfaceAt(double x, double z) const {
+        if (size == 0) return 0;
+        const double step = 140000.0 / double(size);
+        auto idx = [&](double v) { return uint32_t(std::min(double(size - 1), std::max(0.0, std::floor((v + 70000.0) / step)))); };
+        return surface[size_t(idx(z)) * size + idx(x)];
+    }
 };
 
 // Builds the maps at `size` x `size` (e.g. 2334 = 60 m per sample).

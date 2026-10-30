@@ -2,6 +2,7 @@
 
 #include "resources.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <set>
@@ -94,9 +95,46 @@ RoadNetwork loadRoads(const DpcFile& world) {
         for (const auto& pt : line.points)
             touched.insert(RoadNetwork::cellKey(int32_t(std::floor(pt[0] / RoadNetwork::kCell)), int32_t(std::floor(pt[1] / RoadNetwork::kCell))));
         for (uint64_t key : touched) net.cells[key].push_back(index);
+        // Segment grid for roadSurfaceAt: each segment is walked every 16 m and every cell
+        // within kReach of the walk gets it.
+        const auto& pts = line.points;
+        for (size_t k = 0; k + 1 < pts.size(); ++k) {
+            const float dx = pts[k + 1][0] - pts[k][0], dz = pts[k + 1][1] - pts[k][1];
+            const int steps = std::max(1, int(std::ceil(std::hypot(dx, dz) / 16.0f)));
+            std::set<uint64_t> cells;
+            for (int s = 0; s <= steps; ++s) {
+                const float px = pts[k][0] + dx * float(s) / float(steps), pz = pts[k][1] + dz * float(s) / float(steps);
+                const int32_t x0 = int32_t(std::floor((px - RoadNetwork::kReach) / RoadNetwork::kSegCell)), x1 = int32_t(std::floor((px + RoadNetwork::kReach) / RoadNetwork::kSegCell));
+                const int32_t z0 = int32_t(std::floor((pz - RoadNetwork::kReach) / RoadNetwork::kSegCell)), z1 = int32_t(std::floor((pz + RoadNetwork::kReach) / RoadNetwork::kSegCell));
+                for (int32_t cx = x0; cx <= x1; ++cx)
+                    for (int32_t cz = z0; cz <= z1; ++cz) cells.insert(RoadNetwork::cellKey(cx, cz));
+            }
+            for (uint64_t key : cells) net.segCells[key].push_back((uint64_t(index) << 20) | uint64_t(k));
+        }
         net.lines.push_back(std::move(line));
     }
     return net;
+}
+
+bool isTarmacRoad(int t) { return t == 10 || t == 11 || t == 12 || t == 15 || t == 18 || t == 19; }
+
+int roadSurfaceAt(const RoadNetwork& net, double x, double z) {
+    const auto it = net.segCells.find(RoadNetwork::cellKey(int32_t(std::floor(x / RoadNetwork::kSegCell)), int32_t(std::floor(z / RoadNetwork::kSegCell))));
+    if (it == net.segCells.end()) return -1;
+    int result = -1;
+    for (uint64_t ref : it->second) {
+        const RoadNetwork::Line& line = net.lines[size_t(ref >> 20)];
+        const size_t k = size_t(ref & 0xFFFFF);
+        const double ax = line.points[k][0], az = line.points[k][1];
+        const double bx = line.points[k + 1][0] - ax, bz = line.points[k + 1][1] - az;
+        const double len2 = bx * bx + bz * bz;
+        const double t = len2 > 0 ? std::clamp(((x - ax) * bx + (z - az) * bz) / len2, 0.0, 1.0) : 0.0;
+        const double d = std::hypot(x - (ax + bx * t), z - (az + bz * t));
+        if (d > 0.5 * double(net.styles[line.type].width)) continue;
+        if (isTarmacRoad(line.type)) return 11;
+        result = 13;
+    }
+    return result;
 }
 
 }  // namespace fuel

@@ -29,7 +29,17 @@ struct RoadNetwork {
     std::unordered_map<uint64_t, std::vector<uint32_t>> cells;
     static constexpr float kCell = 256.0f;
     static uint64_t cellKey(int32_t cx, int32_t cz) { return (uint64_t(uint32_t(cx)) << 32) | uint32_t(cz); }
+    // Proximity grid for surface queries: 64 m cells -> (line << 20 | segment) of every
+    // segment that comes within kReach of the cell.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> segCells;
+    static constexpr float kSegCell = 64.0f, kReach = 16.0f;
 };
+
+// Road surface under (x, z): the surface type a road lays down (ASPHALT = 11 on tarmac
+// roads, DIRT_FLAT = 13 on dirt roads and trails) when the point is within half the road's
+// drawn width of its centre line, else -1. Tarmac wins where roads overlap.
+int roadSurfaceAt(const RoadNetwork& net, double x, double z);
+bool isTarmacRoad(int roadType);  // types 10, 11, 12, 15, 18, 19
 
 RoadNetwork loadRoads(const DpcFile& world);  // throws if the world has no GenWorld_Z/GwRoad_Z
 

@@ -22,6 +22,7 @@ add_library(fuelcore STATIC
   src/core/ground.cpp
   src/core/vegetation.cpp
   src/core/roads.cpp
+  src/core/surface.cpp
   src/core/vehicle_params.cpp
   src/core/races.cpp
   src/core/assembly.cpp
