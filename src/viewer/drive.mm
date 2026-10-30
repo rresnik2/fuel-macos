@@ -58,22 +58,41 @@ DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::Ve
     }
     for (uint32_t id : riders) {
         parts_.push_back({id, matrix_identity_float4x4});
-        links_.push_back({-1, matrix_identity_float4x4});
+        links_.push_back({-1, matrix_identity_float4x4, true});
     }
     for (const auto& w : setup.wheels) focusHeight_ = std::max(focusHeight_, w.hub[1] + w.radius * 0.6f);
     world_.spawn(setup, x, z, yaw);
 }
 
+void DriveSession::update(float dt, const fuel::DriveInput& input) {
+    world_.update(dt, input);
+    // The rider leans into turns (more with speed) and forward/back with throttle and brakes.
+    const float speed = std::fabs(world_.state().speedKmh) / 3.6f;
+    const float leanTarget = setup_.bike ? 0.0f : input.steer * std::min(speed / 15.0f, 1.0f) * 0.32f;
+    const float pitchTarget = (input.throttle - input.brake) * 0.12f;
+    const float k = std::min(1.0f, dt * 6.0f);
+    lean_ += (leanTarget - lean_) * k;
+    pitch_ += (pitchTarget - pitch_) * k;
+}
+
 std::vector<simd_float4x4> DriveSession::partWorlds() const {
     const fuel::VehicleState st = world_.state();
     const simd_float4x4 chassis = poseMatrix(st.chassis);
+    // Rider pose offset: rotate about the seat (forward axis for lean, sideways for pitch).
+    const float seat = focusHeight_ * 0.55f;
+    simd_float4x4 toSeat = matrix_identity_float4x4, fromSeat = matrix_identity_float4x4;
+    toSeat.columns[3] = simd_make_float4(0, -seat, 0, 1);
+    fromSeat.columns[3] = simd_make_float4(0, seat, 0, 1);
+    const simd_float4x4 rot = simd_matrix4x4(simd_mul(simd_quaternion(lean_, simd_make_float3(0, 0, 1)),
+                                                      simd_quaternion(pitch_, simd_make_float3(1, 0, 0))));
+    const simd_float4x4 riderPose = simd_mul(chassis, simd_mul(fromSeat, simd_mul(rot, toSeat)));
     std::vector<simd_float4x4> out;
     out.reserve(links_.size());
     for (const PartLink& l : links_) {
         if (l.wheel >= 0 && size_t(l.wheel) < st.wheels.size())
             out.push_back(simd_mul(poseMatrix(st.wheels[size_t(l.wheel)]), l.local));
         else
-            out.push_back(simd_mul(chassis, l.local));
+            out.push_back(simd_mul(l.rider ? riderPose : chassis, l.local));
     }
     return out;
 }

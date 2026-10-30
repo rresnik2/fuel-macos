@@ -22,7 +22,7 @@ public:
 
     // The parts in vehicle space, for MeshRenderer::setScene.
     const std::vector<fuel::MeshInstance>& parts() const { return parts_; }
-    void update(float dt, const fuel::DriveInput& input) { world_.update(dt, input); }
+    void update(float dt, const fuel::DriveInput& input);
     void reset() { world_.reset(); }
     // Puts the vehicle on its wheels at (x, z) facing `yaw`.
     void teleport(double x, double z, float yaw) { world_.spawn(setup_, x, z, yaw); }
@@ -37,7 +37,9 @@ private:
     struct PartLink {
         int wheel = -1;              // physics wheel driving this part, -1 = chassis
         simd_float4x4 local;         // vehicle space (chassis parts) or wheel-model space (rotation only)
+        bool rider = false;          // leans with the driving input
     };
+    float lean_ = 0, pitch_ = 0;     // rider body language (radians), smoothed
     fuel::DriveWorld world_;
     fuel::VehicleSetup setup_;
     std::vector<fuel::MeshInstance> parts_;
