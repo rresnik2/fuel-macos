@@ -1274,8 +1274,18 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     const float dist = cam.distance * radius_;
     simd_float3 eye = center_ + dist * simd_make_float3(std::cos(cam.pitch) * std::sin(cam.yaw), std::sin(cam.pitch),
                                                         std::cos(cam.pitch) * std::cos(cam.yaw));
-    if (showTerrain && !terrainData_.raw.empty())  // keep the camera above the ground
-        eye.y = std::max(eye.y, terrainData_.heightAt(eye.x, eye.z) + std::max(1.5f, radius_ * 0.3f));
+    if (showTerrain && !terrainData_.raw.empty()) {
+        // Keep the camera above the (smoothed, as drawn) ground, and lift it until
+        // no hill between it and the target hides the target.
+        const float clear = std::max(1.5f, radius_ * 0.3f);
+        eye.y = std::max(eye.y, terrainData_.smoothHeightAt(eye.x, eye.z) + clear);
+        for (int k = 1; k < 8; ++k) {
+            const float t = float(k) / 8.0f;
+            const simd_float3 p = eye + (center_ - eye) * t;
+            const float need = terrainData_.smoothHeightAt(p.x, p.z) + 0.6f - p.y;
+            if (need > 0) eye.y += need / (1.0f - t);  // raise the eye so the line clears this point
+        }
+    }
     FrameUniforms fu;
     const bool terrain = showTerrain && heightTex_ != nil;
     const float zn = terrain ? std::max(0.05f, dist * 0.02f) : radius_ * 0.02f;

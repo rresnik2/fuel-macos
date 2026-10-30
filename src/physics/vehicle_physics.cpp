@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <map>
@@ -212,6 +213,12 @@ struct DriveWorld::Impl {
         double x = 0, z = 0;  // centre
     };
     std::vector<Patch> patches;
+    // Patches resampled on a worker thread ahead of need (a rebuild took ~12 ms).
+    struct PendingPatch {
+        std::future<RefConst<Shape>> shape;
+        double x0 = 0, z0 = 0;
+    };
+    std::vector<PendingPatch> pendingPatches;
 
     std::unordered_map<uint32_t, RefConst<Shape>> staticShapes;
     std::map<std::pair<uint32_t, std::array<double, 16>>, BodyID> staticBodies;
@@ -271,10 +278,11 @@ struct DriveWorld::Impl {
 
     // A heightfield body covering ~2 km around (x, z), resampled from the
     // world map with the same B-spline the renderer uses.
-    void buildTerrainPatch(double x, double z) {
-        const double half = 0.5 * kPatchSpacing * (kPatchSamples - 1);
-        const double x0 = std::round((x - half) / kPatchSpacing) * kPatchSpacing;
-        const double z0 = std::round((z - half) / kPatchSpacing) * kPatchSpacing;
+    static constexpr double kPatchHalf = 0.5 * kPatchSpacing * (kPatchSamples - 1);
+    static double patchOrigin(double v) { return std::round((v - kPatchHalf) / kPatchSpacing) * kPatchSpacing; }
+
+    // The heightfield shape of the patch with corner (x0, z0); thread-safe.
+    static RefConst<Shape> makePatchShape(const Heightfield& terrain, double x0, double z0) {
         std::vector<float> samples(size_t(kPatchSamples) * kPatchSamples);
         for (uint32_t r = 0; r < kPatchSamples; ++r)
             for (uint32_t c = 0; c < kPatchSamples; ++c)
@@ -282,9 +290,18 @@ struct DriveWorld::Impl {
         HeightFieldShapeSettings hs(samples.data(), Vec3::sZero(), Vec3(kPatchSpacing, 1.0f, kPatchSpacing), kPatchSamples);
         auto result = hs.Create();
         if (result.HasError()) throw std::runtime_error(std::string("terrain patch: ") + result.GetError().c_str());
-        BodyCreationSettings bs(result.Get(), RVec3(x0, 0, z0), Quat::sIdentity(), EMotionType::Static, kStatic);
+        return result.Get();
+    }
+
+    void addPatchBody(RefConst<Shape> shape, double x0, double z0) {
+        BodyCreationSettings bs(shape, RVec3(x0, 0, z0), Quat::sIdentity(), EMotionType::Static, kStatic);
         bs.mFriction = 0.9f;
-        patches.push_back({bodies().CreateAndAddBody(bs, EActivation::DontActivate), x0 + half, z0 + half});
+        patches.push_back({bodies().CreateAndAddBody(bs, EActivation::DontActivate), x0 + kPatchHalf, z0 + kPatchHalf});
+    }
+
+    void buildTerrainPatch(double x, double z) {
+        const double x0 = patchOrigin(x), z0 = patchOrigin(z);
+        addPatchBody(makePatchShape(terrain, x0, z0), x0, z0);
     }
 
     bool onPatch(double x, double z, double reach) const {
@@ -293,12 +310,43 @@ struct DriveWorld::Impl {
         return false;
     }
 
+    bool patchPending(double x, double z, double reach) const {
+        for (const PendingPatch& p : pendingPatches)
+            if (std::hypot(x - (p.x0 + kPatchHalf), z - (p.z0 + kPatchHalf)) <= reach) return true;
+        return false;
+    }
+
     // Every vehicle within kPatchReach of a patch centre; patches far from all vehicles go.
+    // A vehicle heading out of its patch gets the next one prepared in the background.
     void updatePatches() {
+        for (auto it = pendingPatches.begin(); it != pendingPatches.end();) {
+            if (it->shape.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                ++it;
+                continue;
+            }
+            addPatchBody(it->shape.get(), it->x0, it->z0);
+            it = pendingPatches.erase(it);
+        }
+        constexpr double kPrefetch = kPatchReach * 0.6;
         for (const auto& v : vehicles) {
             if (v->car.IsInvalid()) continue;
             const RVec3 pos = bodies().GetPosition(v->car);
-            if (!onPatch(pos.GetX(), pos.GetZ(), kPatchReach)) buildTerrainPatch(pos.GetX(), pos.GetZ());
+            const double x = pos.GetX(), z = pos.GetZ();
+            if (!onPatch(x, z, kPatchReach)) {
+                // Out of reach and nothing usable ready: wait for a pending one nearby, else build now.
+                bool waited = false;
+                for (auto it = pendingPatches.begin(); it != pendingPatches.end(); ++it)
+                    if (std::hypot(x - (it->x0 + kPatchHalf), z - (it->z0 + kPatchHalf)) <= kPatchReach) {
+                        addPatchBody(it->shape.get(), it->x0, it->z0);
+                        pendingPatches.erase(it);
+                        waited = true;
+                        break;
+                    }
+                if (!waited) buildTerrainPatch(x, z);
+            } else if (!onPatch(x, z, kPrefetch) && !patchPending(x, z, kPrefetch)) {
+                const double x0 = patchOrigin(x), z0 = patchOrigin(z);
+                pendingPatches.push_back({std::async(std::launch::async, [&t = terrain, x0, z0] { return makePatchShape(t, x0, z0); }), x0, z0});
+            }
         }
         for (auto it = patches.begin(); it != patches.end();) {
             bool used = false;

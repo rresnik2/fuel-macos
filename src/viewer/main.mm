@@ -1424,8 +1424,19 @@ int main(int argc, const char** argv) {
                             if (opt.aiCheck && i % 600 == 0) printAiCheck(*race, *drive);
                             if (opt.aiCheck && std::all_of(race->racers.begin(), race->racers.end(), [](const RaceSession::Racer& r) { return r.finished >= 0; })) break;
                         }
+                        const double tp0 = CACurrentMediaTime();
                         drive->update(1.0f / 60, in);
+                        const double tp1 = CACurrentMediaTime();
                         if (streamer && (opt.propCheck || opt.film > 0 || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
+                        if (opt.film > 0) {  // worst step times since the last frame
+                            static double worstPhys = 0, worstStream = 0;
+                            worstPhys = std::max(worstPhys, (tp1 - tp0) * 1000.0);
+                            worstStream = std::max(worstStream, (CACurrentMediaTime() - tp1) * 1000.0);
+                            if (i % std::max(1, int(opt.film * 60)) == 0) {
+                                std::printf("film timing: worst physics step %.1f ms, worst streaming %.1f ms\n", worstPhys, worstStream);
+                                worstPhys = worstStream = 0;
+                            }
+                        }
                         if (opt.film > 0 && i % std::max(1, int(opt.film * 60)) == 0) {  // --film: OUT_0001.png ... from the chase camera
                             renderer.setInstanceWorlds(drive->partWorlds());
                             showOpponents(*drive, renderer);

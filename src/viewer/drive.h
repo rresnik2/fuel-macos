@@ -9,6 +9,7 @@
 #include "physics/vehicle_physics.hpp"
 #include "renderer.h"
 
+#include <future>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +87,9 @@ private:
 class WorldStreamer {
 public:
     WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup);
+    ~WorldStreamer() {
+        if (job_.valid()) job_.wait();
+    }
     size_t placementCount() const { return placed_.size(); }
     // Procedural trees and bushes within kPlantRadius (drawn, not solid).
     void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) { vegetation_ = v, terrain_ = terrain; }
@@ -111,7 +115,25 @@ private:
     const fuel::Vegetation* vegetation_ = nullptr;
     const fuel::RoadNetwork* roads_ = nullptr;
     static constexpr float kRoadRadius = 1200.0f;
-    void buildRoads(simd_float3 player, fuel::MeshRenderer& renderer) const;
+    struct RoadMesh {
+        std::vector<fuel::MeshRenderer::RoadVertex> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<fuel::MeshRenderer::RoadBatch> batches;
+    };
+    RoadMesh buildRoads(simd_float3 player) const;  // thread-safe
+    // Plants and road ribbons are rebuilt on a worker thread (they took ~6 ms
+    // per update on the main thread); the renderer gets them when ready.
+    struct Background {
+        std::vector<fuel::MeshInstance> plants;
+        RoadMesh roads;
+        bool haveRoads = false;
+    };
+    Background buildBackground(simd_float3 player) const;
+    void applyBackground(Background&& bg, fuel::MeshRenderer& renderer);
+    void pollBackground(fuel::MeshRenderer& renderer);
+    std::future<Background> job_;
+    bool rerun_ = false;      // the player moved on while the job ran
+    std::vector<fuel::MeshInstance> cellDraw_, plantDraw_;  // the static world's draw list, in two halves
     const fuel::Heightfield* terrain_ = nullptr;
     struct Placed {
         uint32_t meshId;
