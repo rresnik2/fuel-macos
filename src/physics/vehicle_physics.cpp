@@ -14,6 +14,9 @@
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/ShapeCast.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/ObjectLayerPairFilterTable.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
@@ -772,8 +775,20 @@ float DriveWorld::clearance(double x, double z, float yaw, float length, float m
     return blocked ? hit.mFraction * length : length;
 }
 
-float DriveWorld::rayFraction(const std::array<double, 3>& from, const std::array<double, 3>& to) const {
+float DriveWorld::rayFraction(const std::array<double, 3>& from, const std::array<double, 3>& to, float radius) const {
     const RVec3 a(from[0], from[1], from[2]), b(to[0], to[1], to[2]);
+    if (radius > 0) {
+        const SphereShape sphere(radius);
+        const RShapeCast cast(&sphere, Vec3::sReplicate(1.0f), RMat44::sTranslation(a), Vec3(b - a));
+        AllHitCollisionCollector<CastShapeCollector> hits;
+        impl_->physics.GetNarrowPhaseQuery().CastShape(cast, ShapeCastSettings(), RVec3::sZero(), hits,
+                                                       SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)), SpecifiedObjectLayerFilter(kStatic),
+                                                       NotTerrain());
+        float t = 1.0f;
+        for (const ShapeCastResult& h : hits.mHits)
+            if (h.mFraction > 1e-4f) t = std::min(t, h.mFraction);
+        return t;
+    }
     RayCastResult hit;
     const bool blocked = impl_->physics.GetNarrowPhaseQuery().CastRay(RRayCast(a, Vec3(b - a)), hit, SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)),
                                                                       SpecifiedObjectLayerFilter(kStatic), NotTerrain());

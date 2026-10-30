@@ -63,7 +63,7 @@ struct MaterialUniforms {
 };
 
 constant uint PaintOnly = 1, HasOcclusion = 2, HasNormal = 4, HasSpecular = 8, HasNormalLocal = 16, HasDirt = 32,
-              Reflective = 64, GroundTint = 128;
+              Reflective = 64, GroundTint = 128, Foliage = 256;
 
 struct VertexOut {
     float4 position [[position]];
@@ -219,8 +219,15 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
         d.rgb = mix(d.rgb, dirt.rgb, smoothstep(edge, edge + 0.15, dirt.a));
     }
     float4 c = d * m.diffuse;
-    if (m.alphaMode == 1 && c.a < 0.5) discard_fragment();
     float alpha = m.alphaMode == 2 ? c.a : 1.0;
+    if (m.alphaMode == 1) {
+        // Cut-outs: the 0.5 edge sharpened to about a pixel; with MSAA the alpha
+        // becomes coverage (alpha to coverage), so edges stay soft and depth sorts them.
+        alpha = saturate((c.a - 0.5) / max(fwidth(c.a), 1e-4) + 0.5);
+        // Leaves at the lens would fill the screen: thin them out within 1.5..4 m.
+        if (m.features & Foliage) alpha *= saturate((distance(in.world, f.eye.xyz) - 1.5) / 2.5);
+        if (alpha <= 0.0) discard_fragment();
+    }
     if (m.lit == 0) return float4(c.rgb + m.emissive.rgb, alpha);
 
     // Some foliage stores no normal at all: fall back to up.
@@ -1213,6 +1220,7 @@ id<MTLRenderPipelineState> MeshRenderer::pipeline(uint32_t stride, AlphaMode mod
     pd.rasterSampleCount = sampleCount_;
     pd.colorAttachments[0].pixelFormat = kRenderColorFormat;
     pd.depthAttachmentPixelFormat = kRenderDepthFormat;
+    if (mode == AlphaMode::Test) pd.alphaToCoverageEnabled = sampleCount_ > 1;
     if (mode == AlphaMode::Blend) {
         auto* ca = pd.colorAttachments[0];
         ca.blendingEnabled = YES;
@@ -1481,8 +1489,12 @@ std::unique_ptr<MeshRenderer::GpuMesh> MeshRenderer::buildMesh(uint32_t meshId, 
         indices.insert(indices.end(), tris.begin(), tris.end());
         // A distant tree / bush card (a lone 4-vertex sprite) is cut out and writes
         // depth: thousands of overlapping blended cards cannot be sorted.
-        if (d.sprite && mesh.vbs.size() == 1 && mesh.vbs[b.vb].count == 4 && gm->materials[mat].alpha == AlphaMode::Blend)
+        // Foliage too: unsorted blended leaves let a farther tree show through a nearer one.
+        if (gm->materials[mat].alpha == AlphaMode::Blend &&
+            ((d.sprite && mesh.vbs.size() == 1 && mesh.vbs[b.vb].count == 4) || foliage_.count(meshId))) {
             gm->materials[mat].alpha = AlphaMode::Test;
+            gm->materials[mat].features |= Foliage;
+        }
         gm->draws[uint32_t(gm->materials[mat].alpha)].push_back(d);
         gm->triangles += uint32_t(tris.size() / 3);
     }

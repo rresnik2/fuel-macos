@@ -28,6 +28,7 @@
 #include <string>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fuel {
@@ -170,6 +171,8 @@ public:
 
     // ---- Grass tufts (p14): FUEL's 1 m-grid grass cards (core/ground_point.hpp).
     void setGrassAtlas(uint32_t bitmapId);                 // the Grass material's 4x4 atlas
+    // Tree and bush meshes: their blended materials are drawn as cut-outs (alpha to coverage).
+    void setFoliage(std::unordered_set<uint32_t> meshIds) { foliage_ = std::move(meshIds); }
     void setGrass(const std::vector<GrassTuft>& tufts);    // replaces the list
     // Fine ground colour around the player (level 0: 1 m, level 1: 4 m texels), kGroundTile
     // texels per side, sRGB RGBA8 like the colour map (alpha = far-band forest weight); the
@@ -209,6 +212,7 @@ private:
         HasDirt = 1u << 5,
         Reflective = 1u << 6,
         GroundTint = 1u << 7,  // grey detail diffuse: multiplied by the local ground colour
+        Foliage = 1u << 8,     // tree / bush cut-out: fades out right at the camera
     };
     enum Slot { kDiffuse = 0, kOcclusion = 2, kNormal = 3, kSpecular = 4, kNormalLocal = 5, kDirt = 6 };
 
@@ -291,6 +295,7 @@ private:
     std::unordered_map<uint64_t, id<MTLTexture>> textures_;  // key: id << 1 | srgb
     std::unordered_map<uint32_t, uint8_t> textureAlpha_;
     std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> meshes_;
+    std::unordered_set<uint32_t> foliage_;
     std::unordered_map<uint32_t, std::unique_ptr<GpuMesh>> bakedMeshes_;  // addBakedMesh; survive setPaint
 
     Paint paint_;

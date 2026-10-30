@@ -1295,7 +1295,8 @@ int main(int argc, const char** argv) {
                 }
                 scene.parts = drive->parts();
                 renderer.cameraClearance = [d = drive.get()](simd_float3 from, simd_float3 to) {
-                    float t = d->physics().rayFraction({from.x, from.y, from.z}, {to.x, to.y, to.z});
+                    // A 0.6 m sphere, so the camera stays clear of trunks and walls, not just in sight of the target.
+                    float t = d->physics().rayFraction({from.x, from.y, from.z}, {to.x, to.y, to.z}, 0.6f);
                     // Opponents (vehicle and rider) as 1.8 m spheres, so the camera never ends up inside one.
                     const simd_float3 dir = to - from;
                     const float len2 = simd_length_squared(dir);
@@ -1335,6 +1336,12 @@ int main(int argc, const char** argv) {
                     if (fs::path(f->path()).filename() == "USA1.DPC") {
                         try {
                             vegetation = std::make_unique<fuel::Vegetation>(fuel::loadVegetation(*f));
+                            {
+                                std::unordered_set<uint32_t> foliage;
+                                for (const auto* list : {&vegetation->trees, &vegetation->bushes})
+                                    for (const fuel::Species& sp : *list) foliage.insert(sp.full);
+                                renderer.setFoliage(std::move(foliage));
+                            }
                             streamer->setVegetation(vegetation.get(), terrain.get());
                             streamer->setSurfaces([](double x, double z) { return gSurfaces.at(x, z); });
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));

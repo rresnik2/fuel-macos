@@ -127,8 +127,10 @@ public:
     // falls more than 1.6 times as steeply.
     float clearance(double x, double z, float yaw, float length, float maxSlope = 0, float height = 1.0f) const;
     // Fraction (0..1) of the segment from -> to that is clear of static objects
-    // (not the terrain, vehicles or props); 1 when nothing is in the way.
-    float rayFraction(const std::array<double, 3>& from, const std::array<double, 3>& to) const;
+    // (not the terrain, vehicles or props); 1 when nothing is in the way. With `radius`
+    // > 0 a sphere of that radius is swept instead of a ray (objects the sphere already
+    // touches at `from` are ignored).
+    float rayFraction(const std::array<double, 3>& from, const std::array<double, 3>& to, float radius = 0) const;
 
     // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
     // surface counts as dirt. The default applies to worlds created afterwards.
