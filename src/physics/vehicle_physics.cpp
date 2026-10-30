@@ -767,6 +767,14 @@ float DriveWorld::clearance(double x, double z, float yaw, float length, float m
     return blocked ? hit.mFraction * length : length;
 }
 
+float DriveWorld::rayFraction(const std::array<double, 3>& from, const std::array<double, 3>& to) const {
+    const RVec3 a(from[0], from[1], from[2]), b(to[0], to[1], to[2]);
+    RayCastResult hit;
+    const bool blocked = impl_->physics.GetNarrowPhaseQuery().CastRay(RRayCast(a, Vec3(b - a)), hit, SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)),
+                                                                      SpecifiedObjectLayerFilter(kStatic), NotTerrain());
+    return blocked ? hit.mFraction : 1.0f;
+}
+
 void DriveWorld::setSurfaceQuery(SurfaceQuery query) { impl_->surfaceQuery = std::move(query); }
 void DriveWorld::setDefaultSurfaceQuery(SurfaceQuery query) { defaultSurfaceQuery() = std::move(query); }
 

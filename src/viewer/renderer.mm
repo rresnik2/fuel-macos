@@ -1286,6 +1286,10 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             if (need > 0) eye.y += need / (1.0f - t);  // raise the eye so the line clears this point
         }
     }
+    if (cameraClearance) {
+        const float t = cameraClearance(center_, eye);
+        if (t < 1.0f) eye = center_ + (eye - center_) * std::max(0.15f, t - 0.4f / std::max(dist, 0.5f));
+    }
     FrameUniforms fu;
     const bool terrain = showTerrain && heightTex_ != nil;
     const float zn = terrain ? std::max(0.05f, dist * 0.02f) : radius_ * 0.02f;

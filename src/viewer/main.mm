@@ -1240,6 +1240,9 @@ int main(int argc, const char** argv) {
                     die(name + ": " + e.what());
                 }
                 scene.parts = drive->parts();
+                renderer.cameraClearance = [d = drive.get()](simd_float3 from, simd_float3 to) {
+                    return d->physics().rayFraction({from.x, from.y, from.z}, {to.x, to.y, to.z});
+                };
                 // The static world: every sub-world's placements (geometry lives in USA1.DPC).
                 std::vector<const fuel::DpcFile*> subs, lookup;
                 const fs::path worldDir = fs::path(opt.dataDir) / "CommonComponent/WORLD";

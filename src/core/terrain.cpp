@@ -137,8 +137,15 @@ size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world) {
         std::memcpy(&v, &b[o], 4);
         return v;
     };
+    // Overlapping surfaces: the one with the larger value at +0x54 wins (ties: the
+    // later record). Scored against the placed objects, this order seats more of
+    // them on the ground than file order, max or min (camps on ramps, for example).
+    std::vector<size_t> order(n);
+    for (uint32_t i = 0; i < n; ++i) order[i] = p + size_t(i) * 0x83;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t c) { return f32(a + 0x54) < f32(c + 0x54); });
     size_t applied = 0;
-    for (uint32_t i = 0; i < n; ++i, p += 0x83) {
+    for (const size_t rec : order) {
+        p = rec;
         // Record: u32 id; axis x (3 floats + pad), axis y, axis z, centre; then parameters
         // (+0x4c = blend margin in metres).
         const float ax[3] = {f32(p + 4), f32(p + 8), f32(p + 12)};

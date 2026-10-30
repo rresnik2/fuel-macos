@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -69,6 +70,9 @@ inline constexpr MTLPixelFormat kRenderDepthFormat = MTLPixelFormatDepth32Float;
 
 class MeshRenderer {
 public:
+    // Optional: fraction of the segment from the camera target to the eye that is
+    // clear of world objects; the chase camera moves in front of what blocks it.
+    std::function<float(simd_float3 from, simd_float3 to)> cameraClearance;
     MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const ResourceLibrary& library);
 
     // Registers CPU-built geometry (the baked rider) under `key`, which then works
