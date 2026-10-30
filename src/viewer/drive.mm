@@ -461,17 +461,15 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         // full meshes in chunks < 60 m (W+0xa68), cards beyond; bushes only in
         // chunks < 100 m, full meshes below 60 m (W+0xa64). In 30..60 m chunks the
         // engine also queues the card next to the full mesh; the port draws the mesh.
-        // Port limitation: the renderer does not draw the tree cards correctly yet
-        // (they come out invisible or as dark rectangles; bush cards are fine), so
-        // trees keep their full mesh in the 96 m chunks (to ~200-540 m) and the
-        // 192 / 384 m chunks, where FUEL draws only cards, stay empty.
+        // Beyond kPlantRadius only trees remain, all as cards (scattered with them).
+        fuel::scatterPlants(*vegetation_, *terrain_, roads_, blocked, player.x, player.z, kCardRadius, scattered, true, kPlantRadius, ground_);
         for (fuel::Plant& p : scattered) {
-            const bool tree = trees.count(p.meshId) != 0;
             const double chunk = decorChunkSize(p.position[0], p.position[2], player.x, player.z);
-            if (chunk >= (tree ? kTreeCardStandIn : kBushChunkMax)) continue;
-            if (!tree && chunk >= kFullMeshChunk) {
-                const auto it = card.find(p.meshId);
-                if (it == card.end() || it->second == 0) continue;
+            const auto it = card.find(p.meshId);
+            const bool tree = trees.count(p.meshId) != 0, isCard = it == card.end();
+            if (chunk >= (tree || isCard ? kTreeChunkMax : kBushChunkMax)) continue;
+            if (!isCard && chunk >= kFullMeshChunk) {
+                if (it->second == 0) continue;
                 p.meshId = it->second;
             }
             plants.push_back(p);

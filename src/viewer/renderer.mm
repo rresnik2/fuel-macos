@@ -1434,6 +1434,10 @@ std::unique_ptr<MeshRenderer::GpuMesh> MeshRenderer::buildMesh(uint32_t meshId, 
             d.sprite = std::memcmp(&vb.data[size_t(tris[0]) * vb.stride], &vb.data[size_t(tris[1]) * vb.stride], 12) == 0;
         }
         indices.insert(indices.end(), tris.begin(), tris.end());
+        // A distant tree / bush card (a lone 4-vertex sprite) is cut out and writes
+        // depth: thousands of overlapping blended cards cannot be sorted.
+        if (d.sprite && mesh.vbs.size() == 1 && mesh.vbs[b.vb].count == 4 && gm->materials[mat].alpha == AlphaMode::Blend)
+            gm->materials[mat].alpha = AlphaMode::Test;
         gm->draws[uint32_t(gm->materials[mat].alpha)].push_back(d);
         gm->triangles += uint32_t(tris.size() / 3);
     }
@@ -1712,6 +1716,9 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         auto drawMesh = [&](const GpuMesh& gm, NSUInteger count) {
             for (const Draw& d : gm.draws[pass]) {
                 const GpuMaterial& m = gm.materials[d.material];
+                // Sprites face the camera with either winding (tree cards wind
+                // counter-clockwise on screen), so they are never culled.
+                [enc setCullMode:cullBackFaces && !d.sprite ? MTLCullModeBack : MTLCullModeNone];
                 [enc setRenderPipelineState:pipeline(gm.vbStrides[d.vb], mode)];
                 [enc setVertexBuffer:gm.vbs[d.vb] offset:0 atIndex:0];
                 const uint32_t sprite = d.sprite ? 1u : 0u;
