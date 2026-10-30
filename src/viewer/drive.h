@@ -150,6 +150,9 @@ public:
         simd_float3 where = {0, 0, 0};  // current position of that one
     };
     PropStats propStats() const;
+    // True when (x, z) is within `clearance` metres (at most 5) of a placed object's ground-plane
+    // bounding circle: the spot is inside, or touching, a building, rock or prop.
+    bool nearObject(double x, double z, float clearance) const { return nearObstacle(x, z, clearance); }
     // Position of the movable prop nearest to `from` (diagnostics); false when there is none.
     bool nearestProp(simd_float3 from, const std::vector<simd_float3>& skip, simd_float3& out) const;
 

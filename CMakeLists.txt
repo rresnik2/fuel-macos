@@ -27,6 +27,7 @@ add_library(fuelcore STATIC
   src/core/surface.cpp
   src/core/vehicle_params.cpp
   src/core/races.cpp
+  src/core/hubs.cpp
   src/core/assembly.cpp
   src/core/sound.cpp
   src/core/rider.cpp
@@ -52,6 +53,7 @@ add_executable(fuelview
   src/viewer/renderer.mm
   src/viewer/drive.mm
   src/viewer/recorder.mm
+  src/viewer/hubcheck.mm
   src/audio/drive_audio.mm
 )
 target_compile_options(fuelview PRIVATE -fobjc-arc)

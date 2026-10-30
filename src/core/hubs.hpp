@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -28,5 +29,14 @@ struct Hub {
 
 // The hubs in career order. `dataDir` is the extracted game folder.
 std::vector<Hub> loadHubs(const std::string& dataDir);
+
+// The hub named `name` (compared without case, spaces or punctuation: "mount rainier",
+// "MOUNT_RAINIER", "Mountrainier"); nullptr when none matches.
+const Hub* findHub(const std::vector<Hub>& hubs, const std::string& name);
+// The hub whose camp, teleports or vistas are nearest to (x, z).
+const Hub* nearestHub(const std::vector<Hub>& hubs, float x, float z);
+// Looks for a spot where `isClear` holds: (x, z) itself, then rings of growing radius
+// (4 m apart, up to `maxRadius`). Returns false when there is none; otherwise moves x, z.
+bool nudgeToClearSpot(float& x, float& z, const std::function<bool(float, float)>& isClear, float maxRadius = 120.0f);
 
 }  // namespace fuel
