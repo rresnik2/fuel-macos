@@ -148,6 +148,34 @@ and its livery library. `--livery N` (1-9, 0 = plain paint), `--color N`
 `fuelview --shot out.png` renders one image without opening a window (options:
 `--mesh ID`, `--size WxH`, `--yaw DEG`, `--pitch DEG`).
 
+## Launcher
+
+`cmake --build build` also assembles **`build/FUEL.app`**: a double-clickable
+launcher (AppKit, no extra packages) with the game binary, `fuelview`, next to it
+in `Contents/MacOS/`, an icon drawn from code at build time, and an ad-hoc
+signature so it runs on the machine that built it. The bundle holds no game data.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+open build/FUEL.app
+```
+
+- **First run:** it asks for the game folder, the one holding `CommonComponent/`,
+  `LocalizedComponent/` and `XFinalComponent/FUEL.exe` (the port reads engine
+  tables from your copy of `FUEL.exe`; it never runs it). A folder that lacks
+  `CommonComponent/WORLD/USA1.DPC`, `LocalizedComponent/GameTsc/` or
+  `XFinalComponent/FUEL.exe` is refused with the missing item named. The folder is remembered.
+- **Settings:** resolution (presets and the display's native size), windowed or
+  fullscreen, post effects, grass, volume and language (en, fr, de, es, it). Every
+  change is saved at once.
+- **Play** starts `fuelview --game`. If it stops with an error, the launcher shows
+  its output in a "Last run log" panel.
+- **Where settings live:** `~/Library/Application Support/FUEL Port/settings.txt`,
+  plain `key = value` lines (`data`, `width`, `height`, `fullscreen`,
+  `post_effects`, `grass`, `volume`, `language`); see `src/core/settings.hpp`. Edit it
+  by hand or delete it to start over. `fuelview --settings` applies the same file
+  (window size, fullscreen, post effects, grass, volume) to a window run.
+
 ## Legal
 
 FUEL and its content belong to their rights holders. This project is not
