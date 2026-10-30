@@ -124,7 +124,7 @@ float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float
     float NdotH = saturate(dot(N, H));
     float VdotH = saturate(dot(V, H));
 
-    float3 ambient = mix(float3(0.13, 0.10, 0.07), float3(0.30, 0.31, 0.34), N.y * 0.5 + 0.5) * ao;
+    float3 ambient = mix(float3(0.15, 0.12, 0.08), float3(0.38, 0.38, 0.42), N.y * 0.5 + 0.5) * ao;
     float3 color = albedo * (sun * NdotL * shadow + ambient);
 
     float a2 = pow(rough, 4.0);
@@ -436,8 +436,8 @@ vertex RoadOut vsRoad(uint vid [[vertex_id]], const device RoadVertex* v [[buffe
 }
 
 fragment float4 fsRoad(RoadOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], texture2d<float> tex [[texture(0)]],
-                       depth2d<float> shadowMap [[texture(7)]], constant uint& textured [[buffer(2)]],
-                       constant float4& tint [[buffer(3)]]) {
+                       texture2d<float> hm [[texture(4)]], depth2d<float> shadowMap [[texture(7)]],
+                       constant uint& textured [[buffer(2)]], constant float4& tint [[buffer(3)]]) {
     constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
     // Dirt road textures are grey detail maps over the dirt colour; tarmac is a colour map (tint 1).
     float3 albedo = (textured != 0 ? tex.sample(rep, float2(in.uv.x, in.uv.y)).rgb : float3(0.5)) * tint.rgb;
@@ -445,7 +445,12 @@ fragment float4 fsRoad(RoadOut in [[stage_in]], constant FrameUniforms& f [[buff
     float edge = smoothstep(0.0, 0.18, in.uv.x) * smoothstep(1.0, 0.82, in.uv.x);
     float shadow = shadowFactor(shadowMap, in.sunPos);
     float3 V = normalize(f.eye.xyz - in.world);
-    float3 rgb = lighting(albedo, float3(0, 1, 0), V, 1.0, shadow, 0.1, 0.8, float2(0), false, f);
+    // The ground's normal, so a road on a slope away from the low sun is as dark as the slope.
+    float e = f.terrain.z;
+    float2 xz = in.world.xz;
+    float3 N = normalize(float3(terrainHeight(hm, xz - float2(e, 0), f) - terrainHeight(hm, xz + float2(e, 0), f), 2.0 * e,
+                                terrainHeight(hm, xz - float2(0, e), f) - terrainHeight(hm, xz + float2(0, e), f)));
+    float3 rgb = lighting(albedo, N, V, 1.0, shadow, 0.1, 0.8, float2(0), false, f);
     return float4(haze(rgb, in.world, f), in.opacity * edge);
 }
 
@@ -922,8 +927,8 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     shaftsPipeline_ = makePost(@"vsFull", @"fsShafts", kRenderColorFormat, 0);
     compositePipeline_ = makePost(@"vsFull", @"fsComposite", kOutputColorFormat, 0);
 
-    // A low, warm evening sun (about 18 degrees up), as in most of FUEL's races.
-    sunDir_ = simd_normalize(simd_make_float3(0.736f, 0.31f, 0.602f));
+    // A low, warm evening sun (about 22 degrees up), as in most of FUEL's races.
+    sunDir_ = simd_normalize(simd_make_float3(0.718f, 0.375f, 0.587f));
 }
 
 void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
@@ -1656,6 +1661,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             [enc setDepthBias:-8.0f slopeScale:-24.0f clamp:0.0f];
             [enc setVertexBuffer:roadVertices_ offset:0 atIndex:0];
             [enc setFragmentTexture:shadowMap_ atIndex:7];
+            [enc setFragmentTexture:heightTex_ atIndex:4];
             for (const auto& [tex, b] : roadBatches_) {
                 const uint32_t textured = tex != nil ? 1u : 0u;
                 [enc setFragmentBytes:&textured length:sizeof textured atIndex:2];
@@ -1725,7 +1731,7 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
     rp.colorAttachments[0].texture = hdrMsaa_;
     rp.colorAttachments[0].resolveTexture = hdr_;
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rp.colorAttachments[0].clearColor = MTLClearColorMake(0.02, 0.022, 0.026, 1.0);
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0.10, 0.12, 0.15, 1.0);  // behind single meshes (no sky)
     rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
     rp.depthAttachment.texture = depthMsaa_;
     rp.depthAttachment.resolveTexture = depth_;
