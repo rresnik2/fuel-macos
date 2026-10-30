@@ -1235,7 +1235,21 @@ int main(int argc, const char** argv) {
                 }
                 scene.parts = drive->parts();
                 renderer.cameraClearance = [d = drive.get()](simd_float3 from, simd_float3 to) {
-                    return d->physics().rayFraction({from.x, from.y, from.z}, {to.x, to.y, to.z});
+                    float t = d->physics().rayFraction({from.x, from.y, from.z}, {to.x, to.y, to.z});
+                    // Opponents (vehicle and rider) as 1.8 m spheres, so the camera never ends up inside one.
+                    const simd_float3 dir = to - from;
+                    const float len2 = simd_length_squared(dir);
+                    for (int i = 1; i < d->vehicleCount() && len2 > 1e-6f; ++i) {
+                        const simd_float3 c = d->position(i) - from;
+                        const float along = simd_dot(c, dir) / len2;
+                        if (along <= 0 || along >= t) continue;
+                        const float miss2 = simd_length_squared(c - dir * along), r = 1.8f;
+                        // Never closer than 3 m to the target: a rival alongside must not push
+                        // the camera into the player's own rider.
+                        const float minT = std::min(1.0f, 3.0f / std::sqrt(len2));
+                        if (miss2 < r * r) t = std::max(minT, along - std::sqrt((r * r - miss2) / len2));
+                    }
+                    return t;
                 };
                 // The static world: every sub-world's placements (geometry lives in USA1.DPC).
                 std::vector<const fuel::DpcFile*> subs, lookup;
