@@ -163,6 +163,7 @@ public:
     // Speed effects for this frame, 0..1: radial blur towards the screen edges.
     float speedBlur = 0;
     bool postEffects = true;  // false: plain tone mapping (no bloom, glare, blur, grade)
+    bool grass = true;        // false: no grass tufts (settings file; FUEL_NO_GRASS=1 also disables)
     float sceneRadius() const { return radius_; }
     // GPU time of the last completed frame, in milliseconds (0 until one finished).
     double lastGpuMs() const { return gpuMs_; }

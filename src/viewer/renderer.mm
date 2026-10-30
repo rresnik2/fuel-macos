@@ -2060,7 +2060,7 @@ void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {
 
 void MeshRenderer::encodeGrass(id<MTLRenderCommandEncoder> enc) {
     static const bool disabled = std::getenv("FUEL_NO_GRASS") != nullptr;  // FUEL_NO_GRASS=1: measure without
-    if (disabled || grassCount_ == 0 || grassAtlas_ == nil || grassPipeline_ == nil) return;
+    if (disabled || !grass || grassCount_ == 0 || grassAtlas_ == nil || grassPipeline_ == nil) return;
     struct {
         simd_float4 a;
     } params;
