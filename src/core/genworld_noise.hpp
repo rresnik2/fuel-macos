@@ -14,8 +14,9 @@ namespace fuel {
 
 using Permutation = std::array<uint8_t, 256>;
 
-// The permutation for a GenWorld seed (USA1: 41).
-Permutation buildPermutation(uint32_t seed);
+// The permutation for a GenWorld seed (USA1: 41). Needs the engine's base shuffle,
+// read once from FUEL.exe in the game data folder that holds `world`.
+Permutation buildPermutation(const DpcFile& world, uint32_t seed);
 
 // The seed stored in the world's GenWorld_Z (the u32 after the materials list).
 // Throws if the world has no GenWorld_Z.

@@ -123,7 +123,7 @@ size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world) {
     // groups {u32 len, name, u32, u32 n, ids[n]}; then u32 n and n 0x83-byte records.
     size_t p = 12;
     for (int list = 0; list < 3; ++list) p += 4 + size_t(rd32(b, p)) * 4;
-    const Permutation perm = buildPermutation(rd32(b, p));
+    const Permutation perm = buildPermutation(world, rd32(b, p));
     p += 4;
     const uint32_t groups = rd32(b, p);
     p += 4;

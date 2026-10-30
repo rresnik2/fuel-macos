@@ -1,7 +1,14 @@
 #include "genworld_noise.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 
 namespace fuel {
@@ -10,21 +17,55 @@ namespace {
 
 constexpr uint32_t kGenWorldClass = 0x31FA94AE;
 
-// The engine's fixed shuffle of 0..255 that the seed permutes further.
-constexpr uint8_t kBaseShuffle[256] = {
-    0xe8, 0xba, 0xe3, 0x14, 0x4f, 0x83, 0xa0, 0xa9, 0xc8, 0x9f, 0x1d, 0x4e, 0xb3, 0x38, 0x45, 0xbc, 0xeb, 0xb9, 0xc5, 0x53, 0x13, 0xd3,
-    0xfc, 0x65, 0xf6, 0x85, 0xb4, 0xbf, 0x34, 0x35, 0x4a, 0x99, 0xad, 0x74, 0x56, 0x04, 0x4d, 0xf1, 0x25, 0x5c, 0x95, 0x02, 0x09, 0x26,
-    0x18, 0xd5, 0x06, 0xf9, 0x1f, 0x63, 0x7f, 0xcc, 0x48, 0x30, 0x9a, 0x0c, 0x32, 0xc2, 0x49, 0x9e, 0xc0, 0xfa, 0xde, 0x8a, 0xf5, 0x73,
-    0x21, 0x42, 0x07, 0xb7, 0x19, 0x5f, 0xe6, 0x6d, 0x9b, 0xbd, 0x0d, 0x54, 0x89, 0x40, 0xce, 0xec, 0xac, 0x23, 0xa4, 0x29, 0x1b, 0x36,
-    0x87, 0xe2, 0x81, 0xd0, 0xdc, 0x01, 0x0f, 0x2a, 0xe7, 0x6f, 0x6e, 0xa2, 0xc6, 0x70, 0x77, 0x94, 0xf0, 0x0a, 0x2f, 0x92, 0x93, 0x96,
-    0x7b, 0xa7, 0xb2, 0x27, 0xe4, 0xf3, 0x61, 0x9c, 0x60, 0xcb, 0x28, 0x84, 0x8e, 0x44, 0x24, 0x88, 0x47, 0x7d, 0x90, 0x91, 0x1c, 0x69,
-    0x39, 0x3c, 0xa5, 0xd7, 0x17, 0x79, 0x41, 0x5e, 0x50, 0x15, 0x7e, 0xf7, 0x3b, 0x55, 0x08, 0xda, 0xf4, 0xc1, 0xdd, 0xa1, 0xab, 0x6b,
-    0x4b, 0x6c, 0xe5, 0x67, 0x12, 0x5d, 0xea, 0x3d, 0x51, 0xa3, 0xd4, 0xed, 0xb5, 0xc4, 0xff, 0x57, 0x75, 0xfd, 0x5b, 0x4c, 0x80, 0xaa,
-    0x52, 0xe1, 0x0e, 0x8f, 0x37, 0xcd, 0x1e, 0xaf, 0xc7, 0x0b, 0x1a, 0xb0, 0xd9, 0x82, 0xf2, 0x46, 0x7c, 0x16, 0x2c, 0x62, 0x64, 0xa8,
-    0xae, 0x2d, 0xef, 0xa6, 0x05, 0x3a, 0x76, 0xd1, 0x20, 0xbe, 0xb6, 0x3e, 0xb1, 0xe0, 0x72, 0x9d, 0xb8, 0xd8, 0x6a, 0xc3, 0x66, 0x8c,
-    0x3f, 0x98, 0x11, 0x43, 0x59, 0x78, 0xd2, 0xd6, 0xcf, 0xdb, 0xf8, 0xfb, 0xdf, 0x22, 0x7a, 0x5a, 0xfe, 0xca, 0x2e, 0x86, 0xe9, 0x33,
-    0x71, 0x8d, 0x58, 0x68, 0x8b, 0xbb, 0xee, 0x10, 0x31, 0xc9, 0x03, 0x2b, 0x97, 0x00,
-};
+// The engine's fixed shuffle of 0..255 that the seed permutes further. It lives
+// in FUEL.exe's .rdata (VA 0xa01220), not in the world data, and the repo holds
+// nothing taken from the game's files: it is read from the player's own copy,
+// found next to the world DPC (<data>/XFinalComponent/FUEL.exe).
+constexpr uint32_t kShuffleVa = 0xA01220;
+
+std::optional<std::array<uint8_t, 256>> readShuffle(const std::filesystem::path& exe) {
+    std::ifstream f(exe, std::ios::binary);
+    if (!f) return std::nullopt;
+    const std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto u16 = [&](size_t o) { return o + 2 <= b.size() ? uint32_t(b[o] | b[o + 1] << 8) : 0u; };
+    auto u32 = [&](size_t o) { return o + 4 <= b.size() ? uint32_t(b[o] | b[o + 1] << 8 | b[o + 2] << 16 | uint32_t(b[o + 3]) << 24) : 0u; };
+    const size_t pe = u32(0x3c);
+    if (u32(pe) != 0x00004550) return std::nullopt;  // "PE\0\0"
+    const uint32_t sections = u16(pe + 6), optSize = u16(pe + 20), imageBase = u32(pe + 24 + 28);
+    const uint32_t rva = kShuffleVa - imageBase;
+    for (uint32_t k = 0; k < sections; ++k) {
+        const size_t sh = pe + 24 + optSize + size_t(k) * 40;
+        const uint32_t va = u32(sh + 12), vsize = std::max(u32(sh + 8), u32(sh + 16)), raw = u32(sh + 20);
+        if (rva < va || rva + 256 > va + vsize) continue;
+        const size_t off = size_t(raw) + (rva - va);
+        if (off + 256 > b.size()) return std::nullopt;
+        std::array<uint8_t, 256> t{};
+        bool seen[256] = {};
+        for (size_t i = 0; i < 256; ++i) {
+            t[i] = b[off + i];
+            if (seen[t[i]]) return std::nullopt;  // not a permutation: another build of the exe
+            seen[t[i]] = true;
+        }
+        return t;
+    }
+    return std::nullopt;
+}
+
+const std::array<uint8_t, 256>& baseShuffle(const DpcFile& world) {
+    static std::once_flag once;
+    static std::array<uint8_t, 256> table;
+    std::call_once(once, [&] {
+        const auto root = std::filesystem::path(world.path()).parent_path().parent_path().parent_path();
+        if (auto t = readShuffle(root / "XFinalComponent" / "FUEL.exe")) {
+            table = *t;
+            return;
+        }
+        std::fprintf(stderr, "fuel: FUEL.exe not found next to the game data; procedural scenery will differ from the game\n");
+        for (size_t i = 0; i < 256; ++i) table[i] = uint8_t((i * 167 + 13) & 255);  // some fixed shuffle
+    });
+    return table;
+}
+
 
 uint32_t rd32(const std::vector<uint8_t>& b, size_t o) {
     if (o + 4 > b.size()) throw std::runtime_error("GenWorld_Z body too short");
@@ -37,7 +78,8 @@ constexpr float kEdgeSpread = 1.0f / 510.0f, kCentreSpread = 1.0f / 255.0f;
 
 }  // namespace
 
-Permutation buildPermutation(uint32_t seed) {
+Permutation buildPermutation(const DpcFile& world, uint32_t seed) {
+    const std::array<uint8_t, 256>& kBaseShuffle = baseShuffle(world);
     // Each output draws from the base shuffle through a 4-step chain keyed by the
     // seed's bytes, taking the next unused entry when the slot is taken.
     int avail[256];

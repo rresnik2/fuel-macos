@@ -279,7 +279,7 @@ Vegetation loadVegetation(const DpcFile& world) {
     p += 4 + size_t(rd32(b, p)) * 4;
     p += 4 + size_t(rd32(b, p)) * 4;
     Vegetation v;
-    v.perm = buildPermutation(rd32(b, p));
+    v.perm = buildPermutation(world, rd32(b, p));
     p += 4;
     // Clearing noise: 3 levels under a 500 m cell (finest 62.5 m).
     v.clearings = Fractal(v.perm, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
