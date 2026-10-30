@@ -30,6 +30,7 @@ add_library(fuelcore STATIC
   src/core/assembly.cpp
   src/core/sound.cpp
   src/core/rider.cpp
+  src/core/settings.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 
