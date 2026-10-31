@@ -27,6 +27,9 @@ add_library(fuelcore STATIC
   src/core/genworld_noise.cpp
   src/core/ground_point.cpp
   src/core/roads.cpp
+  src/core/road_table.cpp
+  src/core/road_segments.cpp
+  src/core/water.cpp
   src/core/surface.cpp
   src/core/vehicle_params.cpp
   src/core/races.cpp

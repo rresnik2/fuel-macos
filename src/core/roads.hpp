@@ -41,6 +41,10 @@ struct RoadNetwork {
 int roadSurfaceAt(const RoadNetwork& net, double x, double z);
 bool isTarmacRoad(int roadType);  // types 10, 11, 12, 15, 18, 19
 
-RoadNetwork loadRoads(const DpcFile& world);  // throws if the world has no GenWorld_Z/GwRoad_Z
+RoadNetwork loadRoads(const DpcFile& world);
+
+// Bitmap_Z of the GenWorld texture enum `e` (GenWorld_Z materials list, p9 R8: 0x2a..0x2e
+// Road01..05, 0x2f..0x33 RoadStop01..05, 0x34 Dirt01, 0x37 Water); 0 when absent.
+uint32_t genWorldEnumTexture(const DpcFile& world, uint32_t e, int slot = 0);  // throws if the world has no GenWorld_Z/GwRoad_Z
 
 }  // namespace fuel
