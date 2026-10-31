@@ -2,16 +2,19 @@
 //
 // GenWorld_Z lists Binary_Z maps; the first is a 4668x4668 grid of 12-bit
 // heights covering a 140 km square centred on the origin (about 30 m
-// spacing, 10000 m for the full 12-bit range). The original engine adds
-// procedural detail on top at run time; the port renders it its own way.
+// spacing, 10000 m for the full 12-bit range). FUEL adds procedural detail on
+// top at run time (AGW_Altitude, FUEL.exe 0x64a2a0): see terrain_height.hpp.
 #pragma once
 
 #include "dpc.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace fuel {
+
+class TerrainDetail;
 
 struct Heightfield {
     uint32_t width = 0, height = 0;  // samples; column = x, row = z
@@ -20,12 +23,19 @@ struct Heightfield {
     float metresPerUnit = 0;         // height of one raw step
     std::vector<uint16_t> raw;       // row-major
 
+    // FUEL's procedural ground on top of the map (null for the bare map).
+    std::shared_ptr<const TerrainDetail> detail;
+
     float sampleHeight(uint32_t col, uint32_t row) const { return float(raw[size_t(row) * width + col]) * metresPerUnit; }
-    // Bilinear height at a world position (clamped to the edges).
+    // Bilinear height of the raw samples at a world position (clamped to the edges).
     float heightAt(float x, float z) const;
-    // Cubic B-spline height, the smooth surface the renderer draws (and the
-    // original engine samples).
+    // Cubic B-spline of the map alone (the engine's base height h0).
+    float baseHeightAt(double x, double z) const;
+    // The ground height FUEL uses everywhere (AGW_Altitude 0x64a2a0 with the detail
+    // fractals, rock, canyon floors, gulches and flat surfaces) when `detail` is set,
+    // else the B-spline of the map.
     float smoothHeightAt(double x, double z) const;
+    float groundHeight(double x, double z) const { return smoothHeightAt(x, z); }
 };
 
 // One GenWorld map (Binary_Z): a grid of 12-bit values over the same 140 km
@@ -41,15 +51,11 @@ Raster decodeRaster(const std::vector<uint8_t>& binaryBody);
 // The Binary_Z map IDs listed by the world's GenWorld_Z (index 0 = heights).
 std::vector<uint32_t> genWorldMaps(const DpcFile& world);
 
-// FUEL levels the ground under hubs, camps and other structures ("flat
-// surfaces" in GenWorld_Z: oriented, possibly sloped rectangles with a blend
-// margin). Bakes them into `hf`; returns how many were applied.
-size_t applyFlatSurfaces(Heightfield& hf, const DpcFile& world);
-
 // Decodes the heightfield of a world DPC (WORLD/USA1.DPC). Throws when the
 // file has no GenWorld_Z or the map does not decode.
 Heightfield loadWorldHeightfield(const DpcFile& world);
-// The heightfield with the flat surfaces applied (what the game drives on).
+// The heightfield with FUEL's procedural ground attached (`detail`): what the game
+// drives on, draws and places objects on.
 Heightfield loadLevelledHeightfield(const DpcFile& world);
 
 }  // namespace fuel

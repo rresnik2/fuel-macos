@@ -1,442 +1,561 @@
-// Road-type table rebuilt from the player's FUEL.exe by running the engine's own
-// initialisation code (FUN_006f24a0 and its three helpers) in a small emulator.
-//
-// Nothing of the table is stored here: only addresses, opcode handling and the
-// arithmetic the code performs. The emulator knows the ~45 instruction forms that occur in
-// the routine and stops with an error on anything else. x87 results are kept as float32
-// after every operation (that is what the engine stores into the table).
 #include "road_types.hpp"
+#include "genworld_noise.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
-#include <optional>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace fuel {
+
 namespace {
 
-// ---- where things live in FUEL.exe (virtual addresses) -------------------------------------
-constexpr uint32_t kTable = 0xa677e0, kTypes = 21, kBlock = 0x200;  // g_RoadTypes
-constexpr uint32_t kEntry = 0x6f2560;  // first useful instruction; the frame set-up before it is skipped
-constexpr uint32_t kExit = 0x6f567a;   // epilogue of the init function: everything is done by here
-constexpr uint32_t kGwColours = 0x47b74;  // GenWorld palette inside the GenWorld object (16 bytes per slot)
-constexpr uint32_t kHelpers[3] = {0x6f1240, 0x6f5690, 0x6f5770};  // the only functions the init calls
+// Addresses in FUEL.exe (code locations, not data).
+constexpr uint32_t kInit = 0x6f24a0;        // AGW_TerraRoad::Init
+constexpr uint32_t kTable = 0xa677e0;       // per-type records, stride 0x200
+constexpr uint32_t kStride = 0x200;
+constexpr uint32_t kCodeLo = 0x6f1240, kCodeHi = 0x6f5940;  // Init and the helpers it calls (0x6f1240, 0x6f5690, 0x6f5770)
+// External calls the replay skips, with the bytes of arguments each callee pops.
+struct Stub {
+    uint32_t va, pops;
+};
+constexpr Stub kStubs[] = {{0x8b6e86, 0}, {0x6fee30, 0}, {0x6597b0, 8}, {0x7a9c80, 12}};
 
-struct Range { uint32_t from, to; };
-constexpr Range kMain{0x6f24a0, 0x6f5682};  // whole init function
-constexpr Range kHelperCode[3] = {{0x6f1240, 0x6f1296}, {0x6f5690, 0x6f576a}, {0x6f5770, 0x6f5937}};
-
-// SHA-256 of the code bytes of the Steam/retail build this was written against (hashes, not game data).
-const char* const kMainHash = "eb5f54ea7abe5b7b1cad50afc01e21fc5f26141e6a10cd55919422bf09a8ebf5";
-const char* const kHelperHash = "972ab0788d7bc13a28f5f3cf0880e94018bbb34fa79ebc68175749d6637049a0";  // the three helpers back to back
-
-struct Fail : std::runtime_error { using std::runtime_error::runtime_error; };
-[[noreturn]] void fail(const char* what, uint32_t at) {
-    char b[128];
-    std::snprintf(b, sizeof b, "%s (at 0x%x)", what, at);
-    throw Fail(b);
-}
-
-// ---- SHA-256 (to recognise the exe build) ----------------------------------------------------
-std::string sha256(const std::vector<uint8_t>& msg) {
-    static const uint32_t K[64] = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
-        0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa,
-        0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85,
-        0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
-        0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-    std::vector<uint8_t> m = msg;
-    const uint64_t bits = uint64_t(msg.size()) * 8;
-    m.push_back(0x80);
-    while (m.size() % 64 != 56) m.push_back(0);
-    for (int i = 7; i >= 0; --i) m.push_back(uint8_t(bits >> (8 * i)));
-    auto ror = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
-    for (size_t o = 0; o < m.size(); o += 64) {
-        uint32_t w[64];
-        for (int i = 0; i < 16; ++i) w[i] = uint32_t(m[o + 4 * i]) << 24 | uint32_t(m[o + 4 * i + 1]) << 16 | uint32_t(m[o + 4 * i + 2]) << 8 | m[o + 4 * i + 3];
-        for (int i = 16; i < 64; ++i) {
-            const uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3), s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-        for (int i = 0; i < 64; ++i) {
-            const uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
-            const uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
-            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-    }
-    char out[65];
-    for (int i = 0; i < 8; ++i) std::snprintf(out + 8 * i, 9, "%08x", h[i]);
-    return out;
-}
-
-// ---- the PE image: virtual address -> byte --------------------------------------------------
-class Image {
-public:
+// The PE image of FUEL.exe, readable by virtual address.
+struct Image {
+    std::vector<uint8_t> file;
+    struct Section {
+        uint32_t va, size, raw;
+    };
+    std::vector<Section> sections;
+    uint32_t base = 0;
     bool load(const std::string& path) {
         std::ifstream f(path, std::ios::binary);
         if (!f) return false;
-        b_.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        auto u16 = [&](size_t o) { return o + 2 <= file.size() ? uint32_t(file[o] | file[o + 1] << 8) : 0u; };
+        auto u32 = [&](size_t o) { return o + 4 <= file.size() ? uint32_t(file[o] | file[o + 1] << 8 | file[o + 2] << 16 | uint32_t(file[o + 3]) << 24) : 0u; };
         const size_t pe = u32(0x3c);
-        if (u32(pe) != 0x00004550) return false;  // "PE\0\0"
-        const uint32_t sections = u16(pe + 6), optSize = u16(pe + 20);
-        base_ = u32(pe + 24 + 28);
-        for (uint32_t k = 0; k < sections; ++k) {
-            const size_t sh = pe + 24 + optSize + size_t(k) * 40;
-            secs_.push_back({u32(sh + 12), u32(sh + 8), u32(sh + 20), u32(sh + 16)});
-        }
-        return !secs_.empty();
-    }
-    // Section bytes past the raw size read as zero (uninitialised data).
-    bool byte(uint32_t va, uint8_t& out) const {
-        const uint32_t rva = va - base_;
-        for (const Sec& s : secs_) {
-            if (rva < s.rva || rva - s.rva >= std::max(s.vsize, s.raw_size)) continue;
-            const uint32_t off = rva - s.rva;
-            if (off >= s.raw_size) { out = 0; return true; }
-            if (size_t(s.raw) + off >= b_.size()) return false;
-            out = b_[s.raw + off];
-            return true;
-        }
-        return false;
-    }
-    bool bytes(Range r, std::vector<uint8_t>& out) const {
-        for (uint32_t a = r.from; a < r.to; ++a) {
-            uint8_t v;
-            if (!byte(a, v)) return false;
-            out.push_back(v);
+        if (u32(pe) != 0x00004550) return false;
+        const uint32_t n = u16(pe + 6), opt = u16(pe + 20);
+        base = u32(pe + 24 + 28);
+        for (uint32_t k = 0; k < n; ++k) {
+            const size_t sh = pe + 24 + opt + size_t(k) * 40;
+            sections.push_back({base + u32(sh + 12), u32(sh + 16), u32(sh + 20)});
         }
         return true;
     }
-
-private:
-    struct Sec { uint32_t rva, vsize, raw, raw_size; };
-    uint32_t u16(size_t o) const { return o + 2 <= b_.size() ? uint32_t(b_[o] | b_[o + 1] << 8) : 0u; }
-    uint32_t u32(size_t o) const { return o + 4 <= b_.size() ? uint32_t(b_[o] | b_[o + 1] << 8 | b_[o + 2] << 16 | uint32_t(b_[o + 3]) << 24) : 0u; }
-    std::vector<uint8_t> b_;
-    std::vector<Sec> secs_;
-    uint32_t base_ = 0;
+    bool byte(uint32_t va, uint8_t& out) const {
+        for (const Section& s : sections)
+            if (va >= s.va && va < s.va + s.size && size_t(s.raw) + (va - s.va) < file.size()) {
+                out = file[s.raw + (va - s.va)];
+                return true;
+            }
+        return false;
+    }
 };
 
-uint32_t floatBits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-float bitsFloat(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+double floatDown(double v) {  // float32 store in the engine's round-down FPU mode
+    float f = float(v);
+    if (double(f) > v) f = std::nextafter(f, -std::numeric_limits<float>::infinity());
+    return double(f);
+}
 
-using Palette = std::function<std::array<float, 4>(int)>;
-
-// ---- the emulator ----------------------------------------------------------------------------
-// Memory map seen by the code:
-//   - the road-type table (persistent between runs, starts as zeroed BSS),
-//   - a stack, and a fake "TerraRoad" object (ebx at entry) whose +0xa8 points to
-//   - a fake GenWorld object whose palette reads go to the palette callback,
-//   - FUEL.exe itself, read only (the constants and the type-name strings).
-// Reading stack/object bytes nobody wrote is an error, so a code path that depends on state
-// this emulator does not model is caught instead of silently producing zeros.
-class Emu {
+// A minimal x86-32 / x87 interpreter for the straight-line table set-up code.
+class Cpu {
 public:
-    Emu(const Image& img, const Palette& pal, std::vector<uint8_t>& table) : img_(img), pal_(pal), tbl_(table) {
-        stack_.base = kStackBase; stack_.d.assign(kStackSize, 0); stack_.w.assign(kStackSize, 0);
-        tr_.base = kTr; tr_.d.assign(kTrSize, 0); tr_.w.assign(kTrSize, 0);
-        st(kTr + 0xa8, 4, kGw);                       // TR+0xa8 = GenWorld
-        r_[ESP] = kStackBase + kStackSize - 0x100;
-        for (uint32_t o = 0; o < 12; o += 4) st(r_[ESP] + o, 4, 0);  // the registers the prologue saved (popped at the end)
-        st(r_[ESP] + 0xc, 4, kTr);                    // [esp+0xc] = TR, as the prologue left it
-        r_[EBX] = kTr;
-        eip_ = kEntry;
+    explicit Cpu(const Image& img) : img_(img) {}
+    std::unordered_map<uint32_t, uint8_t> mem;  // everything written (overrides the image)
+    uint32_t r[8] = {};                          // eax ecx edx ebx esp ebp esi edi
+    double st[8] = {};
+    int top = 0;
+    uint16_t sw = 0;
+    bool cf = false, zf = false, sf = false, of = false, pf = false;
+    uint32_t ip = 0;
+    long steps = 0;
+
+    uint8_t rd8(uint32_t a) const {
+        if (auto it = mem.find(a); it != mem.end()) return it->second;
+        uint8_t b = 0;
+        img_.byte(a, b);
+        return b;
+    }
+    uint32_t rd32(uint32_t a) const { return uint32_t(rd8(a)) | uint32_t(rd8(a + 1)) << 8 | uint32_t(rd8(a + 2)) << 16 | uint32_t(rd8(a + 3)) << 24; }
+    uint16_t rd16(uint32_t a) const { return uint16_t(rd8(a) | rd8(a + 1) << 8); }
+    void wr8(uint32_t a, uint8_t v) { mem[a] = v; }
+    void wr16(uint32_t a, uint16_t v) { wr8(a, uint8_t(v)), wr8(a + 1, uint8_t(v >> 8)); }
+    void wr32(uint32_t a, uint32_t v) {
+        for (int k = 0; k < 4; ++k) wr8(a + uint32_t(k), uint8_t(v >> (8 * k)));
+    }
+    float rdf(uint32_t a) const {
+        const uint32_t u = rd32(a);
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    }
+    void wrf(uint32_t a, double v) {
+        const float f = float(floatDown(v));
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        wr32(a, u);
+    }
+    void push(uint32_t v) { r[4] -= 4, wr32(r[4], v); }
+    uint32_t pop() {
+        const uint32_t v = rd32(r[4]);
+        r[4] += 4;
+        return v;
+    }
+    double& ST(int i) { return st[(top + i) & 7]; }
+    void fpush(double v) { top = (top - 1) & 7, st[top] = v; }
+    void fpop() { top = (top + 1) & 7; }
+
+    [[noreturn]] void fail(const char* what) const {
+        char b[160];
+        std::snprintf(b, sizeof b, "unsupported instruction at 0x%x (%s, byte %02x)", ip, what, rd8(ip));
+        throw std::runtime_error(b);
     }
 
-    void run() {
-        for (uint64_t steps = 0; eip_ != kExit; ++steps) {
-            if (steps > 2000000) fail("runaway", eip_);
+    // Runs from `entry` until it returns to `sentinel`.
+    void run(uint32_t entry, uint32_t sentinel) {
+        ip = entry;
+        while (ip != sentinel) {
+            if (++steps > 2000000) throw std::runtime_error("road table replay does not end");
+            if (ip < kCodeLo || ip >= kCodeHi) {
+                const Stub* s = nullptr;
+                for (const Stub& k : kStubs)
+                    if (k.va == ip) s = &k;
+                if (!s && ip != 0) fail("call outside the table code");
+                ip = pop();
+                r[4] += s ? s->pops : 0;
+                r[0] = 0;
+                continue;
+            }
             step();
         }
     }
 
 private:
-    enum { EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI };
-    static constexpr uint32_t kStackBase = 0x7f0000, kStackSize = 0x10000, kTr = 0x30000000, kTrSize = 0x5000, kGw = 0x40000000;
-    static constexpr int kPaletteSlots = 64;
+    const Image& img_;
 
-    struct Region { uint32_t base = 0; std::vector<uint8_t> d, w; };  // w = byte was written
-    struct Modrm { int mod, reg, rm; uint32_t addr; };
-
-    // -- memory --
-    static bool inside(const Region& r, uint32_t a) { return a - r.base < r.d.size(); }
-    uint8_t ld8(uint32_t a) {
-        for (const Region* r : {&stack_, &tr_})
-            if (inside(*r, a)) {
-                if (!r->w[a - r->base]) fail("read of a byte nobody wrote", eip_);
-                return r->d[a - r->base];
-            }
-        if (a - kTable < tbl_.size()) return tbl_[a - kTable];
-        if (a - (kGw + kGwColours) < 16u * kPaletteSlots) {  // a palette colour: float k of slot s
-            const uint32_t o = a - (kGw + kGwColours), slot = o / 16, comp = o % 16 / 4;
-            auto& c = pal_cache_[slot];
-            if (!c) c = pal_(int(slot));
-            return uint8_t(floatBits((*c)[comp]) >> (8 * (o & 3)));
+    struct ModRM {
+        int mod, reg, rm;
+        uint32_t addr;
+    };
+    ModRM modrm(uint32_t& p) {
+        const uint8_t m = rd8(p++);
+        ModRM o{m >> 6, (m >> 3) & 7, m & 7, 0};
+        if (o.mod == 3) return o;
+        uint32_t a = 0;
+        if (o.rm == 4) {
+            const uint8_t sib = rd8(p++);
+            const int ss = sib >> 6, idx = (sib >> 3) & 7, b = sib & 7;
+            if (b == 5 && o.mod == 0) a = rd32(p), p += 4;
+            else a = r[b];
+            if (idx != 4) a += r[idx] << ss;
+        } else if (o.rm == 5 && o.mod == 0) {
+            a = rd32(p), p += 4;
+        } else {
+            a = r[o.rm];
         }
-        uint8_t v;
-        if (img_.byte(a, v)) return v;
-        fail("read of unmapped memory", eip_);
+        if (o.mod == 1) a += uint32_t(int32_t(int8_t(rd8(p++))));
+        if (o.mod == 2) a += rd32(p), p += 4;
+        o.addr = a;
+        return o;
     }
-    void st8(uint32_t a, uint8_t v) {
-        for (Region* r : {&stack_, &tr_})
-            if (inside(*r, a)) { r->d[a - r->base] = v; r->w[a - r->base] = 1; return; }
-        if (a - kTable < tbl_.size()) { tbl_[a - kTable] = v; return; }
-        fail("write outside the table, stack and TR object", eip_);
+    uint32_t get32(const ModRM& m) const { return m.mod == 3 ? r[m.rm] : rd32(m.addr); }
+    void set32(const ModRM& m, uint32_t v) {
+        if (m.mod == 3) r[m.rm] = v;
+        else wr32(m.addr, v);
     }
-    uint32_t ld(uint32_t a, int n) { uint32_t v = 0; for (int i = 0; i < n; ++i) v |= uint32_t(ld8(a + i)) << (8 * i); return v; }
-    void st(uint32_t a, int n, uint32_t v) { for (int i = 0; i < n; ++i) st8(a + i, uint8_t(v >> (8 * i))); }
-
-    // -- instruction stream --
-    uint8_t f8() {
-        uint8_t v;
-        const bool code = (eip_ >= kMain.from && eip_ < kMain.to) || [&] {
-            for (const Range& r : kHelperCode) if (eip_ >= r.from && eip_ < r.to) return true;
-            return false;
-        }();
-        if (!code || !img_.byte(eip_, v)) fail("instruction fetch outside the known code", eip_);
-        ++eip_;
+    uint8_t reg8(int i) const { return i < 4 ? uint8_t(r[i]) : uint8_t(r[i - 4] >> 8); }
+    void setReg8(int i, uint8_t v) {
+        if (i < 4) r[i] = (r[i] & ~0xFFu) | v;
+        else r[i - 4] = (r[i - 4] & ~0xFF00u) | uint32_t(v) << 8;
+    }
+    uint8_t get8(const ModRM& m) const { return m.mod == 3 ? reg8(m.rm) : rd8(m.addr); }
+    void set8(const ModRM& m, uint8_t v) {
+        if (m.mod == 3) setReg8(m.rm, v);
+        else wr8(m.addr, v);
+    }
+    void logic(uint32_t v, int bits) {
+        const uint32_t mask = bits == 32 ? 0xFFFFFFFFu : 0xFFu;
+        v &= mask;
+        cf = of = false;
+        zf = v == 0;
+        sf = (v >> (bits - 1)) & 1;
+        pf = !(__builtin_popcount(v & 0xFF) & 1);
+    }
+    uint32_t alu(int op, uint32_t a, uint32_t b, int bits) {
+        const uint64_t mask = bits == 32 ? 0xFFFFFFFFull : 0xFFull;
+        uint64_t res = 0;
+        switch (op) {
+            case 0: res = (uint64_t(a) + b); break;           // add
+            case 1: logic(a | b, bits); return (a | b) & uint32_t(mask);
+            case 4: logic(a & b, bits); return (a & b) & uint32_t(mask);
+            case 6: logic(a ^ b, bits); return (a ^ b) & uint32_t(mask);
+            case 5:
+            case 7: res = (uint64_t(a) - b); break;           // sub, cmp
+            default: fail("alu op");
+        }
+        const uint32_t v = uint32_t(res & mask);
+        cf = op == 0 ? (res >> bits) & 1 : (uint64_t(a) & mask) < (uint64_t(b) & mask);
+        zf = v == 0;
+        sf = (v >> (bits - 1)) & 1;
+        const uint32_t sa = (a >> (bits - 1)) & 1, sb = (b >> (bits - 1)) & 1, sr = (v >> (bits - 1)) & 1;
+        of = op == 0 ? (sa == sb && sr != sa) : (sa != sb && sr != sa);
+        pf = !(__builtin_popcount(v & 0xFF) & 1);
         return v;
     }
-    uint32_t f32() { uint32_t v = f8(); v |= uint32_t(f8()) << 8; v |= uint32_t(f8()) << 16; v |= uint32_t(f8()) << 24; return v; }
-    uint32_t f16() { uint32_t v = f8(); v |= uint32_t(f8()) << 8; return v; }
-
-    // -- registers --
-    uint32_t reg(int i, int size) {
-        if (size == 4) return r_[i];
-        if (size == 2) return r_[i] & 0xffff;
-        if (i > 3) fail("high byte register", eip_);
-        return r_[i] & 0xff;
-    }
-    void setReg(int i, int size, uint32_t v) {
-        if (size == 4) r_[i] = v;
-        else if (size == 2) r_[i] = (r_[i] & 0xffff0000u) | (v & 0xffff);
-        else if (i > 3) fail("high byte register", eip_);
-        else r_[i] = (r_[i] & ~0xffu) | (v & 0xff);
-    }
-
-    // -- ModRM (32-bit addressing, with SIB and 8/32-bit displacements) --
-    Modrm modrm(uint8_t b) {
-        Modrm m{b >> 6, (b >> 3) & 7, b & 7, 0};
-        if (m.mod == 3) return m;
-        uint32_t a = 0;
-        if (m.rm == 4) {
-            const uint8_t sib = f8();
-            const int idx = (sib >> 3) & 7, base = sib & 7;
-            if (idx != 4) a += r_[idx] << (sib >> 6);
-            if (base == 5 && m.mod == 0) a += f32(); else a += r_[base];
-        } else if (m.rm == 5 && m.mod == 0) {
-            a = f32();
-        } else {
-            a = r_[m.rm];
+    bool cond(int c) const {
+        bool v = false;
+        switch (c >> 1) {
+            case 0: v = of; break;
+            case 1: v = cf; break;
+            case 2: v = zf; break;
+            case 3: v = cf || zf; break;
+            case 4: v = sf; break;
+            case 5: v = pf; break;
+            case 6: v = sf != of; break;
+            case 7: v = zf || sf != of; break;
         }
-        if (m.mod == 1) a += uint32_t(int32_t(int8_t(f8())));
-        else if (m.mod == 2) a += f32();
-        m.addr = a;
-        return m;
+        return (c & 1) ? !v : v;
     }
-    Modrm modrm() { return modrm(f8()); }
-    uint32_t getRm(const Modrm& m, int size) { return m.mod == 3 ? reg(m.rm, size) : ld(m.addr, size); }
-    void setRm(const Modrm& m, int size, uint32_t v) { if (m.mod == 3) setReg(m.rm, size, v); else st(m.addr, size, v); }
-
-    // -- integer ALU: 0 add, 4 and, 5 sub, 6 xor, 7 cmp (result dropped); only ZF is tracked --
-    uint32_t alu(int kind, uint32_t a, uint32_t b) {
-        uint32_t r;
-        switch (kind) {
-            case 0: r = a + b; break;
-            case 4: r = a & b; break;
-            case 5: case 7: r = a - b; break;
-            case 6: r = a ^ b; break;
-            default: fail("ALU operation", eip_);
-        }
-        zf_ = r == 0;
-        return kind == 7 ? a : r;
+    void fcompare(double a, double b) {
+        sw &= ~0x4500;
+        if (std::isnan(a) || std::isnan(b)) sw |= 0x4500;
+        else if (a < b) sw |= 0x0100;
+        else if (a == b) sw |= 0x4000;
     }
-    void push(uint32_t v) { r_[ESP] -= 4; st(r_[ESP], 4, v); }
-    uint32_t pop() { const uint32_t v = ld(r_[ESP], 4); r_[ESP] += 4; return v; }
-
-    // -- x87 (float32 after every operation) --
-    float& stI(int i) {
-        if (i >= nst_) fail("x87 stack underflow", eip_);
-        return fst_[nst_ - 1 - i];
-    }
-    void fpush(float v) { if (nst_ == 8) fail("x87 stack overflow", eip_); fst_[nst_++] = v; }
-    void fpop() { if (nst_ == 0) fail("x87 stack underflow", eip_); --nst_; }
-    // k: 0 x+y, 1 x*y, 4 x-y, 5 y-x, 6 x/y, 7 y/x
-    static float fop(int k, float x, float y) {
-        const double a = x, b = y;
-        switch (k) {
-            case 0: return float(a + b);
-            case 1: return float(a * b);
-            case 4: return float(a - b);
-            case 5: return float(b - a);
-            case 6: return float(a / b);
-            default: return float(b / a);
+    // st(dst) = st(dst) op src for x87 /reg codes: 0 add 1 mul 4 sub 5 subr 6 div 7 divr.
+    static double farith(int op, double d, double s) {
+        switch (op) {
+            case 0: return d + s;
+            case 1: return d * s;
+            case 4: return d - s;
+            case 5: return s - d;
+            case 6: return d / s;
+            case 7: return s / d;
         }
-    }
-    void x87(uint8_t op) {
-        const uint8_t mb = f8();
-        const int k = (mb >> 3) & 7, i = mb & 7;
-        if (mb < 0xc0) {  // memory operand (32-bit float)
-            const Modrm m = modrm(mb);
-            if (op == 0xd8 && k != 2 && k != 3) { float& s = stI(0); s = fop(k, s, bitsFloat(ld(m.addr, 4))); return; }
-            if (op == 0xd9 && k == 0) { fpush(bitsFloat(ld(m.addr, 4))); return; }
-            if (op == 0xd9 && (k == 2 || k == 3)) { st(m.addr, 4, floatBits(stI(0))); if (k == 3) fpop(); return; }
-            fail("x87 memory form", eip_);
-        }
-        if (op == 0xd9) {
-            if (k == 0) { fpush(stI(i)); return; }                      // fld st(i)
-            if (k == 1) { std::swap(stI(0), stI(i)); return; }          // fxch st(i)
-            if (mb == 0xe0) { stI(0) = -stI(0); return; }               // fchs
-            if (mb == 0xe8) { fpush(1.0f); return; }                    // fld1
-            if (mb == 0xee) { fpush(0.0f); return; }                    // fldz
-            fail("x87 D9 form", eip_);
-        }
-        if (k == 2 || k == 3) fail("x87 compare form", eip_);
-        if (op == 0xd8) { stI(0) = fop(k, stI(0), stI(i)); return; }     // st0 = st0 op st(i)
-        // DC / DE: st(i) = st(i) op st0; the sub/div encodings are crossed over (E0<->E8, F0<->F8)
-        const int kk = (k == 4 || k == 6) ? k + 1 : (k == 5 || k == 7) ? k - 1 : k;
-        stI(i) = fop(kk, stI(i), stI(0));
-        if (op == 0xde) fpop();
+        return d;
     }
 
     void step() {
-        bool op16 = false, rep = false;
-        uint8_t op = f8();
-        for (;; op = f8()) {
-            if (op == 0x66) op16 = true;
-            else if (op == 0xf3) rep = true;
-            else break;
-        }
-        const int w = op16 ? 2 : 4;
-        if (rep && op != 0xa5) fail("rep prefix", eip_);
-        if (op16 && op != 0x89) fail("16-bit operand", eip_);
-
-        if (op >= 0xd8 && op <= 0xdf) {
-            if (op != 0xd8 && op != 0xd9 && op != 0xdc && op != 0xde) fail("x87 opcode", eip_);
-            x87(op);
-        } else if (op >= 0x50 && op <= 0x57) { push(r_[op & 7]);                          // push r32
-        } else if (op >= 0x58 && op <= 0x5f) { r_[op & 7] = pop();                         // pop r32
-        } else if (op >= 0xb8 && op <= 0xbf) { r_[op & 7] = f32();                         // mov r32, imm32
-        } else {
-            switch (op) {
-                case 0x68: push(f32()); break;                                             // push imm32
-                case 0x6a: push(uint32_t(int32_t(int8_t(f8())))); break;                   // push imm8
-                case 0x05: r_[EAX] = alu(0, r_[EAX], f32()); break;                        // add eax, imm32
-                case 0x03: { const Modrm m = modrm(); r_[m.reg] = alu(0, r_[m.reg], getRm(m, 4)); break; }  // add r32, r/m32
-                case 0x31: { const Modrm m = modrm(); setRm(m, 4, alu(6, getRm(m, 4), r_[m.reg])); break; } // xor r/m32, r32
-                case 0x33: { const Modrm m = modrm(); r_[m.reg] = alu(6, r_[m.reg], getRm(m, 4)); break; }  // xor r32, r/m32
-                case 0x81: case 0x83: {                                                    // add/and/sub/cmp r/m32, imm
-                    const Modrm m = modrm();
-                    const uint32_t imm = op == 0x81 ? f32() : uint32_t(int32_t(int8_t(f8())));
-                    if (m.reg != 0 && m.reg != 4 && m.reg != 5 && m.reg != 7) fail("group-1 operation", eip_);
-                    const uint32_t v = alu(m.reg, getRm(m, 4), imm);
-                    if (m.reg != 7) setRm(m, 4, v);
-                    break;
+        uint32_t p = ip;
+        uint8_t op = rd8(p++);
+        bool o16 = false, rep = false;
+        if (op == 0x66) o16 = true, op = rd8(p++);
+        if (op == 0xF3) rep = true, op = rd8(p++);
+        auto imm8s = [&] { return uint32_t(int32_t(int8_t(rd8(p++)))); };
+        auto imm32 = [&] {
+            const uint32_t v = rd32(p);
+            p += 4;
+            return v;
+        };
+        if (op <= 0x3B && (op & 7) <= 3) {  // ALU r/m, r and r, r/m
+            const int kind = op >> 3, dir = op & 2, wide = op & 1;
+            ModRM m = modrm(p);
+            if (wide) {
+                const uint32_t a = dir ? r[m.reg] : get32(m), b = dir ? get32(m) : r[m.reg];
+                const uint32_t v = alu(kind, a, b, 32);
+                if (kind != 7) {
+                    if (dir) r[m.reg] = v;
+                    else set32(m, v);
                 }
-                case 0x84: { const Modrm m = modrm(); zf_ = (getRm(m, 1) & reg(m.reg, 1)) == 0; break; }   // test r/m8, r8
-                case 0x88: { const Modrm m = modrm(); setRm(m, 1, reg(m.reg, 1)); break; }                 // mov r/m8, r8
-                case 0x89: { const Modrm m = modrm(); setRm(m, w, reg(m.reg, w)); break; }                 // mov r/m, r
-                case 0x8a: { const Modrm m = modrm(); setReg(m.reg, 1, getRm(m, 1)); break; }              // mov r8, r/m8
-                case 0x8b: { const Modrm m = modrm(); r_[m.reg] = getRm(m, 4); break; }                    // mov r32, r/m32
-                case 0xa3: st(f32(), 4, r_[EAX]); break;                                                   // mov [abs32], eax
-                case 0x8d: { const Modrm m = modrm(); if (m.mod == 3) fail("lea of a register", eip_); r_[m.reg] = m.addr; break; }
-                case 0xc6: { const Modrm m = modrm(); if (m.reg) fail("C6 /r", eip_); setRm(m, 1, f8()); break; }   // mov r/m8, imm8
-                case 0xc7: { const Modrm m = modrm(); if (m.reg) fail("C7 /r", eip_); setRm(m, 4, f32()); break; }  // mov r/m32, imm32
-                case 0x90: break;                                                          // nop
-                case 0x74: { const int32_t d = int8_t(f8()); if (zf_) eip_ += uint32_t(d); break; }          // je
-                case 0x75: { const int32_t d = int8_t(f8()); if (!zf_) eip_ += uint32_t(d); break; }         // jne
-                case 0xeb: { const int32_t d = int8_t(f8()); eip_ += uint32_t(d); break; }                   // jmp short
-                case 0xe9: { const uint32_t d = f32(); eip_ += d; break; }                                   // jmp near
-                case 0xe8: {                                                               // call a helper
-                    const uint32_t d = f32(), target = eip_ + d;
-                    if (std::find(std::begin(kHelpers), std::end(kHelpers), target) == std::end(kHelpers)) fail("call to an unknown function", eip_);
-                    push(eip_);
-                    eip_ = target;
-                    break;
+            } else {
+                const uint8_t a = dir ? reg8(m.reg) : get8(m), b = dir ? get8(m) : reg8(m.reg);
+                const uint32_t v = alu(kind, a, b, 8);
+                if (kind != 7) {
+                    if (dir) setReg8(m.reg, uint8_t(v));
+                    else set8(m, uint8_t(v));
                 }
-                case 0xc3: eip_ = pop(); break;                                            // ret
-                case 0xc2: { const uint32_t n = f16(); eip_ = pop(); r_[ESP] += n; break; }                  // ret imm16
-                case 0xa5: {                                                               // rep movsd
-                    if (!rep) fail("movsd without rep", eip_);
-                    for (; r_[ECX]; --r_[ECX], r_[ESI] += 4, r_[EDI] += 4) st(r_[EDI], 4, ld(r_[ESI], 4));
-                    break;
-                }
-                case 0x0f: {
-                    const uint8_t op2 = f8();
-                    if (op2 == 0xb6) { const Modrm m = modrm(); r_[m.reg] = getRm(m, 1); }        // movzx r32, r/m8
-                    else if (op2 == 0x84 || op2 == 0x85) {                                          // je / jne near
-                        const uint32_t d = f32();
-                        if (zf_ == (op2 == 0x84)) eip_ += d;
-                    } else fail("0F opcode", eip_);
-                    break;
-                }
-                default: fail("opcode", eip_ - 1);
             }
+        } else if (op <= 0x3D && (op & 7) == 5) {  // ALU eax, imm32
+            const int kind = op >> 3;
+            const uint32_t v = alu(kind, r[0], imm32(), 32);
+            if (kind != 7) r[0] = v;
+        } else if (op >= 0x40 && op <= 0x47) {
+            r[op - 0x40] = alu(0, r[op - 0x40], 1, 32);
+        } else if (op >= 0x48 && op <= 0x4F) {
+            r[op - 0x48] = alu(5, r[op - 0x48], 1, 32);
+        } else if (op >= 0x50 && op <= 0x57) {
+            push(r[op - 0x50]);
+        } else if (op >= 0x58 && op <= 0x5F) {
+            r[op - 0x58] = pop();
+        } else if (op == 0x68) {
+            push(imm32());
+        } else if (op == 0x6A) {
+            push(imm8s());
+        } else if (op >= 0x70 && op <= 0x7F) {
+            const uint32_t t = imm8s();
+            if (cond(op - 0x70)) p += t;
+        } else if (op == 0x0F) {
+            const uint8_t o2 = rd8(p++);
+            if (o2 >= 0x80 && o2 <= 0x8F) {
+                const uint32_t t = imm32();
+                if (cond(o2 - 0x80)) p += t;
+            } else if (o2 == 0xB6) {
+                ModRM m = modrm(p);
+                r[m.reg] = get8(m);
+            } else if (o2 == 0xB7) {
+                ModRM m = modrm(p);
+                r[m.reg] = m.mod == 3 ? (r[m.rm] & 0xFFFF) : rd16(m.addr);
+            } else {
+                fail("0f");
+            }
+        } else if (op == 0x80 || op == 0x81 || op == 0x83) {
+            ModRM m = modrm(p);
+            if (op == 0x80) {
+                const uint8_t v = uint8_t(alu(m.reg, get8(m), rd8(p++), 8));
+                if (m.reg != 7) set8(m, v);
+            } else {
+                const uint32_t b = op == 0x81 ? imm32() : imm8s();
+                const uint32_t v = alu(m.reg, get32(m), b, 32);
+                if (m.reg != 7) set32(m, v);
+            }
+        } else if (op == 0x84) {
+            ModRM m = modrm(p);
+            logic(uint32_t(get8(m) & reg8(m.reg)), 8);
+        } else if (op == 0x85) {
+            ModRM m = modrm(p);
+            logic(get32(m) & r[m.reg], 32);
+        } else if (op == 0xF6 && (rd8(p) & 0x38) == 0) {
+            ModRM m = modrm(p);
+            logic(uint32_t(get8(m) & rd8(p++)), 8);
+        } else if (op == 0x88) {
+            ModRM m = modrm(p);
+            set8(m, reg8(m.reg));
+        } else if (op == 0x89) {
+            ModRM m = modrm(p);
+            if (o16) {
+                if (m.mod == 3) r[m.rm] = (r[m.rm] & ~0xFFFFu) | (r[m.reg] & 0xFFFF);
+                else wr16(m.addr, uint16_t(r[m.reg]));
+            } else {
+                set32(m, r[m.reg]);
+            }
+        } else if (op == 0x8A) {
+            ModRM m = modrm(p);
+            setReg8(m.reg, get8(m));
+        } else if (op == 0x8B) {
+            ModRM m = modrm(p);
+            r[m.reg] = get32(m);
+        } else if (op == 0x8D) {
+            ModRM m = modrm(p);
+            if (m.mod == 3) fail("lea reg");
+            r[m.reg] = m.addr;
+        } else if (op == 0x90) {
+        } else if (op == 0xA1) {
+            r[0] = rd32(imm32());
+        } else if (op == 0xA3) {
+            wr32(imm32(), r[0]);
+        } else if (op == 0xA5 && rep) {  // rep movsd
+            for (; r[1]; --r[1]) wr32(r[7], rd32(r[6])), r[6] += 4, r[7] += 4;
+        } else if (op >= 0xB0 && op <= 0xB7) {
+            setReg8(op - 0xB0, rd8(p++));
+        } else if (op >= 0xB8 && op <= 0xBF) {
+            r[op - 0xB8] = imm32();
+        } else if (op == 0xC2) {
+            const uint16_t n = rd16(p);
+            p = pop();
+            r[4] += n;
+        } else if (op == 0xC3) {
+            p = pop();
+        } else if (op == 0xC6) {
+            ModRM m = modrm(p);
+            set8(m, rd8(p++));
+        } else if (op == 0xC7) {
+            ModRM m = modrm(p);
+            if (o16) {
+                const uint16_t v = rd16(p);
+                p += 2;
+                if (m.mod == 3) r[m.rm] = (r[m.rm] & ~0xFFFFu) | v;
+                else wr16(m.addr, v);
+            } else {
+                set32(m, imm32());
+            }
+        } else if (op == 0xE8) {
+            const uint32_t t = imm32();
+            push(p);
+            p += t;
+        } else if (op == 0xE9) {
+            const uint32_t t = imm32();
+            p += t;
+        } else if (op == 0xEB) {
+            const uint32_t t = imm8s();
+            p += t;
+        } else if (op == 0xFF) {
+            ModRM m = modrm(p);
+            if (m.reg == 2) {
+                const uint32_t t = get32(m);
+                push(p);
+                p = t;
+            } else if (m.reg == 6) {
+                push(get32(m));
+            } else {
+                fail("ff");
+            }
+        } else if (op >= 0xD8 && op <= 0xDF) {
+            p = fpu(op, p);
+        } else {
+            fail("opcode");
         }
+        ip = p;
     }
 
-    const Image& img_;
-    const Palette& pal_;
-    std::vector<uint8_t>& tbl_;
-    Region stack_, tr_;
-    std::array<std::optional<std::array<float, 4>>, kPaletteSlots> pal_cache_;
-    uint32_t r_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t eip_ = 0;
-    bool zf_ = false;
-    float fst_[8] = {};
-    int nst_ = 0;
+    uint32_t fpu(uint8_t op, uint32_t p) {
+        const uint8_t m0 = rd8(p);
+        if (m0 < 0xC0) {
+            ModRM m = modrm(p);
+            const int g = m.reg;
+            switch (op) {
+                case 0xD8:  // arith st0, m32
+                    if (g == 2 || g == 3) {
+                        fcompare(ST(0), rdf(m.addr));
+                        if (g == 3) fpop();
+                    } else {
+                        ST(0) = farith(g, ST(0), rdf(m.addr));
+                    }
+                    return p;
+                case 0xD9:
+                    if (g == 0) fpush(rdf(m.addr));
+                    else if (g == 2) wrf(m.addr, ST(0));
+                    else if (g == 3) wrf(m.addr, ST(0)), fpop();
+                    else fail("d9 mem");
+                    return p;
+                case 0xDB:
+                    if (g == 0) fpush(double(int32_t(rd32(m.addr))));
+                    else if (g == 3) wr32(m.addr, uint32_t(int32_t(std::floor(ST(0))))), fpop();  // fistp, round-down mode
+                    else fail("db mem");
+                    return p;
+                case 0xDC:  // arith st0, m64
+                    fail("dc mem");
+                case 0xDD:
+                    fail("dd mem");
+                default:
+                    fail("fpu mem");
+            }
+        }
+        ++p;
+        const int i = m0 & 7, g = (m0 >> 3) & 7;
+        switch (op) {
+            case 0xD8:
+                if (g == 2 || g == 3) {
+                    fcompare(ST(0), ST(i));
+                    if (g == 3) fpop();
+                } else {
+                    ST(0) = farith(g, ST(0), ST(i));
+                }
+                return p;
+            case 0xD9:
+                if (g == 0) {
+                    fpush(ST(i));
+                } else if (g == 1) {
+                    std::swap(ST(0), ST(i));
+                } else if (m0 == 0xE0) {
+                    ST(0) = -ST(0);
+                } else if (m0 == 0xE1) {
+                    ST(0) = std::fabs(ST(0));
+                } else if (m0 == 0xE8) {
+                    fpush(1.0);
+                } else if (m0 == 0xEE) {
+                    fpush(0.0);
+                } else {
+                    fail("d9");
+                }
+                return p;
+            case 0xDC:  // st(i) = st(i) op st0 (Intel: DC E0+i = fsubr, E8+i = fsub, F0+i = fdivr, F8+i = fdiv)
+            case 0xDE: {
+                int opc = g;
+                if (g == 4) opc = 5;
+                else if (g == 5) opc = 4;
+                else if (g == 6) opc = 7;
+                else if (g == 7) opc = 6;
+                if (op == 0xDE && m0 == 0xD9) {  // fcompp
+                    fcompare(ST(0), ST(1));
+                    fpop(), fpop();
+                    return p;
+                }
+                if (g == 2 || g == 3) fail("dc/de compare");
+                ST(i) = farith(opc, ST(i), ST(0));
+                if (op == 0xDE) fpop();
+                return p;
+            }
+            case 0xDD:
+                if (g == 2) ST(i) = ST(0);
+                else if (g == 3) ST(i) = ST(0), fpop();
+                else fail("dd");
+                return p;
+            case 0xDF:
+                if (m0 == 0xE0) {
+                    r[0] = (r[0] & ~0xFFFFu) | sw;
+                    return p;
+                }
+                fail("df");
+            default:
+                fail("fpu reg");
+        }
+    }
 };
-
-bool codeMatches(const Image& img) {
-    std::vector<uint8_t> main, helpers;
-    if (!img.bytes(kMain, main)) return false;
-    for (const Range& r : kHelperCode)
-        if (!img.bytes(r, helpers)) return false;
-    return sha256(main) == kMainHash && sha256(helpers) == kHelperHash;
-}
 
 }  // namespace
 
-uint32_t RoadType::u32(uint32_t off) const {
-    uint32_t v;
-    std::memcpy(&v, &raw[off], 4);
-    return v;
-}
-
-RoadTypeTable buildRoadTypes(const std::string& exePath, const std::function<std::array<float, 4>(int slot)>& palette, bool laterInit) {
-    RoadTypeTable out;
-    try {
-        Image img;
-        if (!palette || !img.load(exePath)) return out;
-        if (!codeMatches(img)) {
-            std::fprintf(stderr, "fuel: %s is not the FUEL.exe build the road-type table was written for\n", exePath.c_str());
-            return out;
+std::optional<std::array<RoadTypeParams, 21>> loadRoadTypes(const DpcFile& world, std::string* error) {
+    static std::mutex mu;
+    static std::unordered_map<std::string, std::pair<std::optional<std::array<RoadTypeParams, 21>>, std::string>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    const std::string exe = engineExePath(world);
+    auto it = cache.find(exe);
+    if (it == cache.end()) {
+        std::pair<std::optional<std::array<RoadTypeParams, 21>>, std::string> res;
+        try {
+            Image img;
+            if (!img.load(exe)) throw std::runtime_error("cannot read " + exe);
+            Cpu cpu(img);
+            // Fake objects: `this` (AGW_TerraRoad, vtable pointer 0 -> its virtual call is skipped)
+            // and the GenWorld it reads runtime sizes from (zeros: those fields are not used here).
+            constexpr uint32_t kStack = 0x0ff00000, kThis = 0x0e000000, kWorld = 0x0d000000, kRet = 0x0c000000;
+            for (int run = 0; run < 2; ++run) {  // the engine initialises two GenWorlds (0x77c690)
+                std::memset(cpu.r, 0, sizeof cpu.r);
+                cpu.top = 0;
+                cpu.r[4] = kStack;
+                cpu.r[1] = kThis;
+                cpu.push(kWorld);  // argument: the GenWorld
+                cpu.push(kRet);
+                cpu.run(kInit, kRet);
+            }
+            std::array<RoadTypeParams, 21> t{};
+            for (uint32_t k = 0; k < 21; ++k) {
+                const uint32_t b = kTable + k * kStride;
+                RoadTypeParams& q = t[k];
+                q.reach = cpu.rdf(b + 0x00), q.crown = cpu.rdf(b + 0x24), q.verge = cpu.rdf(b + 0x28), q.noise = cpu.rdf(b + 0x34);
+                q.fade = cpu.rdf(b + 0x4c), q.ditch = cpu.rdf(b + 0x50), q.ditchDepth = cpu.rdf(b + 0x54), q.stretch = cpu.rdf(b + 0x5c);
+                q.bumpAmp = cpu.rdf(b + 0x74), q.bumpLen = cpu.rdf(b + 0x78), q.waveAmp = cpu.rdf(b + 0x7c), q.waveLen = cpu.rdf(b + 0x80);
+                q.band = cpu.rdf(b + 0xbc), q.core = cpu.rdf(b + 0xc4), q.flat = cpu.rdf(b + 0xcc);
+                q.smooth = cpu.rdf(b + 0x1f0) * cpu.rdf(b + 0x1e4), q.smoothMin = cpu.rdf(b + 0x1e8);
+                // Sanity: plausible metres for every road type (a different FUEL.exe fails here).
+                auto in = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+                if (!(in(q.reach, 1, 200) && in(q.band, 1, 200) && q.band <= q.reach && in(q.fade, 0.5f, 100) && in(q.flat, -50, 100) &&
+                      in(q.crown, -5, 5) && in(q.verge, -5, 5) && in(q.noise, -5, 5) && in(q.ditch, 0, 50) && in(q.ditchDepth, 0, 10) &&
+                      in(q.stretch, 0, 100) && in(q.waveLen, 0, 1000) && in(q.smooth, 0, 1000) && in(q.smoothMin, 0, 1000))) {
+                    char m[200];
+                    std::snprintf(m, sizeof m, "road type %u: implausible values (reach %g band %g fade %g flat %g)", k, q.reach, q.band, q.fade,
+                                  q.flat);
+                    throw std::runtime_error(m);
+                }
+            }
+            res.first = t;
+        } catch (const std::exception& e) {
+            res.second = std::string("road table from FUEL.exe: ") + e.what();
         }
-        std::vector<uint8_t> table(size_t(kTypes) * kBlock, 0);
-        // A second run sees the +0xb8 values the first run left behind, as a repeated init does in the engine.
-        for (int pass = 0; pass < (laterInit ? 2 : 1); ++pass) Emu(img, palette, table).run();
-        for (uint32_t t = 0; t < kTypes; ++t) {
-            RoadType& r = out.types[t];
-            std::memcpy(r.raw.data(), &table[size_t(t) * kBlock], kBlock);
-            std::memcpy(r.f.data(), r.raw.data(), kBlock);  // little endian host assumed (as the rest of the port)
-            const char* n = reinterpret_cast<const char*>(&r.raw[0xd8]);
-            r.name.assign(n, strnlen(n, 0x100));
-        }
-        out.valid = true;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "fuel: road-type emulation failed: %s\n", e.what());
-        out.valid = false;
+        it = cache.emplace(exe, std::move(res)).first;
     }
-    return out;
+    if (error) *error = it->second.second;
+    return it->second.first;
 }
 
 }  // namespace fuel

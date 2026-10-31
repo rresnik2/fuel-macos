@@ -1,42 +1,46 @@
-// FUEL's road-type table (g_RoadTypes: 21 blocks of 0x200 bytes at 0xa677e0 in FUEL.exe).
+// FUEL's per-road-type terrain parameters (the AGW_TerraRoad table at 0xa677e0, one
+// 0x200-byte record per GwRoad type), as the engine computes them at load.
 //
-// The values are not stored anywhere in the exe: the engine fills the table at start-up
-// with straight-line code (FUN_006f24a0). Instead of copying numbers into the port, this
-// module reads the player's own FUEL.exe and runs that code in a tiny x86/x87 emulator
-// (only the ~45 instruction forms the routine uses; anything else fails cleanly).
+// The table is not data in the game files: AGW_TerraRoad::Init (FUEL.exe 0x6f24a0) fills
+// it with constants in code. The port keeps no copy of those values. It reads the
+// function's machine code from the player's own FUEL.exe and replays it with a small
+// x86/x87 interpreter (straight-line stores, the FPU arithmetic between them, the
+// derived-field helper 0x6f1240 and the record copy 0x6f5690), twice, as the engine's
+// two GenWorld loads do (notes p21 H6: the second run's values are the ones queries see).
 #pragma once
 
+#include "dpc.hpp"
+
 #include <array>
-#include <cstdint>
-#include <functional>
+#include <optional>
 #include <string>
 
 namespace fuel {
 
-struct RoadType {                 // one 0x200-byte block of g_RoadTypes (FUEL.exe 0xa677e0 + type*0x200)
-    std::array<float, 128> f{};   // the block as floats: f[off/4] (offsets 0x00..0x1fc)
-    std::array<uint8_t, 0x200> raw{};  // the same block as bytes (for the u8 fields +0x1d8..+0x1fc and the u32 +0xa8/+0xac)
-    float at(uint32_t off) const { return f[off / 4]; }
-    uint8_t byte(uint32_t off) const { return raw[off]; }
-    uint32_t u32(uint32_t off) const;  // little endian from raw
-    std::string name;             // +0xd8
+// The fields the ground height uses (record offsets in the comments).
+struct RoadTypeParams {
+    float reach = 0;     // +0x00 T0: segments further than this do nothing
+    float crown = 0;     // +0x24 T24: crown/ditch bump amplitude
+    float verge = 0;     // +0x28 T28: verge bump
+    float noise = 0;     // +0x34 T34: weight of the height noise (bank fractal 0x3f54)
+    float fade = 0;      // +0x4c T4c: blend width
+    float ditch = 0;     // +0x50 T50: ditch width
+    float ditchDepth = 0;  // +0x54 T54
+    float stretch = 0;   // +0x5c T5c: lateral distance beyond which the noise stretch applies
+    float bumpAmp = 0;   // +0x74 T74: ATV bumps
+    float bumpLen = 0;   // +0x78 T78
+    float waveAmp = 0;   // +0x7c T7c: profile undulation
+    float waveLen = 0;   // +0x80 T80
+    float band = 0;      // +0xbc Tbc = T0 - T60
+    float core = 0;      // +0xc4 Tc4 = Tbc - T4c
+    float flat = 0;      // +0xcc Tcc
+    float smooth = 0;    // +0x1f0 * +0x1e4: profile smoothing half-window base (M)
+    float smoothMin = 0; // +0x1e8: lower bound of M
 };
 
-struct RoadTypeTable {
-    std::array<RoadType, 21> types;
-    bool valid = false;
-};
-
-// Rebuilds the table from the code in `exePath` (the player's FUEL.exe, read only).
-// Colours come from the GenWorld palette: the code copies GW+0x47c64 / +0x47cc4 / +0x47d04
-// (float4 each, the GenWorld Colors palette slots 15, 21 and 25: slot k = GW+0x47b74+16k);
-// `palette(slot)` must return that float4.
-// `laterInit` true = the values of a second run of the init (the engine reads +0xb8 before
-// it writes it, so a repeat run sees the previous run's value).
-// valid is false when the exe is missing, is another build (the code bytes are checked
-// against a hash) or the emulation meets something it does not know.
-RoadTypeTable buildRoadTypes(const std::string& exePath,
-                             const std::function<std::array<float, 4>(int slot)>& palette,
-                             bool laterInit);
+// The 21 records (index = GwRoad type), or nothing with `error` set when FUEL.exe cannot be
+// read or its code is not the version the port knows (unknown instructions, values out of
+// range). Cached per process.
+std::optional<std::array<RoadTypeParams, 21>> loadRoadTypes(const DpcFile& world, std::string* error = nullptr);
 
 }  // namespace fuel

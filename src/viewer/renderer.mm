@@ -340,26 +340,34 @@ struct TerrainOut {
     float4 position [[position]];
     float3 world;
     float4 sunPos;
+    float3 normal;   // FUEL's ground normal at the vertex (central differences of the chunk's points)
+    float chunk;     // size of the ground chunk the vertex belongs to
 };
 
-// One grid around the camera target whose spacing grows with the square of
-// the distance from the centre: dense up close, coarse at the horizon.
+// FUEL's ground chunks (terrain_mesh.hpp, TerrainVertex): 25 x 25 points per quadtree
+// chunk, morphed towards the half-resolution grid between 2.375 and 2.875 chunk sizes
+// from the camera (horizontal distance; Paysage_BuildVertices 0x7f9b50, ground.vhl).
+struct TerrainVertexIn {
+    packed_float3 p0;
+    float tweenStart;
+    packed_float3 p1;
+    float tweenInv;
+    packed_float3 n;
+    float size;
+};
+
 vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[buffer(1)]],
-                            texture2d<float> hm [[texture(0)]]) {
-    uint n = uint(f.terrainGrid.w);
-    float2 q = float2(vid % n, vid / n) / float(n - 1) * 2.0 - 1.0;
-    float2 xz = f.terrainGrid.xy + q * abs(q) * f.terrainGrid.z;
-    // Snap to a world-fixed lattice (power-of-two spacing near the local vertex
-    // spacing) so the ground under a vertex does not change as the grid follows
-    // the camera; otherwise hills visibly swim and ripple while driving.
-    float2 spacing = max(2.0 * abs(q) * f.terrainGrid.z * (2.0 / float(n - 1)), float2(1.0));
-    float2 lattice = exp2(ceil(log2(spacing)));
-    xz = round(xz / lattice) * lattice;
-    float3 w = float3(xz.x, terrainHeight(hm, xz, f), xz.y);
+                            const device TerrainVertexIn* verts [[buffer(0)]]) {
+    const TerrainVertexIn v = verts[vid];
+    const float3 p0 = float3(v.p0), p1 = float3(v.p1);
+    const float t = clamp((distance(f.eye.xz, p0.xz) - v.tweenStart) * v.tweenInv, 0.0, 1.0);
+    const float3 w = mix(p0, p1, t);
     TerrainOut o;
     o.position = f.viewProj * float4(w, 1.0);
     o.world = w;
     o.sunPos = f.sunViewProj * float4(w, 1.0);
+    o.normal = float3(v.n);
+    o.chunk = v.size;
     return o;
 }
 
@@ -542,9 +550,9 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
                           texture2d<float> decal4 [[texture(12)]], texture2d<float> decal5 [[texture(13)]]) {
     float e = f.terrain.z;
     float2 xz = in.world.xz;
-    float hl = terrainHeight(hm, xz - float2(e, 0), f), hr = terrainHeight(hm, xz + float2(e, 0), f);
-    float hd = terrainHeight(hm, xz - float2(0, e), f), hu = terrainHeight(hm, xz + float2(0, e), f);
-    float3 N = normalize(float3(hl - hr, 2.0 * e, hd - hu));
+    (void)e;
+    // FUEL's ground normal from the chunk's points (P21's ground mesh), interpolated.
+    float3 N = normalize(in.normal);
     float slope = 1.0 - N.y;
     float n = valueNoise(xz * 0.004) * 0.6 + valueNoise(xz * 0.03) * 0.3 + valueNoise(xz * 0.25) * 0.1;
     float3 c;
@@ -579,7 +587,7 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         // (ground.vhl: (d - 2.375 C) * 2 / C, distance in xz); the port blends the parent's
         // textures with the same weight (the engine switches them per chunk).
         const float dist = length(f.eye.xz - xz);
-        const float C = groundChunk(xz, f.eye.xz);
+        const float C = in.chunk > 0.0 ? exp2(round(log2(in.chunk))) : groundChunk(xz, f.eye.xz);  // the ground chunk drawing this pixel
         const float tw = saturate((dist - 2.375 * C) * 2.0 / C);
         GroundBand b = groundBand(C, xz, warp, steep, sandy, groundTypes, groundDecal, detail, rep, f, decal0, decal1, decal2, decal3,
                                   decal4, decal5);
@@ -1386,17 +1394,14 @@ void MeshRenderer::setTerrain(const Heightfield& hf) {
                                                                                 mipmapped:NO];
     heightTex_ = [device_ newTextureWithDescriptor:td];
     [heightTex_ replaceRegion:MTLRegionMake2D(0, 0, hf.width, hf.height) mipmapLevel:0 withBytes:hf.raw.data() bytesPerRow:hf.width * 2];
+    terrainLod_.reset();
+    chunkGpu_.clear();
     terrainData_ = hf;
     terrainInfo_ = simd_make_float4(hf.originX, hf.originZ, hf.spacing, hf.metresPerUnit * 65535.0f);
+    terrainLod_ = std::make_unique<TerrainLod>(terrainData_);
+    lastTerrainEye_ = simd_make_float3(1e9f, 0, 1e9f);
     if (terrainIndices_ == nil) {
-        std::vector<uint32_t> idx;
-        const uint32_t n = kTerrainGridSize;
-        idx.reserve(size_t(n - 1) * (n - 1) * 6);
-        for (uint32_t r = 0; r + 1 < n; ++r)
-            for (uint32_t c = 0; c + 1 < n; ++c) {
-                const uint32_t a = r * n + c, b = a + 1, d = a + n, e = d + 1;
-                idx.insert(idx.end(), {a, b, d, b, e, d});
-            }
+        const std::vector<uint32_t>& idx = terrainChunkIndices();
         terrainIndices_ = [device_ newBufferWithBytes:idx.data() length:idx.size() * 4 options:MTLResourceStorageModeShared];
         terrainIndexCount_ = uint32_t(idx.size());
     }
@@ -1955,6 +1960,30 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.footprint = simd_make_float4(center_.x, center_.z, (sceneMax_.x - sceneMin_.x) * 0.5f, (sceneMax_.z - sceneMin_.z) * 0.5f);
     lastFrame_ = std::make_shared<FrameUniforms>(fu);
 
+    // FUEL's ground chunks around the camera. A first frame or a jump of more than 2 km
+    // waits for the chunks (headless shots), otherwise they stream in from the workers.
+    std::vector<std::shared_ptr<const TerrainChunk>> terrainChunks;
+    if (terrain && terrainLod_) {
+        const bool jump = simd_distance(simd_make_float2(eye.x, eye.z), simd_make_float2(lastTerrainEye_.x, lastTerrainEye_.z)) > 2000.0f;
+        lastTerrainEye_ = eye;
+        if (jump)
+            for (int k = 0; k < 14; ++k) {
+                terrainLod_->update(eye.x, eye.z);
+                terrainLod_->settle();
+            }
+        terrainChunks = terrainLod_->update(eye.x, eye.z);
+        ++chunkFrame_;
+        for (const auto& c : terrainChunks) {
+            ChunkGpu& g = chunkGpu_[c->key];
+            if (g.vb == nil)
+                g.vb = [device_ newBufferWithBytes:c->verts.data() length:c->verts.size() * sizeof(TerrainVertex)
+                                           options:MTLResourceStorageModeShared];
+            g.lastFrame = chunkFrame_;
+        }
+        for (auto it = chunkGpu_.begin(); it != chunkGpu_.end();)
+            it = chunkFrame_ - it->second.lastFrame > 240 ? chunkGpu_.erase(it) : std::next(it);
+    }
+
     [enc setVertexBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentTexture:shadowMap_ atIndex:7];
@@ -2029,7 +2058,6 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc setDepthStencilState:depthWrite_];
         [enc setCullMode:MTLCullModeNone];
         [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-        [enc setVertexTexture:heightTex_ atIndex:0];
         [enc setFragmentTexture:heightTex_ atIndex:0];
         if (groundColour_ != nil) {
             [enc setFragmentTexture:groundColour_ atIndex:1];
@@ -2040,11 +2068,14 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             [enc setFragmentTexture:groundDecal_ atIndex:6];
             for (int k = 0; k < kDecalSlots; ++k) [enc setFragmentTexture:decalTex_[k] != nil ? decalTex_[k] : white_ atIndex:NSUInteger(8 + k)];
         }
-        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                        indexCount:terrainIndexCount_
-                         indexType:MTLIndexTypeUInt32
-                       indexBuffer:terrainIndices_
-                 indexBufferOffset:0];
+        for (const auto& c : terrainChunks) {
+            [enc setVertexBuffer:chunkGpu_[c->key].vb offset:0 atIndex:0];
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:terrainIndexCount_
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:terrainIndices_
+                     indexBufferOffset:0];
+        }
     }
     // Terrain first (roads are painted into it, ground.phl decal path).
     drawPass(0);

@@ -38,6 +38,7 @@
 #include "eventcheck.h"
 #include "hubcheck.h"
 #include "capture.h"
+#include "core/terrain_height.hpp"
 #include "core/hubs.hpp"
 #import <GameController/GameController.h>
 #include "audio/drive_audio.h"
@@ -1554,11 +1555,13 @@ int main(int argc, const char** argv) {
                             ground = std::make_unique<fuel::GroundGenerator>(*f, *terrain, roads.get());  // p14
                             // p22: FUEL's road segments (roads painted into the ground, decal path).
                             try {
-                                fuel::RoadTypeTable types = fuel::loadRoadTypes(*f);
+                                fuel::RoadTypeTable types = fuel::loadRoadTypeTable(*f);
                                 if (types.valid) {
+                                    // Profiles use the ground without roads (AGW_Altitude flags 3, 0x6f8a00).
                                     const fuel::Heightfield* hf = terrain.get();
-                                    roadSampler = std::make_unique<fuel::RoadSampler>(
-                                        *f, std::move(types), [hf](double x, double z) { return double(hf->smoothHeightAt(x, z)); });
+                                    roadSampler = std::make_unique<fuel::RoadSampler>(*f, std::move(types), [hf](double x, double z) {
+                                        return hf->detail ? hf->detail->detailHeight(x, z) : double(hf->smoothHeightAt(x, z));
+                                    });
                                     ground->setRoadSampler(roadSampler.get());
                                 } else {
                                     std::fprintf(stderr, "fuelview: road table not rebuilt from FUEL.exe; roads use the port's widths\n");
@@ -1569,8 +1572,13 @@ int main(int argc, const char** argv) {
                             // p22: the lakes the engine adds from code (FUEL.exe table, flood-filled on
                             // the bare height map) and their water meshes.
                             try {
-                                const fuel::Heightfield bare = fuel::loadWorldHeightfield(*f);
-                                lakes = std::make_unique<fuel::Lakes>(*f, [&bare](double x, double z) { return double(bare.smoothHeightAt(x, z)); });
+                                // Flood fill on the map's B-spline (0x445570 = the base height h0).
+                                std::unique_ptr<fuel::Heightfield> bare;
+                                if (!terrain->detail) bare = std::make_unique<fuel::Heightfield>(fuel::loadWorldHeightfield(*f));
+                                const fuel::Heightfield* hf = terrain.get();
+                                lakes = std::make_unique<fuel::Lakes>(*f, [hf, &bare](double x, double z) {
+                                    return hf->detail ? hf->detail->baseHeight(x, z) : double(bare->smoothHeightAt(x, z));
+                                });
                                 if (lakes->valid()) {
                                     ground->setLakes(lakes.get());
                                     streamer->setLakes(lakes.get());

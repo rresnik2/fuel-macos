@@ -33,7 +33,7 @@ inline double s2(double v) { return 0.5 + 0.5 * v * (2.0 - std::fabs(v)); }
 
 }  // namespace
 
-RoadTypeTable loadRoadTypes(const DpcFile& world) {
+RoadTypeTable loadRoadTypeTable(const DpcFile& world) {
     const auto palette = loadGroundPalette(world);
     const std::string exe =
         (std::filesystem::path(world.path()).parent_path().parent_path().parent_path() / "XFinalComponent" / "FUEL.exe").string();

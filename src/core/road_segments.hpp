@@ -14,7 +14,7 @@
 
 #include "dpc.hpp"
 #include "genworld_noise.hpp"
-#include "road_types.hpp"
+#include "road_table.hpp"
 
 #include <array>
 #include <atomic>
@@ -128,6 +128,6 @@ private:
 };
 
 // Palette slot k of the GenWorld Colors (the road table copies slots 15, 21, 25).
-RoadTypeTable loadRoadTypes(const DpcFile& world);
+RoadTypeTable loadRoadTypeTable(const DpcFile& world);
 
 }  // namespace fuel

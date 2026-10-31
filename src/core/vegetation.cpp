@@ -331,7 +331,7 @@ void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNe
                 const float gx = float(cx * kCell), gz = float(cz * kCell);
                 // Jitter: the engine rounds this sum in single precision.
                 const float hsum = gz * 10.193578f + gx * 12.317513f + (tree ? kTreeSalt : kBushSalt);
-                const uint8_t jb = v.perm[size_t(int64_t(std::nearbyint(hsum)) & 255)];
+                const uint8_t jb = v.perm[size_t(int64_t(std::floor(hsum)) & 255)];
                 const double px = gx + float(jb & 15) * kJitter, pz = gz + float(jb >> 4) * kJitter;
                 const double dist = std::hypot(px - x, pz - z);
                 if (dist > radius || dist < inner) continue;

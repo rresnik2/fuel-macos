@@ -19,12 +19,15 @@ add_library(fuelcore STATIC
   src/core/vehicle.cpp
   src/core/world.cpp
   src/core/terrain.cpp
+  src/core/terrain_height.cpp
+  src/core/terrain_mesh.cpp
+  src/core/road_types.cpp
   src/core/ground.cpp
   src/core/vegetation.cpp
   src/core/genworld_noise.cpp
   src/core/ground_point.cpp
   src/core/roads.cpp
-  src/core/road_types.cpp
+  src/core/road_table.cpp
   src/core/road_segments.cpp
   src/core/water.cpp
   src/core/surface.cpp

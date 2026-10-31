@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace fuel {
@@ -23,12 +24,15 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed);
 // Engine constant tables are read this way instead of being copied into the port.
 std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count);
 
+// Path of the player's FUEL.exe next to the game data that holds `world`.
+std::string engineExePath(const DpcFile& world);
+
 // The seed stored in the world's GenWorld_Z (the u32 after the materials list).
 // Throws if the world has no GenWorld_Z.
 uint32_t genWorldSeed(const DpcFile& world);
 
 // FUEL's position hash: the permutation entry at
-// round(x * 12.317513 + z * 10.193578) & 255.
+// floor(x * 12.317513 + z * 10.193578) & 255 (fistp in the game's round-down FPU mode).
 uint8_t positionHash(const Permutation& p, double x, double z);
 
 // Midpoint-displacement fractal (value noise with `levels` subdivisions of a

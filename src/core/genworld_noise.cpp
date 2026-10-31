@@ -113,6 +113,8 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed) {
     return out;
 }
 
+std::string engineExePath(const DpcFile& world) { return exePath(world).string(); }
+
 std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count) {
     const auto b = readExe(exePath(world), va, count * 4);
     if (!b) return {};
@@ -133,13 +135,13 @@ uint32_t genWorldSeed(const DpcFile& world) {
 
 uint8_t positionHash(const Permutation& p, double x, double z) {
     const double v = x * double(12.317513f) + z * double(10.193578f);
-    return p[size_t(int64_t(std::nearbyint(v)) & 255)];
+    return p[size_t(int64_t(std::floor(v)) & 255)];  // fistp under round-down (p21 H0)
 }
 
 Fractal::Fractal(const Permutation& p, int levels, float size, float seed, float lowAmp, float highAmp, float gain)
     : table_(p), levels_(levels) {
     finest_ = size / float(1 << levels);
-    seedOffset_ = int32_t(std::nearbyint(double(seed) * 262897.0));
+    seedOffset_ = int32_t(std::floor(double(seed) * 262897.0));  // round-down fistp
     mulX_ = uint32_t(1u << (13 - levels)) * 0xC5Bu;
     mulZ_ = uint32_t(1u << (13 - levels)) * 0xA31u;
     const float rough = highAmp - lowAmp;

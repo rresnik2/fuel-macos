@@ -7,13 +7,18 @@
 // ground, with the raw and the levelled (flat surfaces) heightfield.
 
 #include "core/dpc.hpp"
+#include "core/events.hpp"
 #include "core/ground.hpp"
 #include "core/ground_point.hpp"
+#include "core/road_types.hpp"
 #include "core/roads.hpp"
 #include "core/terrain.hpp"
+#include "core/terrain_height.hpp"
+#include "core/terrain_mesh.hpp"
 #include "core/vegetation.hpp"
 #include "core/world.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -43,10 +48,14 @@ int main(int argc, char** argv) {
                     hf.height, hf.spacing, hf.originX, hf.originZ, hf.metresPerUnit, lo * hf.metresPerUnit, hi * hf.metresPerUnit, secs);
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
-            if (a == "--levelled") {  // apply the flat surfaces to later --at queries
-                fuel::Heightfield& h = const_cast<fuel::Heightfield&>(hf);
-                std::printf("flat surfaces applied: %zu\n", fuel::applyFlatSurfaces(h, dpc));
-            } else if (a == "--seat") {
+            if (a == "--levelled") {  // FUEL's ground (procedural detail) for later --at queries
+                const_cast<fuel::Heightfield&>(hf) = fuel::loadLevelledHeightfield(dpc);
+                std::printf("procedural ground attached\n");
+            } else if (a == "--seat" || a == "--float") {
+                // Placed objects against the map B-spline (old port ground) and FUEL's ground.
+                // --seat: fixed placements within 0.5 / 2 m. --float: every non-FITTOGROUND
+                // object whose base is more than 0.5 m (and 4 m) above or below the ground,
+                // excluding those on decks (more than 4 m above both).
                 std::vector<std::unique_ptr<fuel::DpcFile>> subs;
                 for (const auto& e : std::filesystem::directory_iterator(std::filesystem::path(argv[1]).parent_path())) {
                     if (e.path().extension() != ".DPC" || e.path().filename() == "USA1.DPC") continue;
@@ -56,9 +65,15 @@ int main(int argc, char** argv) {
                     } catch (const std::exception&) {
                     }
                 }
-                fuel::Heightfield levelled = hf;
-                const size_t used = fuel::applyFlatSurfaces(levelled, dpc);
-                size_t total = 0, fit = 0, onRaw = 0, onLevelled = 0, nearRaw = 0, nearLevelled = 0;
+                const auto l0 = std::chrono::steady_clock::now();
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                std::printf("procedural ground: %zu flat surfaces, %zu gulch lines (%.2f s)\n", ground.detail->flatSurfaceCount(),
+                            ground.detail->gulchLineCount(), std::chrono::duration<double>(std::chrono::steady_clock::now() - l0).count());
+                size_t total = 0, fit = 0, onRaw = 0, onNew = 0, nearRaw = 0, nearNew = 0;
+                size_t offRaw05 = 0, offNew05 = 0, offRaw4 = 0, offNew4 = 0, aboveNew = 0, belowNew = 0;
+                double sumAbsNew = 0, sumAbsRaw = 0;
+                std::vector<float> devNew;
+                const auto q0 = std::chrono::steady_clock::now();
                 for (const auto& sub : subs)
                     for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, {sub.get(), &dpc})) {
                         const float x = pm.world[12], y = pm.world[13], z = pm.world[14];
@@ -68,19 +83,117 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         ++total;
-                        const float r = std::fabs(y - hf.smoothHeightAt(x, z)), l = std::fabs(y - levelled.smoothHeightAt(x, z));
-                        onRaw += r < 0.5f, onLevelled += l < 0.5f, nearRaw += r < 2.0f, nearLevelled += l < 2.0f;
+                        const float dr = y - hf.baseHeightAt(x, z), dn = y - ground.smoothHeightAt(x, z);
+                        const float r = std::fabs(dr), l = std::fabs(dn);
+                        onRaw += r < 0.5f, onNew += l < 0.5f, nearRaw += r < 2.0f, nearNew += l < 2.0f;
+                        offRaw05 += r > 0.5f, offNew05 += l > 0.5f, offRaw4 += r > 4.0f, offNew4 += l > 4.0f;
+                        if (l > 0.5f) (dn > 0 ? aboveNew : belowNew)++;
+                        if (l < 50) sumAbsNew += l, sumAbsRaw += std::min(r, 50.0f);
+                        devNew.push_back(dn);
+                        if (std::getenv("FUEL_FLOAT_LIST") && l > 0.5f)
+                            std::printf("off %08x %.1f %.2f %.1f %+.2f map %+.2f\n", pm.meshId, x, y, z, dn, dr);
                     }
-                std::printf("flat surfaces used: %zu; placements: %zu fixed + %zu FITTOGROUND\n", used, total, fit);
-                std::printf("within 0.5 m: raw %zu, levelled %zu; within 2 m: raw %zu, levelled %zu\n", onRaw, onLevelled, nearRaw, nearLevelled);
+                const double qs = std::chrono::duration<double>(std::chrono::steady_clock::now() - q0).count();
+                std::printf("placements: %zu fixed + %zu FITTOGROUND (%.1f us per height)\n", total, fit, qs * 1e6 / double(std::max<size_t>(total, 1)));
+                std::printf("within 0.5 m: map %zu, FUEL ground %zu; within 2 m: map %zu, FUEL ground %zu\n", onRaw, onNew, nearRaw, nearNew);
+                if (a == "--float") {
+                    std::printf("float: off by > 0.5 m: map %zu, FUEL ground %zu (%zu above, %zu below); > 4 m: map %zu, FUEL ground %zu\n",
+                                offRaw05, offNew05, aboveNew, belowNew, offRaw4, offNew4);
+                    std::sort(devNew.begin(), devNew.end());
+                    if (!devNew.empty())
+                        std::printf("float: FUEL ground offset percentiles p10 %.2f p25 %.2f p50 %.2f p75 %.2f p90 %.2f m; mean |d| (< 50 m) map %.2f, ground %.2f\n",
+                                    devNew[devNew.size() / 10], devNew[devNew.size() / 4], devNew[devNew.size() / 2], devNew[devNew.size() * 3 / 4],
+                                    devNew[devNew.size() * 9 / 10], sumAbsRaw / double(total), sumAbsNew / double(total));
+                }
+            } else if (a == "--near" && i + 3 < argc) {  // --near X Z R: placed objects and the ground under them
+                const float X = std::strtof(argv[i + 1], nullptr), Z = std::strtof(argv[i + 2], nullptr), R = std::strtof(argv[i + 3], nullptr);
+                i += 3;
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                // FUEL_P22_CARVE=1: the ground with the roads work's 0x6fcaa0 (RoadSampler::carve)
+                // instead of terrain_height's own road decode, to compare the two against placed objects.
+                std::unique_ptr<fuel::RoadSampler> p22;
+                if (std::getenv("FUEL_P22_CARVE") && ground.detail) {
+                    p22 = std::make_unique<fuel::RoadSampler>(dpc, fuel::loadRoadTypeTable(dpc),
+                                                              [&](double px, double pz) { return ground.detail->detailHeight(px, pz); });
+                    const_cast<fuel::TerrainDetail*>(ground.detail.get())
+                        ->setRoadCarver([&](double px, double pz, double& y, double c, double w) { return p22->carve(px, pz, y, c, w); });
+                }
+                for (const auto& e : std::filesystem::directory_iterator(std::filesystem::path(argv[1]).parent_path())) {
+                    if (e.path().extension() != ".DPC" || e.path().filename() == "USA1.DPC") continue;
+                    try {
+                        fuel::DpcFile sub(e.path().string());
+                        if (!sub.isCurrentVersion()) continue;
+                        for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(sub, {&sub, &dpc})) {
+                            const float x = pm.world[12], y = pm.world[13], z = pm.world[14];
+                            if ((x - X) * (x - X) + (z - Z) * (z - Z) > R * R) continue;
+                            const fuel::GroundSample g = ground.detail->sample(x, z);
+                            std::printf("  %08x %s at (%.1f, %.2f, %.1f): ground %.2f (y - ground %+.2f) map %.2f detail %+.2f rock %.2f w18 %.2f%s\n", pm.meshId,
+                                        e.path().filename().string().c_str(), x, y, z, g.ground, y - g.ground, g.h0, g.h2 - g.h0, g.rock, g.w18,
+                                        pm.fitToGround ? " FIT" : "");
+                        }
+                    } catch (const std::exception&) {
+                    }
+                }
+            } else if (a == "--chunks" && i + 2 < argc) {  // --chunks X Z: time ground chunk builds of every size there
+                const float X = std::strtof(argv[i + 1], nullptr), Z = std::strtof(argv[i + 2], nullptr);
+                i += 2;
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                for (double c = 24; c <= 12288; c *= 2) {
+                    const auto c0 = std::chrono::steady_clock::now();
+                    const auto v = fuel::buildTerrainChunk(ground, X + 3 * c, Z, c);
+                    std::printf("chunk %5.0f m: %zu vertices in %.1f ms\n", c, v.size(),
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count() * 1e3);
+                }
+            } else if (a == "--road-types") {  // the AGW_TerraRoad table replayed from FUEL.exe
+                std::string err;
+                const auto t = fuel::loadRoadTypes(dpc, &err);
+                if (!t) {
+                    std::printf("road types: %s\n", err.c_str());
+                    return 1;
+                }
+                for (size_t k = 0; k < t->size(); ++k) {
+                    const fuel::RoadTypeParams& q = (*t)[k];
+                    std::printf("type %2zu: T0 %g T24 %g T28 %g T34 %g T4c %g T50 %g T54 %g T5c %g T74 %g T78 %g T7c %g T80 %g Tbc %g Tc4 %g Tcc %g M %g Mmin %g\n", k,
+                                q.reach, q.crown, q.verge, q.noise, q.fade, q.ditch, q.ditchDepth, q.stretch, q.bumpAmp, q.bumpLen, q.waveAmp,
+                                q.waveLen, q.band, q.core, q.flat, q.smooth, q.smoothMin);
+                }
+            } else if (a == "--events") {
+                // Race starts and checkpoints (authored on FUEL's ground) against the ground.
+                const std::string data = std::filesystem::path(argv[1]).parent_path().parent_path().parent_path().string();
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                std::vector<float> dn, dr;
+                for (const fuel::Event& e : fuel::loadEvents(data)) {
+                    std::vector<std::array<float, 3>> pts = e.race.checkpoints;
+                    pts.push_back(e.race.start);
+                    for (const auto& p : pts) {
+                        if (p[0] == 0 && p[2] == 0) continue;
+                        dn.push_back(p[1] - ground.smoothHeightAt(p[0], p[2]));
+                        dr.push_back(p[1] - hf.baseHeightAt(p[0], p[2]));
+                    }
+                    if (e.id == "CR2-Yell-CP") {
+                        const auto& st = e.race.start;
+                        const fuel::GroundSample g = ground.detail->sample(st[0], st[2]);
+                        std::printf("CR2-Yell-CP start (%.1f, %.1f, %.1f): map %.2f, ground %.2f (h2 %.2f rock %.2f floor %.2f w18 %.2f)\n", st[0],
+                                    st[1], st[2], g.h0, g.ground, g.h2, g.rock, g.floor, g.w18);
+                    }
+                }
+                auto stats = [](const char* name, std::vector<float> v) {
+                    std::sort(v.begin(), v.end());
+                    size_t in1 = 0;
+                    for (float d : v) in1 += std::fabs(d) < 1.0f;
+                    if (!v.empty())
+                        std::printf("events %s: %zu points, p10 %.2f p50 %.2f p90 %.2f m, within 1 m %zu\n", name, v.size(), v[v.size() / 10],
+                                    v[v.size() / 2], v[v.size() * 9 / 10], in1);
+                };
+                stats("map", dr);
+                stats("ground", dn);
             } else if (a == "--grass" && i + 3 < argc) {
                 // --grass X Z R: the decoded ground generator (grass, rock, fields) around (X, Z),
                 // with timing and statistics; also a map of the area as grass.ppm (R/G/B = grass/rock/field).
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
                 const int r = std::atoi(argv[i + 3]);
                 i += 3;
-                fuel::Heightfield levelled = hf;
-                fuel::applyFlatSurfaces(levelled, dpc);
+                const fuel::Heightfield levelled = fuel::loadLevelledHeightfield(dpc);
                 std::unique_ptr<fuel::RoadNetwork> roads;
                 try {
                     roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(dpc));
@@ -179,7 +292,7 @@ int main(int argc, char** argv) {
                 i += 3;
                 const auto r0 = std::chrono::steady_clock::now();
                 const fuel::Heightfield levelled = fuel::loadLevelledHeightfield(dpc);
-                fuel::RoadTypeTable types = fuel::loadRoadTypes(dpc);
+                fuel::RoadTypeTable types = fuel::loadRoadTypeTable(dpc);
                 std::printf("road types: %s\n", types.valid ? "rebuilt from FUEL.exe" : "NOT AVAILABLE");
                 if (!types.valid) return 1;
                 for (int t = 4; t <= 20; ++t) {
@@ -187,7 +300,9 @@ int main(int argc, char** argv) {
                     std::printf("  %2d %-24s C %5.2f half %5.2f bc %6.2f cc %6.2f d4 %6.2f decal 0x%03x tarmac %.0f\n", t, T.name.c_str(), T.at(0x1f0),
                                 T.at(0x00), T.at(0xbc), T.at(0xcc), T.at(0xd4), T.u32(0xa8), T.at(0x38));
                 }
-                fuel::RoadSampler rs(dpc, std::move(types), [&](double px, double pz) { return double(levelled.smoothHeightAt(px, pz)); });
+                fuel::RoadSampler rs(dpc, std::move(types), [&](double px, double pz) {  // flags 3: ground without roads
+                    return levelled.detail ? levelled.detail->detailHeight(px, pz) : double(levelled.smoothHeightAt(px, pz));
+                });
                 std::printf("  %zu records (%.2f s)\n", rs.recordCount(), std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count());
                 const auto s0 = std::chrono::steady_clock::now();
                 const int n = 2 * r + 1;
@@ -217,6 +332,32 @@ int main(int argc, char** argv) {
                 std::ofstream out("roads.ppm", std::ios::binary);
                 out << "P6\n" << n << " " << n << "\n255\n";
                 out.write(reinterpret_cast<const char*>(img.data()), std::streamsize(img.size()));
+                // Cross-check against the terrain's own decode of 0x6fcaa0 (p21 H6): the ground with
+                // P21's road carve vs with this sampler's carve through the RoadCarver hook.
+                if (levelled.detail) {
+                    std::vector<double> a;
+                    for (int k = 0; k <= 400; ++k) a.push_back(levelled.detail->height(x - r + k * (2.0 * r / 400), z));
+                    auto* d = const_cast<fuel::TerrainDetail*>(levelled.detail.get());
+                    d->setRoadCarver([&rs](double px, double pz, double& y, double c, double w) { return rs.carve(px, pz, y, c, w); });
+                    double maxd = 0, sumd = 0;
+                    for (int k = 0; k <= 400; ++k) {
+                        const double b = levelled.detail->height(x - r + k * (2.0 * r / 400), z), dd = std::fabs(b - a[size_t(k)]);
+                        maxd = std::max(maxd, dd), sumd += dd;
+                    }
+                    d->setRoadCarver(nullptr);
+                    std::printf("  carve vs terrain_height's own road decode, 401 points along x: max |diff| %.4f m, mean %.5f m\n", maxd, sumd / 401);
+                }
+                if (std::getenv("FUEL_ROAD_DEBUG")) {
+                    std::vector<const fuel::RoadSampler::Segment*> segs;
+                    rs.segmentsNear(x, z, segs);
+                    for (const auto* sg : segs) {
+                        const float t = (sg->tx * float(x) + sg->tz * float(z)) - sg->c34;
+                        std::printf("  seg rec %u type %u len %.1f t %.2f H(t) %.2f base %d wid %u/%u curv %d/%d\n", sg->record, sg->type, sg->len, t,
+                                    sg->heightAt(t, rs.types().types[sg->type]), sg->base, sg->wid0, sg->wid1, sg->curv0, sg->curv1);
+                    }
+                    if (levelled.detail)
+                        std::printf("  flags-3 height %.3f\n", levelled.detail->detailHeight(x, z));
+                }
                 // A transect along x through (X, Z).
                 for (int k = -20; k <= 20; k += 2) {
                     const fuel::RoadFields f = rs.sample(x + k, z);
@@ -228,7 +369,14 @@ int main(int argc, char** argv) {
                 }
             } else if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);
-                std::printf("height at (%.1f, %.1f) = %.2f m\n", x, z, hf.heightAt(x, z));
+                if (hf.detail) {
+                    const fuel::GroundSample g = hf.detail->sample(x, z);
+                    std::printf("height at (%.1f, %.1f) = %.3f m (map %.3f, n.y %.3f, detail %.3f, rock %.3f, floor %.3f, w18 %.3f, before finish %.3f)\n",
+                                x, z, g.ground, g.h0, g.ny, g.h2 - g.h0, g.rock, g.floor, g.w18, g.detail);
+                    std::printf("    after gulch %.3f, flats A %.3f, roads %.3f, flats B %.3f\n", g.gulch, g.flatA, g.road, g.flatB);
+                } else {
+                    std::printf("height at (%.1f, %.1f) = %.3f m (map B-spline)\n", x, z, hf.baseHeightAt(x, z));
+                }
                 i += 2;
             } else if (a == "--ground" && i + 2 < argc) {  // --ground FILE.ppm SIZE: the colour map
                 const auto g0 = std::chrono::steady_clock::now();
