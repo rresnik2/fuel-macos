@@ -43,7 +43,6 @@ add_library(fuelui STATIC
   src/ui/menu_model.cpp
   src/ui/menu_assets.cpp
   src/ui/menu_check.cpp
-  src/ui/events_stub.cpp  # STUB until P17's loadEvents is merged
 )
 target_link_libraries(fuelui PUBLIC fuelcore)
 

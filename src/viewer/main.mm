@@ -1150,7 +1150,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     const std::vector<int> pos = _race->positions(*_drive);
     for (int p = 1; p <= int(_race->racers.size()); ++p)
         for (size_t i = 0; i < _race->racers.size(); ++i)
-            if (pos[i] == p) rows.push_back({_race->racers[i].name, float(std::max(0.0, _race->racers[i].finished)), i == 0});
+            if (pos[i] == p) rows.push_back({_race->racers[i].name, float(std::max(0.0, _race->rules.racers[i].finished)), i == 0});
     return rows;
 }
 

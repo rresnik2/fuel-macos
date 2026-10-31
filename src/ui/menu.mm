@@ -3,7 +3,7 @@
 #include "core/assembly.hpp"
 #include "core/dpc.hpp"
 #include "core/vehicle_params.hpp"
-#include "ui/events_stub.hpp"
+#include "core/events.hpp"
 #include "ui/tsc.hpp"
 #include "ui/ui_renderer.h"
 
@@ -125,7 +125,11 @@ Menu::Menu(const std::string& dataDir, const Settings& settings, MenuMode mode)
     } catch (const std::exception& e) {
         std::fprintf(stderr, "menu: hubs: %s\n", e.what());
     }
-    events_ = loadEventsStub(dataDir);  // P17: replace with fuel::loadEvents(dataDir)
+    try {
+        events_ = loadEvents(dataDir);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "menu: events: %s\n", e.what());
+    }
     vehicles_ = loadVehicleInfos(dataDir);
     // What the port can start: a variant of that exact name in the vehicle's archive
     // (some variants' names are not decoded yet) with driving parameters.
