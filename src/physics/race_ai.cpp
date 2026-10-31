@@ -1,5 +1,6 @@
 // FUEL's AI racers: see race_ai.hpp and notes/p29-ai.md. Addresses are FUEL.exe (image base 0x400000).
 #include "race_ai.hpp"
+#include "core/road_graph.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -98,6 +99,18 @@ std::optional<AiTables> loadAiTables(const std::string& fuelExe, std::string* er
                 if (!have[k] || !(v > 0 && v < 150) || (k > 0 && v < t.cornerSpeed[size_t(k - 1)]))
                     throw std::runtime_error("corner speed table at 0x61e540 is not the version the port knows");
             }
+            for (int row = 0; row < 6; ++row)
+                for (int col = 0; col < 2; ++col) {
+                    const uint32_t a = 0xa02c88 + uint32_t(row) * 0x40 + uint32_t(col) * 0x20;
+                    for (int k = 0; k < 6; ++k) {
+                        const float v = exe.f32(a + uint32_t(k) * 4);
+                        if (!(v > 0 && v < 10)) throw std::runtime_error("road cost table at 0xa02c88 is not the version the port knows");
+                        t.roadSpeed[size_t(row)][size_t(col)][size_t(k)] = v;
+                    }
+                    const uint8_t f = exe.bytes.at(exe.offset(a + 0x1c));
+                    if (f > 1) throw std::runtime_error("road cost table at 0xa02c88 is not the version the port knows");
+                    t.roadForbid3[size_t(row)][size_t(col)] = f != 0;
+                }
             res.first = t;
         } catch (const std::exception& e) {
             res.second = std::string("AI tables from FUEL.exe: ") + e.what();
@@ -295,6 +308,67 @@ void RaceLine::routeOnRoads(const RoadNetwork& roads, const std::function<float(
             H.push_back(30.0f);
         }
         // Distance along to this target.
+        float acc = 0;
+        for (size_t i = 1; i < P.size(); ++i) acc += std::hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+        G.push_back(acc);
+    }
+    path = P, pathHalf = H, gateAlong = G;
+    pathAlong.assign(path.size(), 0);
+    for (size_t i = 1; i < path.size(); ++i) pathAlong[i] = pathAlong[i - 1] + std::hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]);
+}
+
+void RaceLine::routeOnRoadGraph(const RoadGraph& graph, const std::function<float(int)>& flatHalf, const AiTables* tables,
+                            const std::function<float(float, float)>& height) {
+    if (points.size() < 2) return;
+    // The AI's cost (0x4ef600, row 6 col 0 = the main path, 0x617fc0); the length cost (0x6d7e70) when
+    // FUEL.exe's table is not available.
+    RoadGraph::CostFn cost;
+    if (tables) {
+        const auto c = tables->roadSpeed[5][0];
+        const bool f3 = tables->roadForbid3[5][0];
+        cost = [&graph, c, f3, height](uint32_t r, uint32_t off, uint32_t n, int dir) { return graph.aiCost(r, off, n, dir, c, f3, height); };
+    } else {
+        cost = [&graph](uint32_t r, uint32_t off, uint32_t n, int) { return graph.lengthCost(r, off, n); };
+    }
+    std::vector<std::array<float, 2>> P;
+    std::vector<float> H, G;
+    P.push_back({points[0][0], points[0][2]});
+    H.push_back(30.0f);
+    G.push_back(0);
+    for (size_t k = 0; k + 1 < points.size(); ++k) {
+        const float ax = points[k][0], az = points[k][2], bx = points[k + 1][0], bz = points[k + 1][2];
+        const float L = std::hypot(bx - ax, bz - az);
+        // 0x627400: both ends snap to a road within 10 m (0x6d19f0 returns d^2; d^2 < 100). Its >= 100 branch
+        // (0x6d2360) can never run.
+        int ra, ka, rb, kb;
+        float qax, qaz, qbx, qbz;
+        const bool sa = graph.nearestRoad(ax, az, 10.0f, ra, ka, qax, qaz) >= 0;
+        const bool sb = graph.nearestRoad(bx, bz, 10.0f, rb, kb, qbx, qbz) >= 0;
+        RoadGraph::Route route;
+        std::vector<uint32_t> recOf;
+        std::vector<std::array<float, 2>> R;
+        // IAPathBlockRoad (0x624760): request ends are the gate points, re-snapped within 1000 m.
+        if (sa && sb && graph.request(route, ax, az, bx, bz, cost)) R = graph.polyline(route, &recOf);
+        if (std::getenv("FUEL_AI_PATHDUMP")) {
+            std::printf("  stretch %zu: snap %d %d, %zu points, cost %.0f, types", k, int(sa), int(sb), R.size(), route.cost);
+            int last = -1;
+            for (size_t i = 0; i < recOf.size(); ++i)
+                if (graph.rec(recOf[i]).type != last) last = graph.rec(recOf[i]).type, std::printf(" %d@(%.0f,%.0f)", last, R[i][0], R[i][1]);
+            std::printf("\n");
+        }
+        if (R.size() >= 2) {
+            P.pop_back(), H.pop_back();
+            for (size_t i = 0; i < R.size(); ++i) {
+                const int t = graph.rec(recOf[i]).type;
+                P.push_back(R[i]);
+                H.push_back(std::max(flatHalf(t), 2.0f));  // lanes = T[+0xcc] (0x624a20)
+            }
+            P.back() = {bx, bz};
+        } else {
+            P.push_back({bx, bz});
+            H.push_back(30.0f);
+        }
+        (void)L;
         float acc = 0;
         for (size_t i = 1; i < P.size(); ++i) acc += std::hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
         G.push_back(acc);

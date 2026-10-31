@@ -49,6 +49,7 @@
 #include "physics/race_ai.hpp"
 #include "core/road_types.hpp"
 #include "core/roads.hpp"
+#include "core/road_graph.hpp"
 #include "physics/camcheck.hpp"
 #include "core/rider_anim.hpp"
 #include "core/vehicle_params.hpp"
@@ -574,6 +575,7 @@ struct RaceSession {
     fuel::RaceLine aiLine;                    // hunted racers: their grid, then the event's path
     const fuel::Heightfield* terrain = nullptr;  // puts gates far off the ground onto it
     const fuel::RoadNetwork* roads = nullptr;      // the AI's road / off-road speed blend
+    const fuel::RoadGraph* graph = nullptr;        // FUEL's road graph (snap, road at point, route search)
     std::optional<std::array<fuel::RoadTypeParams, 21>> roadTypes;
     std::optional<fuel::AiTables> aiTables;        // from the player's FUEL.exe
     double clock = 0;  // seconds since the start (negative during the countdown)
@@ -612,10 +614,22 @@ struct RaceSession {
         if (roads && roadTypes) {
             // FUEL's road blocks (0x627590): the AI follows the roads where a stretch's ends lie near them.
             const auto flat = [&types = *roadTypes](int t) { return t == 14 || t < 0 || t >= 21 ? -1.0f : types[size_t(t)].flat; };
-            line.routeOnRoads(*roads, flat);
-            aiLine.routeOnRoads(*roads, flat);
+            const char* rg = std::getenv("FUEL_AI_ROADGRAPH");
+            if (graph && rg && std::atoi(rg) != 0) {
+                std::function<float(float, float)> height = [](float, float) { return 0.0f; };
+                if (terrain) height = [t = terrain](float x, float z) { return t->smoothHeightAt(x, z); };
+                const fuel::AiTables* tab = aiTables ? &*aiTables : nullptr;
+                line.routeOnRoadGraph(*graph, flat, tab, height);
+                aiLine.routeOnRoadGraph(*graph, flat, tab, height);
+            } else {
+                line.routeOnRoads(*roads, flat);
+                aiLine.routeOnRoads(*roads, flat);
+            }
             int onRoad = 0;
             for (size_t k = 0; k + 1 < line.path.size(); ++k) onRoad += line.pathHalf[k] < 30.0f;
+            if (std::getenv("FUEL_AI_PATHDUMP"))
+                for (size_t k = 0; k < line.path.size(); ++k)
+                    std::printf("  path %zu %.1f %.1f half %.1f along %.0f\n", k, line.path[k][0], line.path[k][1], line.pathHalf[k], line.pathAlong[k]);
             std::printf("AI path: %zu points, %.0f m (gates %.0f m), %d road segments\n", line.path.size(), line.pathLength(), line.length(), onRoad);
         }
         playerS = 0;
@@ -767,9 +781,11 @@ struct RaceSession {
                 n[0] = -hx * 0.5f / l, n[1] = 1 / l, n[2] = -hz * 0.5f / l;
                 return h;
             };
-        if (roads && roadTypes)
-            s.offroad = [r = roads, &types = *roadTypes](double x, double z) {
-                const int t = fuel::roadTypeAt(*r, x, z);
+        if (graph && roadTypes)
+            // 0x617000: T[type][+0xb4] of the record 0x6d1d70 finds (1 off roads).
+            s.offroad = [g = graph, &types = *roadTypes](double x, double z) {
+                const int r = g->roadAt(float(x), float(z), [&types](int t) { return t >= 0 && t < 21 ? types[size_t(t)].flat : 0.0f; });
+                const int t = r >= 0 ? g->rec(size_t(r)).type : -1;
                 return t >= 0 && t < 21 ? types[size_t(t)].aiSpeedBlend : 1.0f;
             };
         s.statics = [&world](double x0, double z0, double x1, double z1, std::vector<std::array<double, 6>>& out) { world.staticBounds(x0, z0, x1, z1, out); };
@@ -988,6 +1004,10 @@ void printAiCheck(const RaceSession& race, const DriveSession& drive) {
                     i == 0 ? "(auto)" : "      ", r.ai.mode(), r.ai.frac(), r.ai.physical() ? "sim" : "kin", rr.next, race.rules.lineFor(i).size(),
                     st.speedKmh, r.ai.resets(), drive.physics().respawns(int(i)),
                     rr.finished >= 0 ? (" finished " + std::to_string(int(rr.finished)) + " s").c_str() : rr.out ? " out" : "");
+        if (std::getenv("FUEL_AI_PATHDUMP")) {
+            const simd_float3 p = drive.position(int(i));
+            std::printf("     at %.1f %.1f %.1f\n", p.x, p.y, p.z);
+        }
     }
 }
 
@@ -1840,6 +1860,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
+        std::unique_ptr<fuel::RoadGraph> roadGraph;
         std::optional<std::array<fuel::RoadTypeParams, 21>> roadTypes;  // the AI's road blend (+0xb4)
         std::unique_ptr<fuel::Lakes> lakes;
         std::unique_ptr<fuel::GroundGenerator> ground;  // p14: grass and the trees' ground tests
@@ -1938,6 +1959,11 @@ int main(int argc, const char** argv) {
                             streamer->setSurfaces([](double x, double z) { return gSurfaces.at(x, z); });
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
                             roadTypes = fuel::loadRoadTypes(*f);
+                            try {
+                                roadGraph = std::make_unique<fuel::RoadGraph>(*f);
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "fuelview: road graph: %s\n", e.what());
+                            }
                             streamer->setRoads(roads.get());
                             gSurfaces.roads = roads.get();
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
@@ -2058,6 +2084,7 @@ int main(int argc, const char** argv) {
                     race->terrain = terrain.get();
                     race->roads = roads.get();
                     race->roadTypes = roadTypes;
+                    race->graph = roadGraph.get();
                     {
                         std::string err;
                         race->aiTables = fuel::loadAiTables((fs::path(opt.dataDir) / "XFinalComponent/FUEL.exe").string(), &err);
