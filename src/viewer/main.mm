@@ -1105,10 +1105,19 @@ int runAiVectors(const std::string& dataDir) {
         std::printf("aicheck: %s\n", err.c_str());
         return 1;
     }
-    // The table FUEL's 0x61e540 writes (emulated), against the port's reading of the same code.
-    check("T1", "corner speed table 0x61e540", std::vector<float>(tables->cornerSpeed.begin(), tables->cornerSpeed.end()),
-          {/* engine table removed from the published history; read from FUEL.exe at run time */},
-          1e-6f);
+    // The table FUEL's 0x61e540 writes (emulated), against the port's reading of the same code. Compared by
+    // an FNV-1a hash of its 20 floats so the engine table itself stays out of the repo (hard rule).
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (float f : tables->cornerSpeed) {
+            unsigned char b[4];
+            std::memcpy(b, &f, 4);
+            for (unsigned char c : b) h = (h ^ c) * 0x100000001b3ull;
+        }
+        const bool m = tables->cornerSpeed.size() == 20 && h == 0x60446c3cd0a57b7eull;
+        std::printf("%-4s %-40s %s  hash %016llx\n", "T1", "corner speed table 0x61e540", m ? "match   " : "MISMATCH", (unsigned long long)h);
+        (m ? ok : bad)++;
+    }
     // Samples every 10 m along a path turning by `turns` (degrees at sample k) as ai_gen.py builds them.
     auto arc = [](int n, double perSample, const std::map<int, double>& turns, const std::function<std::pair<float, float>(int)>& lat) {
         std::vector<std::array<double, 2>> pts;
