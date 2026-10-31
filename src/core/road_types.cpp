@@ -536,6 +536,7 @@ std::optional<std::array<RoadTypeParams, 21>> loadRoadTypes(const DpcFile& world
                 q.fade = cpu.rdf(b + 0x4c), q.ditch = cpu.rdf(b + 0x50), q.ditchDepth = cpu.rdf(b + 0x54), q.stretch = cpu.rdf(b + 0x5c);
                 q.bumpAmp = cpu.rdf(b + 0x74), q.bumpLen = cpu.rdf(b + 0x78), q.waveAmp = cpu.rdf(b + 0x7c), q.waveLen = cpu.rdf(b + 0x80);
                 q.band = cpu.rdf(b + 0xbc), q.core = cpu.rdf(b + 0xc4), q.flat = cpu.rdf(b + 0xcc);
+                q.aiSpeedBlend = cpu.rdf(b + 0xb4);
                 q.smooth = cpu.rdf(b + 0x1f0) * cpu.rdf(b + 0x1e4), q.smoothMin = cpu.rdf(b + 0x1e8);
                 // Sanity: plausible metres for every road type (a different FUEL.exe fails here).
                 auto in = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };

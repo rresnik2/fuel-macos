@@ -138,6 +138,25 @@ uint32_t genWorldEnumTexture(const DpcFile& world, uint32_t e, int slot) {
 
 bool isTarmacRoad(int t) { return t == 10 || t == 11 || t == 12 || t == 15 || t == 18 || t == 19; }
 
+int roadTypeAt(const RoadNetwork& net, double x, double z) {
+    const auto it = net.segCells.find(RoadNetwork::cellKey(int32_t(std::floor(x / RoadNetwork::kSegCell)), int32_t(std::floor(z / RoadNetwork::kSegCell))));
+    if (it == net.segCells.end()) return -1;
+    int best = -1;
+    double bestD = 1e30;
+    for (uint64_t ref : it->second) {
+        const RoadNetwork::Line& line = net.lines[size_t(ref >> 20)];
+        const size_t k = size_t(ref & 0xFFFFF);
+        const double ax = line.points[k][0], az = line.points[k][1];
+        const double bx = line.points[k + 1][0] - ax, bz = line.points[k + 1][1] - az;
+        const double len2 = bx * bx + bz * bz;
+        const double t = len2 > 0 ? std::clamp(((x - ax) * bx + (z - az) * bz) / len2, 0.0, 1.0) : 0.0;
+        const double d = std::hypot(x - (ax + bx * t), z - (az + bz * t));
+        if (d > 0.5 * double(net.styles[line.type].width) || d >= bestD) continue;
+        bestD = d, best = line.type;
+    }
+    return best;
+}
+
 int roadSurfaceAt(const RoadNetwork& net, double x, double z) {
     const auto it = net.segCells.find(RoadNetwork::cellKey(int32_t(std::floor(x / RoadNetwork::kSegCell)), int32_t(std::floor(z / RoadNetwork::kSegCell))));
     if (it == net.segCells.end()) return -1;
