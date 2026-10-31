@@ -177,6 +177,10 @@ public:
     // surface counts as dirt. The default applies to worlds created afterwards.
     void setSurfaceQuery(SurfaceQuery query);
     static void setDefaultSurfaceQuery(SurfaceQuery query);
+    // FUEL's ground-class fractions (0x4572d0 -> 0x6b76a0: 18 floats) and sink depth at (x, z); when set,
+    // the tyres and wheel effects read these instead of the one-hot class of the surface type.
+    using ClassQuery = std::function<void(double x, double z, float* frac18, float& depth)>;
+    static void setDefaultClassQuery(ClassQuery query);
     // Water depth (metres above the ground, 0 = dry) at a world point, for FUEL's water floor contacts,
     // water drag and wet grip. Defaults to 0 everywhere (the world's water plugs in here).
     using WaterDepthQuery = std::function<float(double x, double z)>;

@@ -157,6 +157,9 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
     f3f54_ = Fractal(perm_, 1, 10.0f, 25.148701f, 0.3f, 0.3f, 5.0f);
     f9e4c_ = Fractal(perm_, 1, 100.0f, 65.145248f, 0.3f, 0.3f, 5.0f);
     fcdc8_ = Fractal(perm_, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
+    f8e78_ = Fractal(perm_, 1, 100.0f, 67.349632f, 0.3f, 0.3f, 5.0f);  // clay noise (0x45d010)
+    fae20_ = Fractal(perm_, 1, 100.0f, 42.407471f, 0.3f, 0.3f, 5.0f);  // chalk noise (0x45c270)
+    fbdf4_ = Fractal(perm_, 1, 100.0f, 52.488899f, 0.3f, 0.3f, 5.0f);  // volcano noise (0x459530)
     palette_ = loadGroundPalette(world);
     // Grass_EmitTuft tables: tile weights (0x9ff02c) and tile sizes (0x9ff04c); the
     // tile index reaches 8, and the engine reads past the weights into the sizes.
@@ -486,7 +489,11 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     // Bit 23 (0x6bb1f0): palette-half blend T0 and the material weights.
     const float T = t0 >= 0 ? t0 : clamp01(f0004_.at(x, z));
     auto L = [&](int k1, int k2) { return lerp(P(k1), P(k2), T); };
-    const float clay = mapAt(3, x, z), chalk = mapAt(6, x, z), volcano = mapAt(5, x, z);
+    // Clay 0x45d010 / chalk 0x45c270 / volcano 0x459530 = clamp(1.2 m - 0.1 + 0.05 F) (p32 pointcolours 1.1;
+    // [0x9dc834] 1.2, [0x99648c] 0.1, [0x996158] 0.05), not the raw maps.
+    const float clay = clamp01(1.2f * mapAt(3, x, z) - 0.1f + 0.05f * f8e78_.at(x, z));
+    const float chalk = clamp01(1.2f * mapAt(6, x, z) - 0.1f + 0.05f * fae20_.at(x, z));
+    const float volcano = clamp01(1.2f * mapAt(5, x, z) - 0.1f + 0.05f * fbdf4_.at(x, z));
     const float a0 = clamp01(1.3f * mapAt(4, x, z) - 0.15f + 0.1f * f9e4c_.at(x, z));  // 0x6a9d90
     float a = a0, u = 0;
     if (a0 < 1) {
@@ -656,6 +663,72 @@ void GroundGenerator::surfaceTypes(double x, double z, GroundPoint& p) const {
         p.surfaceType[k] = k < n ? uint8_t(idx[k]) : uint8_t(0xff);
         p.surfaceWeight[k] = k < n ? w[idx[k]] / total : 0.0f;
     }
+}
+
+// Ground_ClassFractionsCached 0x6b76a0 (Observed decompile; p32 notes): the point is evaluated at the
+// centre of its cell (floor(x + 0.5): fistp rounds down; cell scale G+0x43ec8 / G+0x43ee8 taken as 1 m),
+// then 18 class weights from the ground layers, each S2-smoothed, normalised by their sum.
+void GroundGenerator::classFractions(double x, double y, double z, float frac[kGroundClasses], float& depth) const {
+    const int32_t ix = int32_t(std::floor(x + 0.5)), iz = int32_t(std::floor(z + 0.5));
+    const uint64_t key = (uint64_t(uint32_t(ix)) << 32) | uint32_t(iz);
+    ClassCell e{};
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lk(classCache_->m);
+        auto it = classCache_->cells.find(key);
+        if (it != classCache_->cells.end()) e = it->second, have = true;
+    }
+    if (!have) {
+        const GroundPoint p = at(double(ix), double(iz));
+        for (float& f : e.frac) f = 0;
+        e.height = p.height;
+        e.soft = p.puddle;  // ctx+0x208
+        const float r = p.road, tk = p.tarmac, ro = p.roughness, sz = p.grassSize;
+        const float cr = clamp01(mapAt(18, double(ix), double(iz)) - r);  // ctx+0x184 (map 18) - road
+        if (p.waterDepth <= p.waterBase + 0.01f) {  // ctx+0x1ac <= ctx+0x1b0 + 0.01: dry
+            e.water = -10000.0f;
+            // Grass weight ctx+0x1d0 = clamp(Grass - 0.8 dry) (bit 8; burn ctx+0x22c is 0 under water).
+            const float burn = std::min(contrast8(2 * mapAt(13, double(ix), double(iz)) - 1) * 0.5f + 0.5f, 0.9f);
+            const float dry = clamp01(1 - 2 * clamp01((p.surfaceHumidity - 0.33f) * 1.5625f + burn));
+            const float g = clamp01(p.grass - 0.8f * dry);
+            const float A = (1 - cr) * (1 - r);
+            float* c = e.frac;
+            c[0] = tk * (1 - cr) * r;                      // tarmac
+            c[1] = clamp01((1 - ro) * (1 - tk) * r + cr);  // smooth dirt road (+ map-18 cover)
+            c[2] = (1 - tk) * (1 - cr) * ro * r;           // rough dirt road
+            const float gr = g * (1 - c[0]) * A;
+            c[11] = gr * (1 - sz), c[12] = gr * sz;               // grass (ctx+0x1d0)
+            c[5] = p.rock * A * (1 - sz), c[6] = p.rock * A * sz;  // rock ctx+0x1e0
+            c[7] = p.caillou * A, c[8] = p.stones * A;             // ctx+0x1d8 / 0x1dc
+            c[9] = p.sand * A * (1 - sz), c[10] = p.sand * A * sz;  // ctx+0x220
+            c[17] = p.highGround * A;                              // ctx+0x19c
+            const float rest = (1 - p.grass - p.rock - p.stones - p.caillou - p.sand - p.highGround) * A;
+            c[3] = rest * (1 - sz), c[4] = rest * sz;
+        } else {
+            e.water = p.waterDepth + p.height - p.waterBase;  // ctx+0x1ac + y - ctx+0x1b0
+            e.frac[0] = 1;
+        }
+        float sum = 0;
+        for (float& f : e.frac) {
+            const float v = 2 * clamp01(f) - 1;
+            f = (2 - std::fabs(v)) * v * 0.5f + 0.5f;
+            sum += f;
+        }
+        if (sum > 0)
+            for (float& f : e.frac) f *= 1 / sum;
+        std::lock_guard<std::mutex> lk(classCache_->m);
+        if (classCache_->cells.size() > 65536) classCache_->cells.clear();
+        classCache_->cells.emplace(key, e);
+    }
+    if (std::isnan(y)) y = double(e.height);  // caller without a contact height: at the ground
+    if (y <= double(e.height) + 1.0) {
+        for (int k = 0; k < kGroundClasses; ++k) frac[k] = e.frac[k];
+    } else {  // more than 1 m above the ground: class 0 only
+        for (int k = 0; k < kGroundClasses; ++k) frac[k] = k == 0 ? 1.0f : 0.0f;
+    }
+    // depth = max(0, water - y) + max(0, soft - 0.05) - 0.01, >= 0
+    const float d = std::max(0.0f, e.water - float(y)) + std::max(0.0f, e.soft - 0.05f) - 0.01f;
+    depth = d > 0 ? d : 0;
 }
 
 bool GroundGenerator::rejectsPlant(double x, double z) const {

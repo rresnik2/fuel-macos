@@ -3,10 +3,9 @@
 //
 // The table is not data in the game files: AGW_TerraRoad::Init (FUEL.exe 0x6f24a0) fills
 // it with constants in code. The port keeps no copy of those values. It reads the
-// function's machine code from the player's own FUEL.exe and replays it with a small
-// x86/x87 interpreter (straight-line stores, the FPU arithmetic between them, the
-// derived-field helper 0x6f1240 and the record copy 0x6f5690), twice, as the engine's
-// two GenWorld loads do (notes p21 H6: the second run's values are the ones queries see).
+// function's machine code from the player's own FUEL.exe and replays it (road_table.*,
+// the single emulator; later-init values, notes p21 H6 / p22). This header keeps the
+// named subset the height, AI and race code use.
 #pragma once
 
 #include "dpc.hpp"

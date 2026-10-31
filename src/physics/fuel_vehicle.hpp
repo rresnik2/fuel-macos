@@ -261,6 +261,11 @@ private:
     std::vector<Contact> contacts_;
     std::vector<GroundBlock> C_;
     std::vector<std::array<float, kGroundClasses>> frac_;
+    // 0x5c9e80 with veh+0x1a48 == 0: one class query at the mean contact point, refreshed after 5 m.
+    bool groundQueried_ = false;
+    double groundAt_[2] = {0, 0};
+    std::array<float, kGroundClasses> groundFrac_{};
+    float groundSink_ = 0;
     std::vector<float> waterDepth_;  // veh+0x1990
     Vec3 groundQueryAt_{1e9f, 0, 1e9f};
 
