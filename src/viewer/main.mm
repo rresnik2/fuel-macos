@@ -107,6 +107,7 @@ struct Options {
     float driveTime = 4.0f;
     double timeOfDay = -1;     // --time HH.MM: FUEL's ForceDayTime (seconds of the day); < 0 the running clock
     float cloud = 0, fog = 0, wet = 0;  // --weather C,F,W: inputs of World_SetWeatherAtmosphere (0..1)
+    bool weatherGiven = false;          // else the world's weather fields at the camera (core/weather.hpp)
     bool renderCheck = false;  // --rendercheck: the renderer's test vectors (no game data needed)
     bool haveAt = false;
     float atX = 0, atZ = 0, atYaw = 0;
@@ -210,6 +211,7 @@ Options parseArgs(int argc, const char** argv) {
         }
         else if (a == "--weather") {
             if (std::sscanf(next().c_str(), "%f,%f,%f", &o.cloud, &o.fog, &o.wet) < 1) die("bad --weather (use CLOUD,FOG,WET in 0..1)");
+            o.weatherGiven = true;
         }
         else if (a == "--rendercheck") o.renderCheck = true;
         else if (a == "--mesh") { o.meshId = uint32_t(std::stoul(next(), nullptr, 16)); o.haveMeshId = true; }
@@ -452,6 +454,14 @@ struct AssemblyMode {
 // --drive: every drivable vehicle in the vehicle archives, for Tab switching.
 // The ground maps and roads behind the physics' per-wheel surface query (drive mode).
 static fuel::GroundMaps gGround;
+// FUEL's point colour (the decoded ground map, gamma bytes as stored) at (x, z), for the wheel effects.
+static std::array<float, 4> groundPointColour(const fuel::GroundMaps& g, double x, double z) {
+    if (g.size == 0 || g.colour.empty()) return {0.5f, 0.5f, 0.5f, 1.0f};
+    const double step = 140000.0 / double(g.size);
+    auto idx = [&](double v) { return size_t(std::min(double(g.size - 1), std::max(0.0, std::floor((v + 70000.0) / step)))); };
+    const uint8_t* c = &g.colour[(idx(z) * g.size + idx(x)) * 4];
+    return {c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, 1.0f};
+}
 static fuel::SurfaceMap gSurfaces;
 
 // Per-frame physics cost of the headless runs (--ai-check prints it).
@@ -1411,7 +1421,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     _renderer->setFocus(_chase.focus());
     _renderer->speedBlur = _chase.speedEffect();
     _renderer->speedBlurAbsolute = _chase.pose().blur;  // FUEL's viewport +0x1dc (P574 x the speed fraction)
-    _dust.update(dt, *_drive, _drive->position());
+    _dust.update(dt, *_drive, _chaseView.eye);
     _renderer->setDust(_dust.particles());
     const fuel::VehicleState st = _drive->state();
     _frame.speedKmh = std::fabs(st.speedKmh);
@@ -1562,6 +1572,7 @@ int main(int argc, const char** argv) {
         renderer.timeFromCommandLine = opt.timeOfDay >= 0;
         renderer.forcedTimeOfDay = opt.timeOfDay;  // --time: ForceDayTime; else 08:00 + the game clock x PP371
         renderer.weather.cloud = opt.cloud, renderer.weather.fog = opt.fog, renderer.weather.wet = opt.wet;
+        renderer.weatherFromWorld = !opt.weatherGiven;
         fuel::Settings playerSettings;
         if (opt.settings) {
             playerSettings = fuel::loadSettings();
@@ -1580,6 +1591,8 @@ int main(int argc, const char** argv) {
                 gGround = fuel::buildGroundMaps(usa1, *terrain, 2334);
                 renderer.setGround(gGround, usa1);
                 gSurfaces.ground = &gGround;
+                DustSystem::setDataDir(opt.dataDir);  // FUEL's wheel effects: pp001.tsc + FUEL.exe tables, ground colour
+                DustSystem::groundColour = [](double x, double z) { return groundPointColour(gGround, x, z); };
                 fuel::DriveWorld::setDefaultSurfaceQuery([](double x, double z) { return gSurfaces.at(x, z); });
                 if (opt.haveAt && !opt.world && !opt.drive)
                     renderer.placement = matrix_from_translation(opt.atX, terrain->heightAt(opt.atX, opt.atZ), opt.atZ);
@@ -1968,7 +1981,7 @@ int main(int argc, const char** argv) {
                         if (opt.film > 0) {
                             if (i == 0 && opt.camView > 0) chase.setView(opt.camView);
                             chaseView = chase.update(1.0f / 60, *drive, {}, cameraOverride(race.get()));
-                            dust.update(1.0f / 60, *drive, drive->position());
+                            dust.update(1.0f / 60, *drive, chaseView.eye);
                         }
                         if (streamer && (opt.propCheck || opt.film > 0 || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
                         if (opt.film > 0) {  // worst step times since the last frame
@@ -2018,7 +2031,7 @@ int main(int argc, const char** argv) {
                             const fuel::VehicleState fs = drive->state();
                             const simd_float3 fp = drive->position();
                             std::printf("film %s t=%.1f (%.0f, %.0f, %.0f) %.0f km/h %d wheels down, %zu dust, gpu %.1f ms%s\n", frame.shot.c_str(), i / 60.0, fp.x, fp.y, fp.z,
-                                        fs.speedKmh, fs.wheelsOnGround, dust.particles().size(), gpuMs, race ? (" " + race->hud(*drive)).c_str() : "");
+                                        fs.speedKmh, fs.wheelsOnGround, dust.particles().sprites.size(), gpuMs, race ? (" " + race->hud(*drive)).c_str() : "");
                             const auto& cp = chase.pose();
                             std::printf("  camera view %d eye (%.1f, %.1f, %.1f) target (%.1f, %.1f, %.1f) %.1f m, fov %.1f, roll %.3f, near %.2f\n", cp.view, cp.ex, cp.ey,
                                         cp.ez, cp.tx, cp.ty, cp.tz, std::hypot(std::hypot(cp.ex - fp.x, cp.ey - fp.y), cp.ez - fp.z), cp.fovDeg, cp.roll, cp.zNear);

@@ -3,6 +3,8 @@
 #include <chrono>
 
 #include "core/genworld_noise.hpp"
+#include "core/vehicle.hpp"
+#include "core/weather.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -974,62 +976,191 @@ fragment float4 fsMarker(MarkerOut in [[stage_in]]) {
     return float4(in.color * g, g * 0.7);
 }
 
-// ---- dust: soft camera-facing sprites over the resolved scene ----
+// ---- FUEL's effects billboards (sfx.vhl / sfx.phl, p30-effects.md 2.5): vh_bboard_soft_static (GPU-animated
+// wheel particles, SubCode 0xe) and vh_billboard_soft (CPU particles, 0xb), both lit by scattering() and drawn
+// with ph_billboard_soft over the resolved scene.
 
-struct DustParticle {
-    float4 position;  // xyz, w radius in metres
-    float4 colour;    // linear albedo, a opacity
-    float4 extra;     // x rotation (radians), y noise seed
+struct SfxSprite {
+    float4 posAngle;
+    float4 uv;
+    float4 colour;
+    float4 vel;
+    float4 acc;
+    float4 life;
+    float4 alphaP;
+    float4 scaleP;
 };
 
-struct DustOut {
+struct SfxParams {
+    float4 user0;  // C_USER0: x FX clock, y 100 ("hundred" of GetParameterValue)
+    float4 user1;  // C_USER1: x fade-to-camera distance (PP5530), y fade-out distance (PP5531), z 0.01 collapse
+    float4 user2;  // C_USER2: x 0.8 FastFade frontier, y 0.1 (0x5f6550)
+};
+
+struct SfxOut {
     float4 position [[position]];
     float2 uv;
-    float3 rgb;
-    float alpha;
-    float depth;   // view-space distance of the sprite
-    float radius;
-    float seed;
+    float4 sun;      // (sky + sun saturate(L.y)) * vcol, a = vertex alpha
+    float4 sky;      // sky * vcol
+    float3 insc;
+    float viewZ;
+    float shadow;    // SFX_VERTEX_SHADOWS: the shadow term at the vertex
 };
 
-vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const device DustParticle* ps [[buffer(0)]],
-                      constant FrameUniforms& f [[buffer(1)]]) {
-    const DustParticle p = ps[iid];
-    float2 c = float2(vid & 1, vid >> 1) * 2.0 - 1.0;
-    float s = sin(p.extra.x), k = cos(p.extra.x);
-    float2 r = float2(c.x * k - c.y * s, c.x * s + c.y * k);
-    float3 w = p.position.xyz + (f.camRight.xyz * r.x + f.camUp.xyz * r.y) * p.position.w;
-    DustOut o;
-    o.position = f.viewProj * float4(w, 1.0);
-    o.uv = c;
+// sfx.h GetParameterValue: integer part / 100 and fraction x 100 of each component weight 1, t, sin(pi t),
+// 0.25 + 0.75 t, 0.25 + 0.75 sin(pi t), an inverting lerp and a final power.
+float sfxParameter(float4 P, float life, float hundred) {
+    const float4 lo = fract(P) * hundred;
+    const float4 hi = (P - fract(P)) / hundred;
+    const float sl = sin(life * M_PI_F);
+    float v = hi.x + lo.x * life + hi.y * sl + lo.y * (0.25 + 0.75 * life) + hi.z * (0.25 + 0.75 * sl);
+    v = v + lo.z * ((1.0 - v) - v);
+    return pow(v, hi.w);
+}
+
+vertex SfxOut vsSfx(uint vid [[vertex_id]], uint iid [[instance_id]], const device SfxSprite* ps [[buffer(0)]],
+                    constant FrameUniforms& f [[buffer(1)]], constant SfxParams& u [[buffer(2)]],
+                    depth2d_array<float> shadowMap [[texture(0)]]) {
+    const SfxSprite p = ps[iid];
+    const float2 corner = float2(vid & 1, vid >> 1) * 2.0 - 1.0;  // (-1,-1) (1,-1) (-1,1) (1,1)
+    float3 pos = p.posAngle.xyz;
+    float4 diffuse = p.colour;
+    float angle = p.posAngle.w;
+    float scale = 1.0;
+    float2 vert = corner * p.vel.w;
+    if (p.life.z > 0.5) {  // vh_bboard_soft_static
+        const float dT = u.user0.x - p.life.x;
+        const float life = dT / p.life.y;
+        pos += dT * p.vel.xyz + dT * dT * 0.5 * p.acc.xyz;
+        if (life > 1.0) {
+            diffuse = float4(0.0);
+        } else {
+            const float dist = length(pos - f.eye.xyz);
+            const float alphaCamera = saturate((dist - u.user1.y) / (u.user1.x - u.user1.y));
+            diffuse.a *= sfxParameter(p.alphaP, life, u.user0.y) * alphaCamera;
+            diffuse.a *= 1.0 - saturate((life - u.user2.x) / u.user2.y);  // FastFade
+            angle += dT * p.acc.w;
+            vert = clamp(vert, -2.5, 2.5) * sfxParameter(p.scaleP, life, u.user0.y);
+        }
+    } else {  // vh_billboard_soft
+        const float dist = length(pos - f.eye.xyz);
+        diffuse.a *= saturate((dist - u.user1.y) / (u.user1.x - u.user1.y));
+    }
+    if (diffuse.a > u.user1.z) {
+        const float s = sin(angle), c = cos(angle);
+        const float2 r = float2(vert.x * c - vert.y * s, vert.x * s + vert.y * c);
+        pos += r.x * f.camRight.xyz + r.y * f.camUp.xyz;
+    }
+    SfxOut o;
+    o.position = f.viewProj * float4(pos, 1.0);
+    // Corner -> atlas uv (0x5fac70: -x corners take u0, +x corners u1; the top takes v0).
+    o.uv = float2(corner.x < 0.0 ? p.uv.x : p.uv.z, corner.y > 0.0 ? p.uv.y : p.uv.w);
     const float3 fwd = cross(f.camUp.xyz, f.camRight.xyz);
-    o.depth = dot(p.position.xyz - f.eye.xyz, fwd);
-    o.radius = p.position.w;
-    o.seed = p.extra.y;
-    // Lit like FUEL's billboard_soft (sfx.vhl, p26-work/particles.md 2.5): scattering() at the particle,
-    // lit = (sky + sun x saturate(L.y)) x vcol (the shadowed variant lerps to sky x vcol; port: unshadowed),
-    // + inscatter. The port's dust colours are albedos stored linear: taken to gamma space here.
-    const Scatter sc = fuelScattering(f, p.position.xyz);
-    const float3 vcol = pow(max(p.colour.rgb, 0.0), 1.0 / 2.2) * sc.ext;
-    o.rgb = (f.skyColour.rgb + f.sunColour.rgb * saturate(f.lightDir.y)) * vcol + sc.insc;
-    o.alpha = p.colour.a;
+    o.viewZ = dot(pos - f.eye.xyz, fwd);
+    const Scatter sc = fuelScattering(f, pos);
+    const float3 vcol = diffuse.rgb * 2.0 * sc.ext;
+    o.sun = float4((f.skyColour.rgb + f.sunColour.rgb * saturate(f.lightDir.y)) * vcol, diffuse.a);
+    o.sky = float4(f.skyColour.rgb * vcol, diffuse.a);
+    o.insc = sc.insc;
+    o.shadow = fuelShadow(shadowMap, pos, f);
+    if (u.user2.z > 0.0) o.sun = o.sky = float4(4.0, 0.0, 0.0, 1.0);  // FUEL_SFX_DEBUG=2: solid red sprites
     return o;
 }
 
-fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0)]], constant FrameUniforms& f [[buffer(1)]]) {
-    float r2 = dot(in.uv, in.uv);
-    if (r2 >= 1.0) discard_fragment();
-    // Lumpy edges: a little value noise over the round falloff.
-    float n = valueNoise(in.uv * 2.3 + in.seed * 17.0) * 0.6 + valueNoise(in.uv * 5.1 - in.seed * 9.0) * 0.4;
-    float blob = saturate(pow(1.0 - r2, 1.2) * mix(0.3, 1.7, n));
-    // Soft particles: fade out where the sprite meets the scene, and near the camera.
-    // The resolved depth turns back into a view distance with zn and q (fog.zw).
-    float d = depth.read(uint2(in.position.xy));
-    float scene = f.fog.z * f.fog.w / (d + f.fog.w);
-    // ph_billboard_soft: a *= saturate((sceneViewZ - particleViewZ) x 4); port: also thinned near the camera.
-    float fade = saturate((scene - in.depth) * 4.0) * saturate((in.depth - 0.4) / max(1.2, in.radius * 1.2));
-    float a = saturate(in.alpha * blob * fade);
-    return float4(in.rgb, a);
+fragment float4 fsSfx(SfxOut in [[stage_in]], depth2d<float> depth [[texture(0)]], texture2d<float> atlas [[texture(1)]],
+                      constant FrameUniforms& f [[buffer(1)]]) {
+    constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    float4 c = atlas.sample(smp, in.uv);
+    if (c.a < 0.01) discard_fragment();  // sfxClip
+    c *= mix(in.sky, in.sun, in.shadow);
+    c.rgb += in.insc;
+    // ph_billboard_soft: a *= saturate((sceneViewZ - particleViewZ) * 4); the resolved depth -> view distance.
+    const float d = depth.read(uint2(in.position.xy));
+    const float scene = f.fog.z * f.fog.w / (d + f.fog.w);
+    c.a *= saturate((scene - in.viewZ) * 4.0);
+    return float4(max(c.rgb, 0.0), saturate(c.a));
+}
+
+// ---- Weather tanks (rain.vhl vh_rain, snow.vhl vh_snow, drawn with ph_sfxBase; p30-effects.md 6): N drops in a
+// [-1, 1]^3 tank of half size TankScale whose centre sits ahead of the camera, wrapped by MapTankCoordinate.
+
+struct TankParams {
+    float4 user[8];  // C_USER0..7 as the tank's constants function writes them (0x5e21a0 rain, 0x5dffc0 snow)
+    float4 mode;     // x 0 rain / 1 snow
+    float4 uv;       // atlas rect of the tank (u0, v0, du, dv)
+};
+
+struct TankOut {
+    float4 position [[position]];
+    float4 diffuse;
+    float2 uv;
+    float viewZ;
+};
+
+float3 mapTankCoordinate(float3 position, float3 tankPosition, float tankScale) {
+    const float3 p = position - tankPosition / tankScale;  // (sic: the shader divides only the tank position)
+    const float3 sp = sign(p);
+    return (fmod(p + sp, 2.0) - sp) * tankScale + tankPosition;
+}
+
+vertex TankOut vsTank(uint vid [[vertex_id]], uint iid [[instance_id]], const device float4* drops [[buffer(0)]],
+                      constant FrameUniforms& f [[buffer(1)]], constant TankParams& t [[buffer(2)]]) {
+    const float4 d = drops[iid];
+    const float2 corner = float2(vid & 1, vid >> 1) * 2.0 - 1.0;
+    const float3 fwd = cross(f.camUp.xyz, f.camRight.xyz);
+    TankOut o;
+    float3 world;
+    if (t.mode.x < 0.5) {  // vh_rain
+        const float4 RainColor = t.user[0];
+        const float3 Speed = t.user[1].xyz;
+        const float TankScale = t.user[1].w;
+        const float WidthFar = t.user[2].x, WidthNear = t.user[2].y, Height = t.user[2].z, Individual = t.user[2].w;
+        const float AlphaNear = t.user[3].x, AlphaFar = t.user[3].y;
+        const float3 position = mapTankCoordinate(d.xyz + t.user[5].xyz, t.user[4].xyz, TankScale);
+        const float speedz = fract(d.w), speedx = d.w / 1000.0;
+        const float2 individual = float2(speedx - 0.5, speedz - 0.5) * 2.0;
+        const float2 xz = (Speed.xz + individual * Individual) * -corner.y;
+        world = float3(position.x + xz.x, position.y + Height * corner.y, position.z + xz.y);
+        const float depth = abs(dot(world - f.eye.xyz, fwd) / TankScale);
+        world += f.camRight.xyz * (mix(WidthNear, WidthFar, depth) * corner.x);  // view-space x
+        o.diffuse = float4(RainColor.rgb, mix(AlphaNear, AlphaFar, depth));
+        // u: the quad's two corner columns are the drop's own quarter column of the atlas rect (0x5e2490)
+        const float col = floor(fract(d.w * 7.31) * 4.0);
+        const float u = t.uv.x + col * t.uv.z * 0.25 + t.uv.z * 0.0625 + (corner.x > 0.0 ? t.uv.z * 0.125 : 0.0);
+        o.uv = float2(u, corner.y > 0.0 ? t.uv.y : t.uv.y + t.uv.w);
+    } else {  // vh_snow
+        const float4 SnowColor = float4(t.user[0].rgb, 0.3);
+        const float3 Speed = t.user[1].xyz * 0.6;
+        const float TankScale = t.user[1].w;
+        const float ParticleScale = t.user[2].x, WaveAmplitude = t.user[2].y, WaveFrequency = t.user[2].z;
+        const float scaleRatio = t.user[3].x;
+        const float3 current = d.xyz + Speed;
+        float3 position = mapTankCoordinate(current, t.user[4].xyz, TankScale);
+        const float angle = WaveFrequency * length(current) + WaveFrequency * d.w;
+        const float s = sin(angle), c = cos(angle);
+        position += WaveAmplitude * float3(c - s, s - c, s + c);
+        const float depth = abs(dot(position - f.eye.xyz, fwd) / TankScale);
+        const float scale = ParticleScale * (1.0 + scaleRatio * depth);
+        world = position + (f.camRight.xyz * corner.x + f.camUp.xyz * corner.y) * scale;
+        o.diffuse = SnowColor;
+        o.uv = float2(corner.x < 0.0 ? t.uv.x : t.uv.x + t.uv.z, corner.y > 0.0 ? t.uv.y : t.uv.y + t.uv.w);
+    }
+    o.position = f.viewProj * float4(world, 1.0);
+    o.viewZ = dot(world - f.eye.xyz, fwd);
+    return o;
+}
+
+// ph_sfxBase: rgb = vcol x tex x 2, a = vcol.a x tex.a, clip at 0.01; hidden behind the scene (resolved depth).
+fragment float4 fsTank(TankOut in [[stage_in]], depth2d<float> depth [[texture(0)]], texture2d<float> atlas [[texture(1)]],
+                       constant FrameUniforms& f [[buffer(1)]]) {
+    constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    const float4 tex = atlas.sample(smp, in.uv);
+    float4 c = float4(in.diffuse.rgb * tex.rgb * 2.0, in.diffuse.a * tex.a);
+    if (c.a < 0.01) discard_fragment();
+    const float d = depth.read(uint2(in.position.xy));
+    const float scene = f.fog.z * f.fog.w / (d + f.fog.w);
+    if (in.viewZ > scene) discard_fragment();
+    return float4(c.rgb, saturate(c.a));
 }
 
 // ---- FUEL's HDR post chain (fx.phl; p26-work/post.md P3): 128 x 128 scene shrink, log luminance,
@@ -1185,6 +1316,10 @@ kernel void kRenderCheck(constant FrameUniforms& f [[buffer(0)]], const device f
             const float3 x = a.xyz;
             const float3 P = x + x * x + x * x * x + x * x * x * x;
             r0 = float4(P / (1.0 + P), 0);
+            break;
+        }
+        case 4: {  // sfx.h GetParameterValue(P, t): P = b, c, d at t = a.x, a.y, a.z (hundred = 100)
+            r0 = float4(sfxParameter(b, a.x, 100.0), sfxParameter(c, a.y, 100.0), sfxParameter(d, a.z, 100.0), 0.0);
             break;
         }
         case 3: {  // the sky along a.xyz
@@ -1541,7 +1676,8 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         if (ps == nil) [NSException raise:@"pipeline" format:@"%@", e];
         return ps;
     };
-    dustPipeline_ = makePost(@"vsDust", @"fsDust", kRenderColorFormat, 1);
+    dustPipeline_ = makePost(@"vsSfx", @"fsSfx", kRenderColorFormat, 1);
+    tankPipeline_ = makePost(@"vsTank", @"fsTank", kRenderColorFormat, 1);
     shrinkPipeline_ = makePost(@"vsFull", @"fsShrink", kRenderColorFormat, 0);
     lumLogPipeline_ = makePost(@"vsFull", @"fsLumLog", MTLPixelFormatR32Float, 0);
     lumAvgPipeline_ = makePost(@"vsFull", @"fsLumAvg", MTLPixelFormatR32Float, 0);
@@ -1573,6 +1709,13 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
     // the clock scale PP371 from pp001.tsc.
     if (!engineSettingsRead_) {
         engineSettingsRead_ = true;
+        loadSfxAtlas(world);
+        {
+            std::string err;
+            auto atlas = sfx::replayAtlas(engineExePath(world), &err);
+            if (!atlas.empty()) sfxTables_ = std::make_shared<const std::vector<sfx::AtlasEntry>>(std::move(atlas));
+        }
+        weatherFields_ = weatherFieldsFor(world);
         const std::string exe = engineExePath(world);
         readEngineRenderSettings(exe.c_str(), postDefaults_, shadowSettings_);
         const std::filesystem::path pp = std::filesystem::path(world.path()).parent_path().parent_path().parent_path() / "CommonComponent" /
@@ -2223,6 +2366,12 @@ void MeshRenderer::fillAtmosphere(FrameUniforms& fu, simd_float3 eye, const simd
     AtmosphereInput in;
     in.timeOfDay = timeOfDay();
     in.weather = weather;
+    // FUEL's weather at the camera (WeatherManager_G 0x5b89e0 -> apply 0x5bba30 -> hook 0x6409d0), unless --weather.
+    if (weatherFromWorld && weatherFields_ && weatherFields_->valid()) {
+        weatherNow_ = weatherFields_->sample(eye.x, eye.y, eye.z);
+        const Weather h = weatherHook(weatherNow_);
+        in.weather.cloud = h.cloud, in.weather.fog = h.fog, in.weather.wet = h.wet;
+    }
     in.brightness = brightness;
     in.camera = {eye.x, eye.y, eye.z};
     atmo_ = computeAtmosphere(in);
@@ -2712,7 +2861,7 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
     frameCb_ = nil;
     frameRp_ = nil;
 
-    if (lastFrame_ && !dust_.empty()) encodeDust(cb);
+    if (lastFrame_) encodeDust(cb);
     encodePost(cb, target);
     ++frame_;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
@@ -2731,15 +2880,30 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
 }
 
 void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
-    // Back to front from the camera, for alpha blending.
+    if (sfxAtlas_ == nil) return;
+    encodeTanks(cb);
+    if (dust_.sprites.empty()) return;
+    // Back to front from the camera (FUEL sorts its 32-particle buckets by depth, 0x5fee80; the port sorts sprites).
     const simd_float3 eye = lastFrame_->eye.xyz;
+    const std::vector<SfxSprite>& sp = dust_.sprites;
     std::vector<std::pair<float, uint32_t>> order;
-    order.reserve(dust_.size());
-    for (uint32_t i = 0; i < dust_.size(); ++i) order.emplace_back(-simd_distance_squared(dust_[i].position.xyz, eye), i);
+    order.reserve(sp.size());
+    for (uint32_t i = 0; i < sp.size(); ++i) {
+        simd_float3 p = sp[i].posAngle.xyz;
+        if (sp[i].life.z > 0.5f) {
+            const float t = dust_.clock - sp[i].life.x;
+            p += t * sp[i].vel.xyz + 0.5f * t * t * sp[i].acc.xyz;
+        }
+        order.emplace_back(-simd_distance_squared(p, eye), i);
+    }
     std::sort(order.begin(), order.end());
-    id<MTLBuffer> buf = [device_ newBufferWithLength:order.size() * sizeof(DustParticle) options:MTLResourceStorageModeShared];
-    auto* out = static_cast<DustParticle*>(buf.contents);
-    for (size_t k = 0; k < order.size(); ++k) out[k] = dust_[order[k].second];
+    id<MTLBuffer> buf = [device_ newBufferWithLength:order.size() * sizeof(SfxSprite) options:MTLResourceStorageModeShared];
+    auto* out = static_cast<SfxSprite*>(buf.contents);
+    for (size_t k = 0; k < order.size(); ++k) out[k] = sp[order[k].second];
+    struct {
+        simd_float4 user0, user1, user2;
+    } params = {simd_make_float4(dust_.clock, 100.0f, 0, 0), simd_make_float4(dust_.fadeTo, dust_.fadeOut, 0.01f, 0),
+                simd_make_float4(0.8f, 0.1f, std::getenv("FUEL_SFX_DEBUG") && std::atoi(std::getenv("FUEL_SFX_DEBUG")) == 2 ? 1.0f : 0.0f, 0)};  // 0x5f6550
 
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = hdr_;
@@ -2749,10 +2913,149 @@ void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     [enc setRenderPipelineState:dustPipeline_];
     [enc setVertexBuffer:buf offset:0 atIndex:0];
     [enc setVertexBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setVertexBytes:&params length:sizeof params atIndex:2];
+    [enc setVertexTexture:shadowMap_ atIndex:0];
     [enc setFragmentBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
     [enc setFragmentTexture:depth_ atIndex:0];
+    [enc setFragmentTexture:sfxAtlas_ atIndex:1];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:order.size()];
     [enc endEncoding];
+}
+
+// FUEL's rain and snow tanks (SpecialEffectsRainTank_G 0x5e1920 / SnowTank_G 0x5dfbd0, started by the weather apply
+// 0x5bba30 with 1024 x 12 rain drops and 12000 flakes; drawn count = floor(amount x N) 0x5de850).
+void MeshRenderer::encodeTanks(id<MTLCommandBuffer> cb) {
+    const WeatherAmounts& w = weatherNow_;
+    if (std::getenv("FUEL_SFX_DEBUG") && frame_ % 30 == 0)
+        std::fprintf(stderr, "weather at camera: cloud %.2f rain %.2f snow %.2f fog %.2f wind %.1f\n", w.cloud, w.rain, w.snow, w.fog, w.windSpeed);
+    if (!weatherFields_ || (w.rain <= 0 && w.snow <= 0)) {
+        tankClock_ = std::chrono::steady_clock::now(), haveTankClock_ = false;
+        return;
+    }
+    auto P = [&](int n) { return weatherFields_->P(n); };
+    const auto now = std::chrono::steady_clock::now();
+    float dt = haveTankClock_ ? std::min(0.25f, std::chrono::duration<float>(now - tankClock_).count()) : 0.0f;
+    if (exposureDt >= 0) dt = exposureDt;
+    tankClock_ = now, haveTankClock_ = true;
+    const simd_float3 eye = lastFrame_->eye.xyz;
+    const simd_float3 fwd = simd_cross(lastFrame_->camUp.xyz, lastFrame_->camRight.xyz);
+    // Rain velocity (0x5e1fc0): the player's velocity smoothed 0.25 per frame, x PP5043, + 0.3 wind, at most PP5042.
+    // Port: the camera's velocity stands in for the player vehicle's (it follows it), no wind vector (U).
+    simd_float3 v = haveTankEye_ && dt > 0 ? (eye - tankEye_) / dt : simd_make_float3(0, 0, 0);
+    if (simd_length(v) > 200.0f) v = 0;
+    tankEye_ = eye, haveTankEye_ = true;
+    rainSmooth_ += (v - rainSmooth_) * 0.25f;
+    simd_float3 rv = rainSmooth_ * P(5043);
+    const float rl = simd_length(rv);
+    if (P(5042) < rl) rv *= P(5042) / rl;
+    const simd_float3 half = simd_make_float3(rv.x * 0.5f, rv.y + P(5058), rv.z * 0.5f);  // +0xb4..+0xbc (0x5e1cb0)
+    rainShift_ += half * dt;
+    // Snow drift (0x5e0240): 0.5 wind + a fall of lerp(PP5027, PP5026, drawn / N).
+    const int rainN = 1024 * 12, snowN = 12000;
+    const int rainDrawn = int(std::floor(w.rain * float(rainN))), snowDrawn = int(std::floor(w.snow * float(snowN)));
+    snowShift_ += simd_make_float3(0, P(5027) + (P(5026) - P(5027)) * (float(snowDrawn) / float(snowN)), 0) * dt;
+    auto ensure = [&](__strong id<MTLBuffer>& buf, int n, bool rain) {
+        if (buf != nil) return;
+        std::vector<simd_float4> d(static_cast<size_t>(n));
+        uint32_t r = rain ? 0x2545f491u : 0x9e3779b9u;  // port RNG (FUEL fills the buffer with rand 0x6460f0)
+        auto u = [&]() {
+            r ^= r << 13, r ^= r >> 17, r ^= r << 5;
+            return float(r >> 8) / 16777216.0f;
+        };
+        for (auto& q : d) {
+            q.x = u() * 2 - 1, q.y = u() * 2 - 1, q.z = u() * 2 - 1;
+            q.w = rain ? float(int(u() * 1000.0f) + 1) + u() : u();  // vh_rain: x speed = w / 1000, z speed = frac(w)
+        }
+        buf = [device_ newBufferWithBytes:d.data() length:d.size() * sizeof(simd_float4) options:MTLResourceStorageModeShared];
+    };
+    struct TankParams {
+        simd_float4 user[8];
+        simd_float4 mode, uv;
+    };
+    auto atlasRect = [&](int i) {
+        if (!sfxTables_ || size_t(i) >= sfxTables_->size()) return simd_make_float4(0, 0, 1, 1);
+        const auto& e = (*sfxTables_)[size_t(i)];
+        return simd_make_float4(e.u0, e.v0, e.du, e.dv);
+    };
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = hdr_;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:tankPipeline_];
+    [enc setVertexBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentTexture:depth_ atIndex:0];
+    [enc setFragmentTexture:sfxAtlas_ atIndex:1];
+    if (rainDrawn > 0) {  // 0x5e21a0
+        ensure(rainDrops_, rainN, true);
+        TankParams t{};
+        t.user[0] = simd_make_float4(P(5040), P(5040), P(5040), 0);
+        t.user[1] = simd_make_float4(rv.x, rv.y + P(5058), rv.z, 30.0f);  // tank scale .rdata 0x9dbf90 (30)
+        t.user[2] = simd_make_float4(P(5044), P(5045), P(5046), 0.3f);
+        t.user[3] = simd_make_float4(P(5047), P(5048), P(5048), P(5048));
+        // Centre: camera + camera rotation x (0.5 vx, 0.5 (vy + PP5058), 0.5 vz + PP5049) (tank +0x38 = PP5049).
+        const simd_float3 local = simd_make_float3(half.x, half.y * 0.5f, half.z + P(5049));
+        t.user[4] = simd_make_float4(eye + lastFrame_->camRight.xyz * local.x + lastFrame_->camUp.xyz * local.y + fwd * local.z, 0);
+        t.user[5] = simd_make_float4(rainShift_, 1);
+        t.mode = simd_make_float4(0, 0, 0, 0);
+        t.uv = atlasRect(50);  // the splash tank's rain sub-tank: atlas 0x32
+        [enc setVertexBuffer:rainDrops_ offset:0 atIndex:0];
+        [enc setVertexBytes:&t length:sizeof t atIndex:2];
+        [enc setFragmentBytes:&t length:sizeof t atIndex:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:NSUInteger(rainDrawn)];
+    }
+    if (snowDrawn > 0) {  // 0x5dffc0
+        ensure(snowDrops_, snowN, false);
+        TankParams t{};
+        const float scale = P(5009);  // snow tank +0x38
+        t.user[0] = simd_make_float4(P(5001), P(5001), P(5001), P(5004));
+        t.user[1] = simd_make_float4(snowShift_, scale);
+        t.user[2] = simd_make_float4(P(5005), P(5006), P(5007), P(5008));
+        t.user[3] = simd_make_float4(P(5002), 0, 0, 0);
+        t.user[4] = simd_make_float4(eye + fwd * scale, 0);
+        t.mode = simd_make_float4(1, 0, 0, 0);
+        t.uv = atlasRect(49);  // 0x31
+        [enc setVertexBuffer:snowDrops_ offset:0 atIndex:0];
+        [enc setVertexBytes:&t length:sizeof t atIndex:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:NSUInteger(snowDrawn)];
+    }
+    [enc endEncoding];
+}
+
+void MeshRenderer::loadSfxAtlas(const DpcFile& world) {
+    // FX_ATLAS_0: MaterialAnim_Z (link = name CRC) in DATAS/SHARED.DPC -> body + 0x3c Material_Z -> slot 0 bitmap.
+    namespace fs = std::filesystem;
+    const fs::path shared = fs::path(world.path()).parent_path().parent_path() / "DATAS" / "SHARED.DPC";
+    try {
+        if (!fs::exists(shared)) return;
+        sfxShared_ = std::make_unique<DpcFile>(shared.string());
+        const DpcFile& d = *sfxShared_;
+        const uint32_t want = asoboCrc("FX_ATLAS_0");
+        for (uint32_t id : d.ids(cls::MaterialAnim)) {
+            const DpcFile::Entry* e = d.find(id);
+            const std::vector<uint8_t> link = d.link(*e);
+            uint32_t name = 0;
+            if (link.size() >= 4) std::memcpy(&name, link.data(), 4);
+            if (name != want) continue;
+            const auto body = d.body(*e);
+            if (!body || body->size() < 0x40) return;
+            uint32_t matId;
+            std::memcpy(&matId, body->data() + 0x3c, 4);
+            const DpcFile::Entry* me = d.find(matId);
+            if (!me) return;
+            const Material mat = parseMaterialBody(d.body(*me).value());
+            const DpcFile::Entry* be = d.find(mat.textures[0]);
+            if (!be) return;
+            uint8_t alphaKind = 0;
+            sfxAtlas_ = uploadBitmap(d, *be, false, &alphaKind);
+            if (std::getenv("FUEL_SFX_DEBUG"))
+                std::fprintf(stderr, "sfx atlas: material %08x bitmap %08x -> %s\n", matId, mat.textures[0], sfxAtlas_ ? "loaded" : "failed");
+            return;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fuelview: no FX atlas: %s\n", e.what());
+    }
 }
 
 // FUEL's HDR chain (post.md P3 / P6), with the per-frame exposure, bloom scale and blue shift of

@@ -14,6 +14,8 @@
 #include <simd/simd.h>
 
 #include "core/atmosphere.hpp"
+#include "core/weather.hpp"
+#include "core/sfx.hpp"
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
 #include "core/ground.hpp"
@@ -89,11 +91,24 @@ inline constexpr MTLPixelFormat kRenderColorFormat = MTLPixelFormatRGBA16Float;
 inline constexpr MTLPixelFormat kRenderDepthFormat = MTLPixelFormatDepth32Float;
 inline constexpr MTLPixelFormat kOutputColorFormat = MTLPixelFormatBGRA8Unorm_sRGB;
 
-// One dust particle, a soft sprite facing the camera.
-struct DustParticle {
-    simd_float4 position;  // xyz, w radius in metres
-    simd_float4 colour;    // albedo (linear; the renderer takes it to gamma space), a opacity
-    simd_float4 extra;     // x rotation (radians), y noise seed 0..1
+// One effects billboard (core/sfx.hpp Particle) for FUEL's billboard_soft shaders (sfx.vhl/phl):
+// GPU-animated ones (SubCode 0xe, vh_bboard_soft_static) carry their spawn state, CPU ones (0xb,
+// vh_billboard_soft) their current position, alpha and size. 128 bytes, matches the shader.
+struct SfxSprite {
+    simd_float4 posAngle;  // start (GPU) or current (CPU) position, w = angle (radians)
+    simd_float4 uv;        // u at the -x corners, v top, u at the +x corners, v bottom (FX atlas)
+    simd_float4 colour;    // vertex rgb (gamma, as the game stores it), a = vertex alpha
+    simd_float4 vel;       // xyz velocity (GPU), w = corner offset in metres (the quad spans +-w)
+    simd_float4 acc;       // xyz acceleration (GPU), w = rotation speed (GPU)
+    simd_float4 life;      // x spawn time (FX clock), y life, z = 1 GPU-animated / 0 CPU
+    simd_float4 alphaP;    // GetParameterValue packs of the alpha and size codes (0x5fab60), GPU
+    simd_float4 scaleP;
+};
+// The effects of one frame: sprites, the FX clock (C_USER0.x) and the camera fade (C_USER1.xy = PP5530, 5531).
+struct SfxFrame {
+    std::vector<SfxSprite> sprites;
+    float clock = 0;
+    float fadeTo = 2.0f, fadeOut = 1.25f;
 };
 
 struct FrameUniforms;  // renderer.mm
@@ -161,8 +176,10 @@ public:
     void setGround(const GroundMaps& maps, const DpcFile& world);
     bool showTerrain = true;
 
-    // Dust drawn with the next frames (replaces the earlier list).
-    void setDust(const std::vector<DustParticle>& particles) { dust_ = particles; }
+    // FUEL's wheel effects drawn with the next frames (replaces the earlier list).
+    void setDust(const SfxFrame& frame) { dust_ = frame; }
+    // The FX atlas texture (FX_ATLAS_0 of DATAS/SHARED.DPC); setGround loads it next to the world.
+    bool sfxAtlasLoaded() const { return sfxAtlas_ != nil; }
     // Speed effects for this frame, 0..1: FUEL's radial blur (ph_motionblur) at speedBlur x speedBlurMax
     // (viewport +0x1dc = VehiclePP 574 x the speed fraction; 0.015 for most vehicles).
     float speedBlur = 0;
@@ -176,7 +193,9 @@ public:
     bool timeFromCommandLine = false;  // --time given: capture spots keep it
     double gameClock = -1;         // elapsed game seconds; < 0: wall time since the renderer started
     float clockScale = 96.0f;      // PP371, read from pp001.tsc by setGround when present
-    Weather weather;               // clear and dry unless set (the port has no weather fields yet)
+    Weather weather;               // --weather: fixed inputs of the atmosphere hook 0x6409d0
+    bool weatherFromWorld = true;  // the world's weather fields at the camera (core/weather.hpp) replace `weather`
+    const WeatherAmounts& weatherAmounts() const { return weatherNow_; }  // of the last frame
     float brightness = 1.0f;       // the Brightness option (0.5..2), default 1 (U2)
     // Seconds the auto exposure adapts over in the next frame (< 0: wall time since the last frame).
     float exposureDt = -1;
@@ -241,6 +260,13 @@ private:
     void encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam);
     void ensureTargets(NSUInteger width, NSUInteger height);
     void encodeDust(id<MTLCommandBuffer> cb);
+    void encodeTanks(id<MTLCommandBuffer> cb);  // rain / snow (weather tanks)
+    id<MTLRenderPipelineState> tankPipeline_;
+    id<MTLBuffer> rainDrops_ = nil, snowDrops_ = nil;
+    simd_float3 rainSmooth_ = {0, 0, 0}, rainShift_ = {0, 0, 0}, snowShift_ = {0, 0, 0}, tankEye_ = {0, 0, 0};
+    bool haveTankEye_ = false, haveTankClock_ = false;
+    std::chrono::steady_clock::time_point tankClock_;
+    std::shared_ptr<const std::vector<sfx::AtlasEntry>> sfxTables_;  // the FX atlas (0x8e6ae0 replay)
     void encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target);
     // ---- Grass tufts (p14)
     void createGrassPipeline();
@@ -409,7 +435,12 @@ private:
     id<MTLTexture> postFx_;                       // tone-mapped frame before the radial blur
     id<MTLRenderPipelineState> dustPipeline_, shrinkPipeline_, lumLogPipeline_, lumAvgPipeline_, adaptPipeline_, brightPipeline_,
         gaussPipeline_, toneMapPipeline_, toneMapFxPipeline_, radialPipeline_;
-    std::vector<DustParticle> dust_;
+    SfxFrame dust_;
+    id<MTLTexture> sfxAtlas_ = nil;
+    std::unique_ptr<DpcFile> sfxShared_;
+    std::shared_ptr<const WeatherFields> weatherFields_;
+    WeatherAmounts weatherNow_;
+    void loadSfxAtlas(const DpcFile& world);
     std::shared_ptr<FrameUniforms> lastFrame_;  // the uniforms of the last encode, for dust and the post pass
     std::atomic<double> gpuMs_{0};
     uint32_t frame_ = 0;

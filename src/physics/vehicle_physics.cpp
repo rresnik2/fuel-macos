@@ -978,6 +978,25 @@ VehicleState DriveWorld::state(int i) const {
             skid += wheelSkid;
         }
         st.wheelSkid.push_back(wheelSkid);
+        {
+            VehicleState::WheelFx fx;
+            const float r = m.wheelRadius(w);
+            const Vec3 up = rot * Vec3::sAxisY(), fwdW = rot * Vec3::sAxisZ();
+            const RVec3 c = wp - RVec3(up * r);
+            fx.contact = {double(c.GetX()), double(c.GetY()), double(c.GetZ())};
+            const RVec3 hubW = pos + rot * Vec3(sw.hub[0], sw.hub[1], sw.hub[2]);
+            const fv::Vec3 pv = m.pointVelocity({float(hubW.GetX() - impl_->ox), float(hubW.GetY()), float(hubW.GetZ() - impl_->oz)});
+            fx.velocity = {pv.x, pv.y, pv.z};
+            fx.forward = {fwdW.GetX(), fwdW.GetY(), fwdW.GetZ()};
+            fx.radius = r;
+            fx.spin = m.rimSpeed(w) / std::max(r, 0.01f);
+            fx.load = m.wheelLoad(w);
+            fx.slip = fx.load > 0.01f ? std::max(0.0f, m.wheelSlipRatio(w)) : 0.0f;
+            fx.depth = m.waterDepth(w);
+            const auto& cf = m.classFractions(w);
+            for (size_t k = 0; k < fx.classes.size() && k < cf.size(); ++k) fx.classes[k] = cf[k];
+            st.wheelFx.push_back(fx);
+        }
     }
     st.speedKmh = m.forwardSpeed() * 3.6f;
     st.rpm = m.displayRpm();  // the smoothed rpm FUEL exports for the sound (+0x1280)

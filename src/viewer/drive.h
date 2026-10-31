@@ -9,8 +9,10 @@
 #include "core/world.hpp"
 #include "physics/fuel_camera.hpp"
 #include "physics/vehicle_physics.hpp"
+#include "core/sfx.hpp"
 #include "renderer.h"
 
+#include <functional>
 #include <future>
 #include <memory>
 #include <unordered_map>
@@ -125,24 +127,21 @@ private:
     bool havePrev_ = false;
 };
 
-// Dust thrown up by the wheels: billowing particles, more on loose ground and
-// when the tyres slide or spin, for every vehicle near the camera.
+// FUEL's wheel effects (core/sfx.hpp: SpecialEffectsWheelEmitter_G per wheel, fed like 0x5ceb60) for every
+// vehicle near the camera: dust, stones, mud/water projections and tyre smoke, drawn by the renderer's
+// billboard_soft pass. Tuning from pp001.tsc and FUEL.exe (setDataDir).
 class DustSystem {
 public:
+    // The FUEL install (CommonComponent/ and XFinalComponent/ below it); without it nothing is emitted.
+    static void setDataDir(const std::string& dir);
+    // FUEL's point colour of the ground at (x, z), rgba 0..1 (0x6b76a0 colour; the viewer's ground map).
+    static std::function<std::array<float, 4>(double x, double z)> groundColour;
     void update(float dt, const DriveSession& drive, simd_float3 eye);
-    const std::vector<fuel::DustParticle>& particles() const { return drawn_; }
+    const fuel::SfxFrame& particles() const { return frame_; }
 
 private:
-    struct Particle {
-        simd_float3 position, velocity, colour;
-        float age, life, size, grow, rotation, spin, opacity, seed;
-    };
-    std::vector<Particle> particles_;
-    std::vector<fuel::DustParticle> drawn_;
-    std::vector<simd_float3> lastChassis_;  // per vehicle, for its velocity
-    std::vector<float> carry_;              // per vehicle and wheel: fractional particles owed
-    uint32_t rng_ = 0x9e3779b9u;
-    float random();                         // 0..1
+    std::unique_ptr<fuel::sfx::System> sys_;
+    fuel::SfxFrame frame_;
 };
 
 // Streams the static world around the player: every object the sub-worlds

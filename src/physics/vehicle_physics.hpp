@@ -84,6 +84,20 @@ struct VehicleState {
     // contact in m/s (0 = no contact) and the largest normal speed of a new impact this step.
     float scrapeSpeed = 0;
     float impactSpeed = 0;
+    // What FUEL's wheel effects read per wheel (p30; the vehicle feed 0x5ceb60 into
+    // SpecialEffectsWheelEmitter_G), same order as `wheels`.
+    struct WheelFx {
+        std::array<double, 3> contact{};  // world: hub - body up x radius
+        std::array<float, 3> velocity{};  // world velocity of the hub point (0x5cc370)
+        std::array<float, 3> forward{};   // world: the wheel's rolling direction (body forward)
+        float spin = 0;                   // rim / radius, rad/s (emitter +0xe0 = -(veh+0x15b8+4w))
+        float radius = 0;
+        float load = 0;                   // suspension compression (veh+0x15e8+4w)
+        float slip = 0;                   // 0x5da710: the slip ratio 0x523c50 while loaded (> 0.01)
+        float depth = 0;                  // water / soft depth (veh+0x1990+4w)
+        std::array<float, 18> classes{};  // ground-class fractions (veh+0x10a8+0x48w)
+    };
+    std::vector<WheelFx> wheelFx;
 };
 
 struct PropPose {

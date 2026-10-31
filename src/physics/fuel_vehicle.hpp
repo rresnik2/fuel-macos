@@ -135,6 +135,13 @@ public:
     const GroundBlock& ground(int w) const { return C_[size_t(w)]; }
     float wheelLoad(int w) const { return wheels_[size_t(w)].load; }
     float wheelUtil(int w) const;
+    // ---- read-outs for the wheel effects (p30, SpecialEffectsWheelEmitter_G feed 0x5ceb60) ----
+    float rimSpeed(int w) const { return body_.S.auxVel[1 + w]; }  // m/s (aux state, +0x15b8 = -rim/r is the engine's export)
+    float wheelRadius(int w) const { return wheelR(w); }            // P49 front / P50 rear
+    float wheelSlipRatio(int w) const { return slipRatio(w); }      // 0x523c50 (1e5 when unloaded)
+    const std::array<float, kGroundClasses>& classFractions(int w) const { return frac_[size_t(w)]; }  // veh+0x10a8+0x48w
+    float waterDepth(int w) const { return waterDepth_[size_t(w)]; }                                    // veh+0x1990+4w
+    Vec3 pointVelocity(const Vec3& p) const { return body_.pointVel(p); }                              // 0x5cc370 (world)
     float param(int n) const { return n > 0 && size_t(n) < P_.size() ? P_[size_t(n)] : 0.0f; }
     // Wheel hub in model space (sphere centre of the proxy).
     Vec3 hubModel(int w) const { return wheels_[size_t(w)].hubL + com_; }

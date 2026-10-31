@@ -44,6 +44,8 @@ add_library(fuelcore STATIC
   src/core/rider_anim.cpp
   src/core/settings.cpp
   src/core/atmosphere.cpp
+  src/core/sfx.cpp
+  src/core/weather.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 
