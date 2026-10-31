@@ -28,7 +28,7 @@ std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t co
 uint32_t genWorldSeed(const DpcFile& world);
 
 // FUEL's position hash: the permutation entry at
-// round(x * 12.317513 + z * 10.193578) & 255.
+// floor(x * 12.317513 + z * 10.193578) & 255 (fistp in the game's round-down FPU mode).
 uint8_t positionHash(const Permutation& p, double x, double z);
 
 // Midpoint-displacement fractal (value noise with `levels` subdivisions of a
