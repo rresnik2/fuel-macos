@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "core/atmosphere.hpp"
+#include "core/sfx.hpp"
 #import "renderer.h"
 
 #include <algorithm>
@@ -319,6 +320,85 @@ int runRenderCheck(const std::string& dataDir) {
                     scattering(b, e, {e[0] + d[0] * t2, e[1] + d[1] * t2, e[2] + d[2] * t2}, ext, insc);
                     std::snprintf(name, sizeof name, "%s GPU sky along direction %d", when, k);
                     check3(name, {out[size_t(12 + k * 2)].x, out[size_t(12 + k * 2)].y, out[size_t(12 + k * 2)].z}, insc, 2e-3f);
+                }
+            }
+        }
+    }
+
+    // ---- Effects (p30-effects.md): values from FUEL.exe run under Ghidra's emulator (notes/p30-work/v1.cmd, v2.cmd)
+    std::printf("Effects: RNG, fade codes, fades, HSV, FX atlas (emulated FUEL.exe)\n");
+    {
+        namespace fs = std::filesystem;
+        const std::string exe = (fs::path(dataDir) / "XFinalComponent" / "FUEL.exe").string();
+        const sfx::Tables t = sfx::loadTables(exe, (fs::path(dataDir) / "CommonComponent" / "Param" / "pp001.tsc").string());
+        if (!t.ok) {
+            std::printf("  FAIL effect tables: %s\n", t.error.c_str());
+            ++gFail;
+        } else {
+            sfx::Well512 rng(t.wellSeed);
+            const uint32_t want[4] = {0x873a6bffu, 0xc0d9f1a8u, 0xbd6c6829u, 0x8b452b40u};  // 0x5fd710 x4 from the shipped state
+            bool ok = true;
+            uint32_t got[4];
+            for (int i = 0; i < 4; ++i) got[i] = rng.next(), ok = ok && got[i] == want[i];
+            ++(ok ? gPass : gFail);
+            std::printf("  %-4s %-58s got %08x %08x %08x %08x\n", ok ? "ok" : "FAIL", "WELL512 0x5fd710 first four outputs", got[0], got[1], got[2],
+                        got[3]);
+            const struct { uint16_t code; F4 want; } codes[] = {
+                {0x301, {0.01f, 0, 0.01f, 200}}, {0x403, {0, 0.01f, 0, 50}}, {0x101, {0.01f, 0, 0.01f, 100}}, {0xa02, {0, 100, 0, 400}}};
+            for (const auto& c : codes) {
+                char name[96];
+                std::snprintf(name, sizeof name, "fade code 0x%03x -> GPU parameter (0x5fab60)", c.code);
+                const auto p = sfx::codeParams(c.code);
+                check4(name, {p[0], p[1], p[2], p[3]}, c.want, 1e-6f);
+            }
+            const float f[5] = {sfx::fadeValue(sfx::Fade::LogPuff, 0.5f, 2), sfx::fadeValue(sfx::Fade::OneMinusTSq, 0.5f, 2),
+                                sfx::fadeValue(sfx::Fade::SqrtQuarter, 0.5f, 2), sfx::fadeValue(sfx::Fade::Quarter, 0.5f, 2),
+                                sfx::fadeValue(sfx::Fade::OneMinusT, 0.5f, 2)};
+            const float fw[5] = {0.998908366f, 0.5625f, 0.661437828f, 0.4375f, 0.75f};
+            check("fades 0x5f47c0 0x5f4810 0x5edad0 0x5d2fd0 0x4beab0 at t .25", f, fw, 5, 1e-6f);
+            // The GPU parameter of each code gives the CPU function (sfx.h GetParameterValue = 0x5fab60 inverse).
+            float cg[6], cw[6];
+            const sfx::Fade fs6[6] = {sfx::Fade::One, sfx::Fade::OneMinusT, sfx::Fade::OneMinusTSq, sfx::Fade::SqrtT, sfx::Fade::Quarter,
+                                      sfx::Fade::SqrtQuarter};
+            for (int i = 0; i < 6; ++i) {
+                cg[i] = sfx::parameterValue(sfx::codeParams(sfx::fadeCode(fs6[i])), 0.3f);
+                cw[i] = sfx::fadeValue(fs6[i], 0.3f, 1);
+            }
+            check("GetParameterValue(code) == CPU fade at t .3 (6 codes)", cg, cw, 6, 1e-5f);
+            const auto hsv = sfx::rgbToHsv({0.6f, 0.5f, 0.35f, 1});
+            check4("rgb -> hsv 0x5f4be0 (0.6, 0.5, 0.35)", {hsv[0], hsv[1], hsv[2], hsv[3]}, {0.6f, 0.4166667f, 0.6f, 1}, 1e-6f);
+            const auto rgb = sfx::hsvToRgb({hsv[0], hsv[1], 0.22f, 1});
+            // Expected from the disassembly (case 0: v, t, p): the emulator's floor/ftol (0x8e04c0 / 0x8e01d0) rounds
+            // 0.6 to 1 because pcode ignores the rounding control, so its (0.2567, 0.22, 0.1283) is case 1.
+            check4("hsv -> rgb 0x5f4a90 (v 0.22)", {rgb[0], rgb[1], rgb[2], rgb[3]}, {0.22f, 0.18333334f, 0.12833333f, 1}, 1e-6f);
+            const bool names = t.atlas[15].material == "FX_PNEU" && t.atlas[42].material == "FX_ATLAS_0" && t.atlas[47].material == "FX_ATLAS_0";
+            ++(names ? gPass : gFail);
+            std::printf("  %-4s %-58s got %s %s %s\n", names ? "ok" : "FAIL", "FX atlas names 15, 42, 47 (0x8e6ae0 replay)", t.atlas[15].material.c_str(),
+                        t.atlas[42].material.c_str(), t.atlas[47].material.c_str());
+            auto rect = [&](int i) { return F4{t.atlas[size_t(i)].u0, t.atlas[size_t(i)].v0, t.atlas[size_t(i)].du, t.atlas[size_t(i)].dv}; };
+            check4("FX atlas entry 15 rect", rect(15), {0, 0, 1, 1}, 1e-7f);
+            check4("FX atlas entry 42 rect", rect(42), {0, 0, 0.5f, 0.5f}, 1e-7f);
+            check4("FX atlas entry 47 rect (wheel dust)", rect(47), {0.5f, 0.75f, 0.25f, 0.25f}, 1e-7f);
+            check4("FX atlas entry 49 rect", rect(49), {0.75f, 0.875f, 0.0625f, 0.0625f}, 1e-7f);
+            // GPU GetParameterValue against the CPU copy.
+            @autoreleasepool {
+                id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                if (device != nil) {
+                    ResourceLibrary lib;
+                    MeshRenderer r(device, 1, lib);
+                    std::vector<simd_float4> in;
+                    auto P = [](uint16_t c) { const auto p = sfx::codeParams(c); return simd_make_float4(p[0], p[1], p[2], p[3]); };
+                    in.insert(in.end(), {simd_make_float4(0.3f, 0.7f, 0.95f, 4), P(0x301), P(0x403), P(0xa02)});
+                    const std::vector<simd_float4> out = r.shaderCheck(at(hm(8, 0)), simd_make_float4(0, 900, 0, 1).xyz, in);
+                    if (out.size() == 2) {
+                        const float gw[3] = {sfx::parameterValue(sfx::codeParams(0x301), 0.3f), sfx::parameterValue(sfx::codeParams(0x403), 0.7f),
+                                             sfx::parameterValue(sfx::codeParams(0xa02), 0.95f)};
+                        const float gg[3] = {out[0].x, out[0].y, out[0].z};
+                        check("GPU GetParameterValue (codes 0x301, 0x403, 0xa02)", gg, gw, 3, 1e-4f);
+                    } else {
+                        std::printf("  FAIL GPU sfx check did not run\n");
+                        ++gFail;
+                    }
                 }
             }
         }

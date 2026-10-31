@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "core/genworld_noise.hpp"
+#include "core/vehicle.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -974,62 +975,109 @@ fragment float4 fsMarker(MarkerOut in [[stage_in]]) {
     return float4(in.color * g, g * 0.7);
 }
 
-// ---- dust: soft camera-facing sprites over the resolved scene ----
+// ---- FUEL's effects billboards (sfx.vhl / sfx.phl, p30-effects.md 2.5): vh_bboard_soft_static (GPU-animated
+// wheel particles, SubCode 0xe) and vh_billboard_soft (CPU particles, 0xb), both lit by scattering() and drawn
+// with ph_billboard_soft over the resolved scene.
 
-struct DustParticle {
-    float4 position;  // xyz, w radius in metres
-    float4 colour;    // linear albedo, a opacity
-    float4 extra;     // x rotation (radians), y noise seed
+struct SfxSprite {
+    float4 posAngle;
+    float4 uv;
+    float4 colour;
+    float4 vel;
+    float4 acc;
+    float4 life;
+    float4 alphaP;
+    float4 scaleP;
 };
 
-struct DustOut {
+struct SfxParams {
+    float4 user0;  // C_USER0: x FX clock, y 100 ("hundred" of GetParameterValue)
+    float4 user1;  // C_USER1: x fade-to-camera distance (PP5530), y fade-out distance (PP5531), z 0.01 collapse
+    float4 user2;  // C_USER2: x 0.8 FastFade frontier, y 0.1 (0x5f6550)
+};
+
+struct SfxOut {
     float4 position [[position]];
     float2 uv;
-    float3 rgb;
-    float alpha;
-    float depth;   // view-space distance of the sprite
-    float radius;
-    float seed;
+    float4 sun;      // (sky + sun saturate(L.y)) * vcol, a = vertex alpha
+    float4 sky;      // sky * vcol
+    float3 insc;
+    float viewZ;
+    float shadow;    // SFX_VERTEX_SHADOWS: the shadow term at the vertex
 };
 
-vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const device DustParticle* ps [[buffer(0)]],
-                      constant FrameUniforms& f [[buffer(1)]]) {
-    const DustParticle p = ps[iid];
-    float2 c = float2(vid & 1, vid >> 1) * 2.0 - 1.0;
-    float s = sin(p.extra.x), k = cos(p.extra.x);
-    float2 r = float2(c.x * k - c.y * s, c.x * s + c.y * k);
-    float3 w = p.position.xyz + (f.camRight.xyz * r.x + f.camUp.xyz * r.y) * p.position.w;
-    DustOut o;
-    o.position = f.viewProj * float4(w, 1.0);
-    o.uv = c;
+// sfx.h GetParameterValue: integer part / 100 and fraction x 100 of each component weight 1, t, sin(pi t),
+// 0.25 + 0.75 t, 0.25 + 0.75 sin(pi t), an inverting lerp and a final power.
+float sfxParameter(float4 P, float life, float hundred) {
+    const float4 lo = fract(P) * hundred;
+    const float4 hi = (P - fract(P)) / hundred;
+    const float sl = sin(life * M_PI_F);
+    float v = hi.x + lo.x * life + hi.y * sl + lo.y * (0.25 + 0.75 * life) + hi.z * (0.25 + 0.75 * sl);
+    v = v + lo.z * ((1.0 - v) - v);
+    return pow(v, hi.w);
+}
+
+vertex SfxOut vsSfx(uint vid [[vertex_id]], uint iid [[instance_id]], const device SfxSprite* ps [[buffer(0)]],
+                    constant FrameUniforms& f [[buffer(1)]], constant SfxParams& u [[buffer(2)]],
+                    depth2d_array<float> shadowMap [[texture(0)]]) {
+    const SfxSprite p = ps[iid];
+    const float2 corner = float2(vid & 1, vid >> 1) * 2.0 - 1.0;  // (-1,-1) (1,-1) (-1,1) (1,1)
+    float3 pos = p.posAngle.xyz;
+    float4 diffuse = p.colour;
+    float angle = p.posAngle.w;
+    float scale = 1.0;
+    float2 vert = corner * p.vel.w;
+    if (p.life.z > 0.5) {  // vh_bboard_soft_static
+        const float dT = u.user0.x - p.life.x;
+        const float life = dT / p.life.y;
+        pos += dT * p.vel.xyz + dT * dT * 0.5 * p.acc.xyz;
+        if (life > 1.0) {
+            diffuse = float4(0.0);
+        } else {
+            const float dist = length(pos - f.eye.xyz);
+            const float alphaCamera = saturate((dist - u.user1.y) / (u.user1.x - u.user1.y));
+            diffuse.a *= sfxParameter(p.alphaP, life, u.user0.y) * alphaCamera;
+            diffuse.a *= 1.0 - saturate((life - u.user2.x) / u.user2.y);  // FastFade
+            angle += dT * p.acc.w;
+            vert = clamp(vert, -2.5, 2.5) * sfxParameter(p.scaleP, life, u.user0.y);
+        }
+    } else {  // vh_billboard_soft
+        const float dist = length(pos - f.eye.xyz);
+        diffuse.a *= saturate((dist - u.user1.y) / (u.user1.x - u.user1.y));
+    }
+    if (diffuse.a > u.user1.z) {
+        const float s = sin(angle), c = cos(angle);
+        const float2 r = float2(vert.x * c - vert.y * s, vert.x * s + vert.y * c);
+        pos += r.x * f.camRight.xyz + r.y * f.camUp.xyz;
+    }
+    SfxOut o;
+    o.position = f.viewProj * float4(pos, 1.0);
+    // Corner -> atlas uv (0x5fac70: -x corners take u0, +x corners u1; the top takes v0).
+    o.uv = float2(corner.x < 0.0 ? p.uv.x : p.uv.z, corner.y > 0.0 ? p.uv.y : p.uv.w);
     const float3 fwd = cross(f.camUp.xyz, f.camRight.xyz);
-    o.depth = dot(p.position.xyz - f.eye.xyz, fwd);
-    o.radius = p.position.w;
-    o.seed = p.extra.y;
-    // Lit like FUEL's billboard_soft (sfx.vhl, p26-work/particles.md 2.5): scattering() at the particle,
-    // lit = (sky + sun x saturate(L.y)) x vcol (the shadowed variant lerps to sky x vcol; port: unshadowed),
-    // + inscatter. The port's dust colours are albedos stored linear: taken to gamma space here.
-    const Scatter sc = fuelScattering(f, p.position.xyz);
-    const float3 vcol = pow(max(p.colour.rgb, 0.0), 1.0 / 2.2) * sc.ext;
-    o.rgb = (f.skyColour.rgb + f.sunColour.rgb * saturate(f.lightDir.y)) * vcol + sc.insc;
-    o.alpha = p.colour.a;
+    o.viewZ = dot(pos - f.eye.xyz, fwd);
+    const Scatter sc = fuelScattering(f, pos);
+    const float3 vcol = diffuse.rgb * 2.0 * sc.ext;
+    o.sun = float4((f.skyColour.rgb + f.sunColour.rgb * saturate(f.lightDir.y)) * vcol, diffuse.a);
+    o.sky = float4(f.skyColour.rgb * vcol, diffuse.a);
+    o.insc = sc.insc;
+    o.shadow = fuelShadow(shadowMap, pos, f);
+    if (u.user2.z > 0.0) o.sun = o.sky = float4(4.0, 0.0, 0.0, 1.0);  // FUEL_SFX_DEBUG=2: solid red sprites
     return o;
 }
 
-fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0)]], constant FrameUniforms& f [[buffer(1)]]) {
-    float r2 = dot(in.uv, in.uv);
-    if (r2 >= 1.0) discard_fragment();
-    // Lumpy edges: a little value noise over the round falloff.
-    float n = valueNoise(in.uv * 2.3 + in.seed * 17.0) * 0.6 + valueNoise(in.uv * 5.1 - in.seed * 9.0) * 0.4;
-    float blob = saturate(pow(1.0 - r2, 1.2) * mix(0.3, 1.7, n));
-    // Soft particles: fade out where the sprite meets the scene, and near the camera.
-    // The resolved depth turns back into a view distance with zn and q (fog.zw).
-    float d = depth.read(uint2(in.position.xy));
-    float scene = f.fog.z * f.fog.w / (d + f.fog.w);
-    // ph_billboard_soft: a *= saturate((sceneViewZ - particleViewZ) x 4); port: also thinned near the camera.
-    float fade = saturate((scene - in.depth) * 4.0) * saturate((in.depth - 0.4) / max(1.2, in.radius * 1.2));
-    float a = saturate(in.alpha * blob * fade);
-    return float4(in.rgb, a);
+fragment float4 fsSfx(SfxOut in [[stage_in]], depth2d<float> depth [[texture(0)]], texture2d<float> atlas [[texture(1)]],
+                      constant FrameUniforms& f [[buffer(1)]]) {
+    constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    float4 c = atlas.sample(smp, in.uv);
+    if (c.a < 0.01) discard_fragment();  // sfxClip
+    c *= mix(in.sky, in.sun, in.shadow);
+    c.rgb += in.insc;
+    // ph_billboard_soft: a *= saturate((sceneViewZ - particleViewZ) * 4); the resolved depth -> view distance.
+    const float d = depth.read(uint2(in.position.xy));
+    const float scene = f.fog.z * f.fog.w / (d + f.fog.w);
+    c.a *= saturate((scene - in.viewZ) * 4.0);
+    return float4(max(c.rgb, 0.0), saturate(c.a));
 }
 
 // ---- FUEL's HDR post chain (fx.phl; p26-work/post.md P3): 128 x 128 scene shrink, log luminance,
@@ -1185,6 +1233,10 @@ kernel void kRenderCheck(constant FrameUniforms& f [[buffer(0)]], const device f
             const float3 x = a.xyz;
             const float3 P = x + x * x + x * x * x + x * x * x * x;
             r0 = float4(P / (1.0 + P), 0);
+            break;
+        }
+        case 4: {  // sfx.h GetParameterValue(P, t): P = b, c, d at t = a.x, a.y, a.z (hundred = 100)
+            r0 = float4(sfxParameter(b, a.x, 100.0), sfxParameter(c, a.y, 100.0), sfxParameter(d, a.z, 100.0), 0.0);
             break;
         }
         case 3: {  // the sky along a.xyz
@@ -1541,7 +1593,7 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         if (ps == nil) [NSException raise:@"pipeline" format:@"%@", e];
         return ps;
     };
-    dustPipeline_ = makePost(@"vsDust", @"fsDust", kRenderColorFormat, 1);
+    dustPipeline_ = makePost(@"vsSfx", @"fsSfx", kRenderColorFormat, 1);
     shrinkPipeline_ = makePost(@"vsFull", @"fsShrink", kRenderColorFormat, 0);
     lumLogPipeline_ = makePost(@"vsFull", @"fsLumLog", MTLPixelFormatR32Float, 0);
     lumAvgPipeline_ = makePost(@"vsFull", @"fsLumAvg", MTLPixelFormatR32Float, 0);
@@ -1573,6 +1625,7 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
     // the clock scale PP371 from pp001.tsc.
     if (!engineSettingsRead_) {
         engineSettingsRead_ = true;
+        loadSfxAtlas(world);
         const std::string exe = engineExePath(world);
         readEngineRenderSettings(exe.c_str(), postDefaults_, shadowSettings_);
         const std::filesystem::path pp = std::filesystem::path(world.path()).parent_path().parent_path().parent_path() / "CommonComponent" /
@@ -2712,7 +2765,7 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
     frameCb_ = nil;
     frameRp_ = nil;
 
-    if (lastFrame_ && !dust_.empty()) encodeDust(cb);
+    if (lastFrame_ && !dust_.sprites.empty()) encodeDust(cb);
     encodePost(cb, target);
     ++frame_;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
@@ -2731,15 +2784,28 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
 }
 
 void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
-    // Back to front from the camera, for alpha blending.
+    if (sfxAtlas_ == nil) return;
+    // Back to front from the camera (FUEL sorts its 32-particle buckets by depth, 0x5fee80; the port sorts sprites).
     const simd_float3 eye = lastFrame_->eye.xyz;
+    const std::vector<SfxSprite>& sp = dust_.sprites;
     std::vector<std::pair<float, uint32_t>> order;
-    order.reserve(dust_.size());
-    for (uint32_t i = 0; i < dust_.size(); ++i) order.emplace_back(-simd_distance_squared(dust_[i].position.xyz, eye), i);
+    order.reserve(sp.size());
+    for (uint32_t i = 0; i < sp.size(); ++i) {
+        simd_float3 p = sp[i].posAngle.xyz;
+        if (sp[i].life.z > 0.5f) {
+            const float t = dust_.clock - sp[i].life.x;
+            p += t * sp[i].vel.xyz + 0.5f * t * t * sp[i].acc.xyz;
+        }
+        order.emplace_back(-simd_distance_squared(p, eye), i);
+    }
     std::sort(order.begin(), order.end());
-    id<MTLBuffer> buf = [device_ newBufferWithLength:order.size() * sizeof(DustParticle) options:MTLResourceStorageModeShared];
-    auto* out = static_cast<DustParticle*>(buf.contents);
-    for (size_t k = 0; k < order.size(); ++k) out[k] = dust_[order[k].second];
+    id<MTLBuffer> buf = [device_ newBufferWithLength:order.size() * sizeof(SfxSprite) options:MTLResourceStorageModeShared];
+    auto* out = static_cast<SfxSprite*>(buf.contents);
+    for (size_t k = 0; k < order.size(); ++k) out[k] = sp[order[k].second];
+    struct {
+        simd_float4 user0, user1, user2;
+    } params = {simd_make_float4(dust_.clock, 100.0f, 0, 0), simd_make_float4(dust_.fadeTo, dust_.fadeOut, 0.01f, 0),
+                simd_make_float4(0.8f, 0.1f, std::getenv("FUEL_SFX_DEBUG") && std::atoi(std::getenv("FUEL_SFX_DEBUG")) == 2 ? 1.0f : 0.0f, 0)};  // 0x5f6550
 
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = hdr_;
@@ -2749,10 +2815,48 @@ void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     [enc setRenderPipelineState:dustPipeline_];
     [enc setVertexBuffer:buf offset:0 atIndex:0];
     [enc setVertexBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setVertexBytes:&params length:sizeof params atIndex:2];
+    [enc setVertexTexture:shadowMap_ atIndex:0];
     [enc setFragmentBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
     [enc setFragmentTexture:depth_ atIndex:0];
+    [enc setFragmentTexture:sfxAtlas_ atIndex:1];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:order.size()];
     [enc endEncoding];
+}
+
+void MeshRenderer::loadSfxAtlas(const DpcFile& world) {
+    // FX_ATLAS_0: MaterialAnim_Z (link = name CRC) in DATAS/SHARED.DPC -> body + 0x3c Material_Z -> slot 0 bitmap.
+    namespace fs = std::filesystem;
+    const fs::path shared = fs::path(world.path()).parent_path().parent_path() / "DATAS" / "SHARED.DPC";
+    try {
+        if (!fs::exists(shared)) return;
+        sfxShared_ = std::make_unique<DpcFile>(shared.string());
+        const DpcFile& d = *sfxShared_;
+        const uint32_t want = asoboCrc("FX_ATLAS_0");
+        for (uint32_t id : d.ids(cls::MaterialAnim)) {
+            const DpcFile::Entry* e = d.find(id);
+            const std::vector<uint8_t> link = d.link(*e);
+            uint32_t name = 0;
+            if (link.size() >= 4) std::memcpy(&name, link.data(), 4);
+            if (name != want) continue;
+            const auto body = d.body(*e);
+            if (!body || body->size() < 0x40) return;
+            uint32_t matId;
+            std::memcpy(&matId, body->data() + 0x3c, 4);
+            const DpcFile::Entry* me = d.find(matId);
+            if (!me) return;
+            const Material mat = parseMaterialBody(d.body(*me).value());
+            const DpcFile::Entry* be = d.find(mat.textures[0]);
+            if (!be) return;
+            uint8_t alphaKind = 0;
+            sfxAtlas_ = uploadBitmap(d, *be, false, &alphaKind);
+            if (std::getenv("FUEL_SFX_DEBUG"))
+                std::fprintf(stderr, "sfx atlas: material %08x bitmap %08x -> %s\n", matId, mat.textures[0], sfxAtlas_ ? "loaded" : "failed");
+            return;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fuelview: no FX atlas: %s\n", e.what());
+    }
 }
 
 // FUEL's HDR chain (post.md P3 / P6), with the per-frame exposure, bloom scale and blue shift of

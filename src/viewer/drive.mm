@@ -1,6 +1,8 @@
 #import "drive.h"
 #include "rider_view.h"
 
+#include <filesystem>
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -256,95 +258,84 @@ fuel::OrbitCamera ChaseCamera::update(float dt, const DriveSession& drive, const
 }
 
 
-float DustSystem::random() {
-    rng_ ^= rng_ << 13, rng_ ^= rng_ >> 17, rng_ ^= rng_ << 5;
-    return float(rng_ >> 8) / float(1u << 24);
-}
+namespace {
+std::string gEffectsDataDir;
+std::unique_ptr<fuel::sfx::Tables> gEffectsTables;
+}  // namespace
+
+std::function<std::array<float, 4>(double x, double z)> DustSystem::groundColour;
+
+void DustSystem::setDataDir(const std::string& dir) { gEffectsDataDir = dir; }
 
 void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
-    using G = fuel::GripCategory;
-    // Per grip category: particles per second per wheel at speed, and the dust colour (linear).
-    struct Kind {
-        float rate;
-        simd_float3 colour;
-    };
-    static const Kind kKinds[int(G::Count)] = {
-        {0.6f, {0.30f, 0.28f, 0.26f}},   // tarmac: a little grit
-        {34.0f, {0.36f, 0.27f, 0.18f}},  // dirt
-        {3.0f, {0.30f, 0.27f, 0.18f}},   // grass
-        {40.0f, {0.50f, 0.40f, 0.28f}},  // sand
-        {18.0f, {0.80f, 0.83f, 0.88f}},  // snow
-        {7.0f, {0.22f, 0.17f, 0.11f}},   // mud
-        {10.0f, {0.38f, 0.34f, 0.29f}},  // rock and gravel
-    };
-    constexpr size_t kMaxParticles = 3000;
-    constexpr int kWheelSlots = 8;
-    const int vehicles = drive.vehicleCount();
-    if (dt > 0) {
-        lastChassis_.resize(size_t(vehicles), simd_make_float3(NAN, NAN, NAN));
-        carry_.resize(size_t(vehicles) * kWheelSlots, 0.0f);
-        for (int v = 0; v < vehicles; ++v) {
-            const fuel::VehicleState st = drive.state(v);
-            const simd_float3 body = simd_make_float3(float(st.chassis.position[0]), float(st.chassis.position[1]), float(st.chassis.position[2]));
-            simd_float3 velocity = (body - lastChassis_[size_t(v)]) / dt;
-            lastChassis_[size_t(v)] = body;
-            if (!simd_all(velocity == velocity) || simd_length(velocity) > 120.0f) velocity = 0;  // first frame or a teleport
-            if (simd_distance(body, eye) > 250.0f) continue;
-            const float speed = std::fabs(st.speedKmh);
-            const fuel::VehicleSetup& setup = drive.setup(v);
-            for (size_t w = 0; w < st.wheels.size() && w < size_t(kWheelSlots); ++w) {
-                float& owed = carry_[size_t(v) * kWheelSlots + w];
-                const int surface = w < st.wheelSurface.size() ? st.wheelSurface[w] : -1;
-                if (surface < 0) {
-                    owed = 0;
-                    continue;
-                }
-                const Kind& kind = kKinds[int(fuel::gripCategory(surface))];
-                const float skid = w < st.wheelSkid.size() ? st.wheelSkid[w] : st.skid;
-                // Wheelspin on the spot (a start line full of revving opponents) throws little.
-                const float push = smoothstep(4.0f, 80.0f, speed) + skid * 1.5f * smoothstep(3.0f, 25.0f, speed);
-                owed += kind.rate * push * dt;
-                const float radius = w < setup.wheels.size() ? setup.wheels[w].radius : 0.3f;
-                const auto& wp = st.wheels[w].position;
-                const simd_float3 contact = simd_make_float3(float(wp[0]), float(wp[1]) - radius * 0.8f, float(wp[2]));
-                for (; owed >= 1.0f; owed -= 1.0f) {
-                    if (particles_.size() >= kMaxParticles) particles_.erase(particles_.begin());
-                    Particle p;
-                    p.position = contact + simd_make_float3(random() - 0.5f, random() * 0.2f, random() - 0.5f) * 0.4f;
-                    // Thrown up and out, keeping some of the vehicle's speed; drag soon stops it.
-                    p.velocity = velocity * (0.1f + 0.15f * random()) +
-                                 simd_make_float3((random() - 0.5f) * 2.4f, 0.6f + random() * 1.6f + skid * 1.5f, (random() - 0.5f) * 2.4f);
-                    p.colour = kind.colour * (0.85f + 0.3f * random());
-                    p.age = 0;
-                    p.life = 1.2f + random() * 1.2f;
-                    p.size = 0.35f + random() * 0.3f;
-                    p.grow = 1.0f + random() * 1.2f + 0.01f * speed;
-                    p.rotation = random() * 6.2832f;
-                    p.spin = (random() - 0.5f) * 1.2f;
-                    p.opacity = (0.3f + 0.2f * random()) * std::min(1.0f, 0.4f + 0.6f * push);
-                    p.seed = random();
-                    particles_.push_back(p);
-                }
-            }
-        }
-        const float drag = std::exp(-1.8f * dt);
-        for (Particle& p : particles_) {
-            p.age += dt;
-            p.velocity = p.velocity * drag + simd_make_float3(0, 0.3f * dt, 0);  // warm dust drifts up
-            p.position += p.velocity * dt;
-            p.size += p.grow * dt * std::max(0.2f, 1.0f - p.age / p.life);
-            p.rotation += p.spin * dt;
-        }
-        particles_.erase(std::remove_if(particles_.begin(), particles_.end(), [](const Particle& p) { return p.age >= p.life; }),
-                         particles_.end());
+    namespace fs = std::filesystem;
+    if (!gEffectsTables && !gEffectsDataDir.empty()) {
+        const fs::path d(gEffectsDataDir);
+        gEffectsTables = std::make_unique<fuel::sfx::Tables>(fuel::sfx::loadTables(
+            (d / "XFinalComponent" / "FUEL.exe").string(), (d / "CommonComponent" / "Param" / "pp001.tsc").string()));
+        if (!gEffectsTables->ok) std::fprintf(stderr, "fuelview: no wheel effects: %s\n", gEffectsTables->error.c_str());
     }
-    drawn_.clear();
-    drawn_.reserve(particles_.size());
-    for (const Particle& p : particles_) {
-        const float t = p.age / p.life;
-        const float a = p.opacity * smoothstep(0.0f, 0.12f, t) * std::pow(1.0f - t, 1.5f);
-        drawn_.push_back({simd_make_float4(p.position, p.size), simd_make_float4(p.colour, a), simd_make_float4(p.rotation, p.seed, 0, 0)});
+    if (!gEffectsTables || !gEffectsTables->ok) return;
+    if (!sys_) sys_ = std::make_unique<fuel::sfx::System>(*gEffectsTables);
+    if (dt <= 0) return;
+    // The feed of 0x5ceb60, per vehicle and wheel: a wheel emits while loaded (> 0.01) and within 200 m.
+    std::vector<fuel::sfx::System::WheelFeed> feeds;
+    for (int v = 0; v < drive.vehicleCount(); ++v) {
+        const fuel::VehicleState st = drive.state(v);
+        const std::vector<float>& vp = drive.setup(v).params;
+        auto VP = [&](int n) { return size_t(n) < vp.size() ? vp[size_t(n)] : 0.0f; };
+        const int noFx = int(std::floor(VP(670)));  // veh+0x1048 = VehiclePP 670: wheels without emitters (bit w)
+        for (size_t w = 0; w < st.wheelFx.size() && w < 16; ++w) {
+            const fuel::VehicleState::WheelFx& fx = st.wheelFx[w];
+            fuel::sfx::System::WheelFeed f;
+            f.key = v * 16 + int(w);
+            f.player = v == 0;
+            fuel::sfx::WheelInput& in = f.in;
+            in.contact = {float(fx.contact[0]), float(fx.contact[1]), float(fx.contact[2])};
+            in.velocity = fx.velocity;
+            in.forward = fx.forward;
+            in.spin = fx.spin, in.radius = fx.radius, in.load = fx.load, in.slip = fx.slip, in.depth = fx.depth;
+            in.classes = fx.classes;
+            if (groundColour) in.groundColour = groundColour(fx.contact[0], fx.contact[2]);
+            const simd_float3 c = simd_make_float3(in.contact[0], in.contact[1], in.contact[2]);
+            in.cameraDistance = simd_distance(c, eye);
+            in.rain = 0;  // WeatherManager rain (no weather fields in the port yet)
+            for (int k = 0; k < 6; ++k) in.intensity[size_t(k)] = VP(671 + k);
+            if (noFx & (1 << int(w))) continue;
+            f.active = fx.load > 0.01f && in.cameraDistance <= 200.0f;
+            feeds.push_back(f);
+        }
     }
+    sys_->update(dt, feeds, {eye.x, eye.y, eye.z});
+    // Sprites for the renderer.
+    std::vector<const fuel::sfx::Particle*> ps;
+    sys_->collect(ps);
+    frame_.sprites.clear();
+    frame_.sprites.reserve(ps.size());
+    for (const fuel::sfx::Particle* p : ps) {
+        fuel::SfxSprite s;
+        const bool gpu = p->gpu;
+        const auto& at = gpu ? p->start : p->pos;
+        s.posAngle = simd_make_float4(at[0], at[1], at[2], p->angle);
+        s.uv = simd_make_float4(p->uv[0], p->uv[1], p->uv[2], p->uv[3]);
+        s.colour = simd_make_float4(p->colour[0], p->colour[1], p->colour[2], gpu ? p->colour[3] : p->drawAlpha);
+        s.vel = simd_make_float4(p->vel[0], p->vel[1], p->vel[2], gpu ? p->size : p->drawSize);
+        s.acc = simd_make_float4(p->accel[0], p->accel[1], p->accel[2], p->rotSpeed);
+        s.life = simd_make_float4(p->spawnTime, p->life, gpu ? 1.0f : 0.0f, 0);
+        const auto pa = fuel::sfx::codeParams(fuel::sfx::fadeCode(p->alphaFn));
+        const auto pz = fuel::sfx::codeParams(fuel::sfx::fadeCode(p->sizeFn));
+        s.alphaP = simd_make_float4(pa[0], pa[1], pa[2], pa[3]);
+        s.scaleP = simd_make_float4(pz[0], pz[1], pz[2], pz[3]);
+        frame_.sprites.push_back(s);
+    }
+    frame_.clock = sys_->clock();
+    if (std::getenv("FUEL_SFX_DEBUG") && !frame_.sprites.empty() && int(sys_->clock() * 60) % 60 == 0) {
+        const fuel::SfxSprite& s = frame_.sprites.back();
+        std::fprintf(stderr, "sfx: %zu sprites (%zu gpu), last: pos %.1f %.1f %.1f size %.2f col %.2f %.2f %.2f a %.2f life %.2f gpu %.0f uv %.2f %.2f %.2f %.2f\n",
+                     frame_.sprites.size(), sys_->gpuCount(), s.posAngle.x, s.posAngle.y, s.posAngle.z, s.vel.w, s.colour.x, s.colour.y,
+                     s.colour.z, s.colour.w, s.life.y, s.life.z, s.uv.x, s.uv.y, s.uv.z, s.uv.w);
+    }
+    frame_.fadeTo = gEffectsTables->P(5530), frame_.fadeOut = gEffectsTables->P(5531);
 }
 
 namespace {
