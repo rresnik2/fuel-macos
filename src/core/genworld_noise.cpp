@@ -116,7 +116,11 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed) {
 std::string engineExePath(const DpcFile& world) { return exePath(world).string(); }
 
 std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count) {
-    const auto b = readExe(exePath(world), va, count * 4);
+    return readEngineFloats(exePath(world).string(), va, count);
+}
+
+std::vector<float> readEngineFloats(const std::string& exe, uint32_t va, size_t count) {
+    const auto b = readExe(exe, va, count * 4);
     if (!b) return {};
     std::vector<float> out(count);
     std::memcpy(out.data(), b->data(), count * 4);

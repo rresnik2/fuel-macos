@@ -2,7 +2,10 @@
 
 #include <chrono>
 
+#include "core/genworld_noise.hpp"
+
 #include <algorithm>
+#include <filesystem>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -16,7 +19,7 @@ namespace {
 // a D3DCOLOR tangent at 12, a D3DCOLOR normal at 16 and float2 uv0 at 20.
 // Only the stride differs.
 constexpr uint32_t kMinDrawableStride = 28;
-constexpr NSUInteger kShadowMapSize = 2048;
+constexpr NSUInteger kShadowMapSize = 1024;  // slice size W (FUEL default; "-HS" doubles it)
 constexpr float kVehicleDrawDistance = 2500.0f;  // metres from the focus (setVehicles)
 
 const char* kShaderSource = R"METAL(
@@ -49,6 +52,20 @@ struct FrameUniforms {
     float4 groundFar;     // rgb: far-band forest colour (palette 57, linear); w = 1 when the colour map is
                           // FUEL's decoded point colour (alpha = forest weight), 0 for the old heuristic map
     float4 groundFine[3]; // fine ground tiles around the player (1, 2, 4 m): origin x, z, extent, w = 1 when loaded
+    // ---- FUEL's lights and scattering (core/atmosphere.hpp; p26-renderer.md L1-L8)
+    float4 lightDir;      // DLIGHT_DIR (towards the sun, lifted), w DLIGHT_INVINTENSITY
+    float4 skyDir;        // DSKY_DIR
+    float4 sunColour;     // gDSunColor = DLIGHT_COLOR * SC1.z
+    float4 dlight;        // DLIGHT_COLOR (inscatter tint, sun disc), w blue shift strength (day 10, night 0.5)
+    float4 skyColour;     // DSKY_COLOR
+    float4 skyAmbient;    // DSKY_AMBIENT (0)
+    float4 sunRaw;        // un-lifted direction of the sun / moon disc
+    float4 scat[11];      // VS c6..c16: SC1, SC2, TERM, BETA_1, BETA_DASH_1, BETA_2, BETA_DASH_2, BETA_1_PLUS_2,
+                          // ONE_OVER_BETA_1_PLUS_2, HG, SC3
+    float4 shadowSplit;   // gShadowSliceDist: view z where slices 1..3 start, w = end of the shadows
+    float4 shadowSize;    // TextureSize: (W, 1/W, 1/(4W), 4W) of the atlas, W = slice size
+    float4x4 shadowMat[4];// view space -> (u, v in the atlas, light depth) per slice
+    float4x4 view;        // world -> view space (FUEL's view: +z forward)
 };
 
 struct MaterialUniforms {
@@ -71,80 +88,168 @@ struct VertexOut {
     float3 normal;
     float4 tangent;
     float2 uv;
-    float4 sunPos;
+    float3 ext;         // scattering at the vertex (scat_mesh.vhl scatteringbase)
+    float3 insc;
     float3 m0, m1, m2;  // the instance's rotation (for object-space normal maps)
     float3 tint;        // local ground colour x2, for grey foliage and rock textures
     uint sprite [[flat]];
 };
 
-constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
-
-float shadowFactor(depth2d<float> map, float4 sunPos) {
-    float3 p = sunPos.xyz / sunPos.w;
-    float2 uv = p.xy * float2(0.5, -0.5) + 0.5;
-    if (any(uv < 0.0) || any(uv > 1.0) || p.z >= 1.0) return 1.0;
-    float texel = 1.0 / float(map.get_width());
-    float s = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x) s += map.sample_compare(shadowSampler, uv + float2(x, y) * texel, p.z - 0.001);
-    return s / 9.0;
+// ---- FUEL's cascaded sun shadow (p26-work/shadows.md S1): 4 orthographic slices stacked in one
+// W x 4W atlas, depth reversed (1 at the light camera; lit when the receiver depth >= the stored one).
+// Port: the atlas is a 4-slice depth array (slice i = FUEL's atlas rows [iW, (i+1)W)), so the receiver
+// matrices end at the slice's (u, v) instead of the atlas v = 0.25 v + 0.25 i; the taps are the same.
+float shadowTap(depth2d_array<float> map, float2 uv, uint slice, float depth) {
+    const int W = int(map.get_width());
+    const int2 p = clamp(int2(floor(uv * float(W))), int2(0), int2(W - 1));
+    return step(map.read(uint2(p), slice), depth);
 }
 
-// A late-afternoon sky like FUEL's: a warm, hazy horizon under a dusty blue
-// zenith, with a broad glow around the low sun. Linear HDR; the post pass tone maps.
-constant float3 kSunColour = float3(1.0, 0.74, 0.46);
-
-float3 skyColor(float3 d, float3 sun) {
-    float3 zenith = float3(0.11, 0.19, 0.38), horizon = float3(0.70, 0.56, 0.42), ground = float3(0.20, 0.15, 0.10);
-    float3 c = d.y >= 0.0 ? mix(horizon, zenith, pow(d.y, 0.5)) : mix(horizon * 0.75, ground, saturate(-d.y * 4.0));
-    float mu = saturate(dot(d, sun));
-    return c + float3(1.0, 0.62, 0.30) * (pow(mu, 6.0) * 0.40 + pow(mu, 48.0) * 0.9);
+// PixelShadow4: four bilinear PCF lookups over the 3x3 neighbourhood (a 2-texel tent).
+float pcf3x3(depth2d_array<float> map, float3 tc, uint slice, float4 ts) {
+    const float2 S = float2(ts.y, ts.z);
+    const float2 fr = fract(tc.xy * float2(ts.x, ts.w));
+    float s[3][3];
+    for (int j = -1; j <= 1; ++j)
+        for (int i = -1; i <= 1; ++i) s[j + 1][i + 1] = shadowTap(map, tc.xy + float2(i, j) * S, slice, tc.z);
+    float sum = 0.0;
+    for (int j = 0; j < 2; ++j)
+        for (int i = 0; i < 2; ++i) {
+            const float a0 = mix(s[j][i], s[j][i + 1], fr.x), a1 = mix(s[j + 1][i], s[j + 1][i + 1], fr.x);
+            sum += mix(a0, a1, fr.y);
+        }
+    return 0.25 * sum;
 }
 
-// The world palette is a bright spring green; FUEL's evening ground reads olive
-// and brown. Pull greens towards their luminance and warm them a little.
+// ProjShadowPS + ComputeShadow + ShadowAttenuation: 1 lit, 0 shadowed; fades to lit from 957.5 to 1600 m.
+float fuelShadow(depth2d_array<float> map, float3 world, constant FrameUniforms& f) {
+    if (f.shadowSize.x <= 0.0) return 1.0;
+    const float3 pv = (f.view * float4(world, 1.0)).xyz;
+    const float vz = pv.z;
+    const float4 d = f.shadowSplit;
+    const int i = int(vz >= d.x) + int(vz >= d.y) + int(vz >= d.z);
+    float3 tc = (f.shadowMat[i] * float4(pv, 1.0)).xyz;
+    tc.xy = saturate(tc.xy);
+    const float s = pcf3x3(map, tc, uint(i), f.shadowSize);
+    const float lo = d.z + (d.w - d.z) * 0.5;
+    return saturate(s + smoothstep(lo, d.w, vz));
+}
+
+// ---- Atmospheric scattering (scattering.h; the fog of every lit shader). Index names as VS c6..c16.
+constant int SC1 = 0, SC2 = 1, TERM = 2, BETA_DASH_1 = 4, BETA_DASH_2 = 6, BETA_SUM = 7, ONE_OVER = 8, HG = 9, SC3 = 10;
+
+// scatterintegral: atmospheric density integral of a segment of length len between two heights.
+float fuelScatterIntegral(constant FrameUniforms& f, float len, float y1, float y2) {
+    const float4 sc1 = f.scat[SC1], sc2 = f.scat[SC2], term = f.scat[TERM];
+    float4 r11 = float4(max(y1, y2), min(y1, y2), max(y1, y2), min(y1, y2));
+    const float4 o = r11;
+    r11.xy *= term.w;
+    r11.zw *= sc2.w;
+    float4 r10 = min(r11, 1.0);
+    float4 d = float4(r11.x - r11.y, r11.z - r11.w, r10.x - r10.y, r10.z - r10.w);
+    d = max(d, term.w);
+    const float f1 = d.z / d.x, f2 = d.w / d.y;
+    const float dens = (1.0 - (r10.x + r10.y) * 0.5) * f1 * sc2.y + (1.0 - (r10.z + r10.w) * 0.5) * f2 * sc2.z;
+    float integral = dens * len;
+    const float2 c = clamp(o.xy, sc1.y, term.z);
+    integral += len * (c.x - c.y) / max(o.x - o.y, 1.0 / 16384.0) * f.scat[HG].w;
+    return integral;
+}
+
+struct Scatter {
+    float3 ext;
+    float3 insc;
+};
+
+// scatteringfinish: extinction and inscatter for a density and the view/sun angle.
+Scatter fuelScatterFinish(constant FrameUniforms& f, float lookY, float density, float cosT) {
+    const float cc = min(0.0, cosT);
+    const float phase1 = 1.0 + cc * cc;
+    Scatter s;
+    s.ext = exp2(-f.scat[BETA_SUM].xyz * f.scat[SC2].x * density);
+    const float r = rsqrt(f.scat[HG].y + f.scat[HG].z * cosT);
+    const float phase2 = f.scat[HG].x * (r * r * r * r);
+    float ep = max(0.0, 1.0 + lookY);
+    ep *= ep;
+    ep *= ep;
+    ep *= ep;
+    ep = 1.0 - f.scat[SC3].w + ep * f.scat[SC3].w;
+    float tw = 0.5 - cosT * 0.5;
+    tw = saturate(tw * tw);
+    s.insc = (f.scat[BETA_DASH_1].xyz * phase1 + f.scat[BETA_DASH_2].xyz * phase2) * f.scat[ONE_OVER].xyz;
+    s.insc *= (1.0 - s.ext) * ep;
+    s.insc *= (f.dlight.xyz * tw + (1.0 - tw)) * f.scat[TERM].y;
+    s.ext *= sqrt(length(s.ext));
+    return s;
+}
+
+// scatteringbase: what the camera sees of the air between it and the world point p.
+Scatter fuelScattering(constant FrameUniforms& f, float3 p) {
+    float3 look = f.eye.xyz - p;
+    const float len = length(look);
+    look /= max(len, 1e-6);
+    const float cosT = dot(look, f.scat[SC3].xyz);
+    const float density = fuelScatterIntegral(f, len, 0.25 + max(p.y, 0.0), f.eye.y);
+    return fuelScatterFinish(f, min(look.y, 0.0), density, cosT);
+}
+
+// The sky seen along `dir` (ph_sky: the inscatter of the sky box, U1: box half size 20 km around the camera).
+float3 fuelSky(constant FrameUniforms& f, float3 dir) {
+    const float B = 20000.0;
+    const float3 a = abs(dir);
+    const float t = B / max(max(a.x, a.y), max(a.z, 1e-4));
+    return fuelScattering(f, f.eye.xyz + dir * t).insc;
+}
+
+// ---- Lighting (scattering_light.h)
+float fuelSkylighting(float3 n, float3 K, thread float& skydot) {
+    skydot = sqrt(saturate(dot(K, n) * 0.5 + 0.5));
+    return skydot * 0.9 + 0.1;
+}
+
+float fuelSunlighting(float shadow, float occ) { return shadow * (1.0 - occ * 0.1) + occ * 0.1; }
+
+// lighting(): vtx (sky + sun + omni) + spec * sunCol (with the shadow map: spec and sun shadowed).
+float3 fuelLighting(float3 n, float3 L, float3 K, float3 V, float3 sunCol, float3 skyCol, float3 vtx, float3 specCol,
+                    float power, float shadow, float3 omni, float occ) {
+    const float3 r = dot(n, V) * n * 2.0 - V;
+    float s = pow(max(saturate(dot(r, L)), 1e-4), power) * shadow;
+    const float sun = saturate(dot(n, L)) * fuelSunlighting(shadow, occ);
+    float skydot;
+    const float sky = fuelSkylighting(n, K, skydot);
+    return vtx * (sky * skyCol + sun * sunCol + omni) + s * specCol * sunCol;
+}
+
+// lightingmaterial(): with the material's diffuse and emissive.
+float3 fuelLightingMaterial(float3 n, float3 L, float3 K, float3 V, float3 sunCol, float3 skyCol, float3 vtx, float3 specCol,
+                            float power, float shadow, float3 omni, float occ, float4 diffuse, float3 emissive) {
+    const float3 r = dot(n, V) * n * 2.0 - V;
+    float s = pow(max(saturate(dot(r, L)), 1e-4), power) * shadow;
+    const float sun = saturate(dot(n, L)) * fuelSunlighting(shadow, occ);
+    float skydot;
+    const float sky = fuelSkylighting(n, K, skydot);
+    return vtx * (emissive * diffuse.a + diffuse.rgb * (sky * skyCol + sun * sunCol + omni)) + s * specCol * sunCol;
+}
+
+// cubelighting(): lighting() blended towards the reflection by the cube map influence.
+float3 fuelCubeLighting(float3 n, float3 L, float3 K, float3 V, float3 sunCol, float3 skyCol, float3 vtx, float3 specCol,
+                        float power, float3 cube, float cubePower, float shadow, float3 omni, float occ) {
+    const float3 r = dot(n, V) * n * 2.0 - V;
+    float s = pow(max(saturate(dot(r, L)), 1e-4), power) * shadow;
+    const float sun = saturate(dot(n, L)) * fuelSunlighting(shadow, occ);
+    float skydot;
+    const float sky = fuelSkylighting(n, K, skydot);
+    const float3 base = vtx * (sky * skyCol + sun * sunCol + omni);
+    const float3 refl = skydot * (cube + s * specCol * sunCol);
+    return mix(base, refl, cubePower);
+}
+
+// The world palette is a bright spring green; the port's old heuristic colour map (no decoded
+// ground colours) is pulled towards olive. Not used with FUEL's decoded colours.
 float3 groundGrade(float3 c) {
     float l = dot(c, float3(0.30, 0.59, 0.11));
     float green = saturate((c.g - max(c.r, c.b)) / max(c.g, 1e-3) * 2.0);
     return mix(float3(l), c, mix(0.75, 0.45, green)) * float3(0.92, 0.86, 0.76);
-}
-
-// Aerial perspective: distance haze in the colour of the sky near the horizon in
-// that direction, so it glows warm towards the sun.
-float3 haze(float3 rgb, float3 world, constant FrameUniforms& f) {
-    if (f.fog.x <= 0.0) return rgb;
-    float3 d = world - f.eye.xyz;
-    float k = (1.0 - exp(-length(d) * f.fog.x)) * 0.85;
-    return mix(rgb, skyColor(normalize(float3(d.x, max(d.y, 0.0) * 0.15, d.z)), normalize(f.sunDir.xyz)), k);
-}
-
-// Sun (GGX highlight, shadowed), hemispheric sky light and sky reflections.
-float3 lighting(float3 albedo, float3 N, float3 V, float ao, float shadow, float specStrength, float rough,
-                float2 fresnel, bool reflective, constant FrameUniforms& f) {
-    float3 L = normalize(f.sunDir.xyz);
-    float3 sun = kSunColour * f.sunDir.w;
-    float NdotL = saturate(dot(N, L));
-    float NdotV = saturate(dot(N, V)) + 1e-4;
-    float3 H = normalize(L + V);
-    float NdotH = saturate(dot(N, H));
-    float VdotH = saturate(dot(V, H));
-
-    float3 ambient = mix(float3(0.15, 0.12, 0.08), float3(0.38, 0.38, 0.42), N.y * 0.5 + 0.5) * ao;
-    float3 color = albedo * (sun * NdotL * shadow + ambient);
-
-    float a2 = pow(rough, 4.0);
-    float dn = NdotH * NdotH * (a2 - 1.0) + 1.0;
-    float D = a2 / (M_PI_F * dn * dn);
-    float k = (rough + 1.0) * (rough + 1.0) / 8.0;
-    float G = NdotL / (NdotL * (1.0 - k) + k) * NdotV / (NdotV * (1.0 - k) + k);
-    float f0 = mix(0.02, 0.08, specStrength);
-    float F = f0 + (1.0 - f0) * pow(1.0 - VdotH, 5.0);
-    color += sun * (D * G * F / max(4.0 * NdotV, 1e-3)) * shadow * specStrength;
-
-    float3 env = mix(skyColor(reflect(-V, N), L), float3(0.40, 0.38, 0.36), rough);
-    float fr = reflective ? mix(fresnel.x, fresnel.y, pow(1.0 - NdotV, 5.0)) * 2.0
-                          : (f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0)) * (1.0 - rough) * specStrength;
-    return color + env * saturate(fr) * ao * mix(0.5, 1.0, shadow);
 }
 
 // Instanced: one world matrix per instance in buffer 2.
@@ -159,7 +264,8 @@ vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[bu
         // Like FUEL's ground, foliage and rocks take the palette colour under them
         // (ground x 2; the fragment shader decides how to apply it).
         constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
-        o.tint = groundGrade(groundColour.sample(lin, (model[3].xz + 70000.0) / 140000.0, level(0)).rgb) * 2.0;
+        const float3 gc = groundColour.sample(lin, (model[3].xz + 70000.0) / 140000.0, level(0)).rgb;
+        o.tint = (f.groundFar.w > 0.0 ? gc : groundGrade(gc)) * 2.0;
     }
     o.m0 = model[0].xyz;
     o.m1 = model[1].xyz;
@@ -176,15 +282,53 @@ vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[bu
     o.normal = (model * float4(in.normal.xyz * 2.0 - 1.0, 0.0)).xyz;
     o.tangent = float4((model * float4(in.tangent.xyz * 2.0 - 1.0, 0.0)).xyz, in.tangent.w > 0.5 ? 1.0 : -1.0);
     o.uv = in.uv;
-    o.sunPos = f.sunViewProj * w;
+    const Scatter sc = fuelScattering(f, w.xyz);
+    o.ext = sc.ext;
+    o.insc = sc.insc;
     return o;
 }
 
-vertex float4 vsShadow(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
-                       const device float4x4* models [[buffer(2)]], uint iid [[instance_id]]) {
-    return f.sunViewProj * (models[iid] * float4(in.position, 1.0));
+// ---- Shadow casters (shadow.phl ph_shadow, mesh_shadow.vhl vh_shadow): pushed away from the light by
+// ADDBIAS / (|n.L|^2 + 1/4096) (ReAddShadowBiasNormal), depth z = 1 - zLight / ZExtent, cut-outs alpha-tested.
+struct ShadowUniforms {
+    float4x4 lightViewProj;
+    float4 light;  // xyz towards the sun (DLIGHT_DIR), w ADDBIAS of the slice
+    float4 eye;    // (terrain casters)
+    float4 lightRight, lightUp;  // the light camera's axes: sprites face it (rotshape_shadow.vhl)
+};
+
+struct ShadowOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex ShadowOut vsShadow(VertexIn in [[stage_in]], constant ShadowUniforms& su [[buffer(1)]],
+                          const device float4x4* models [[buffer(2)]], constant uint& sprite [[buffer(3)]], uint iid [[instance_id]]) {
+    const float4x4 model = models[iid];
+    float4 w = model * float4(in.position, 1.0);
+    if (sprite != 0) {
+        // Billboards face the light camera and move by the constant ReAddShadowBias.
+        w.xyz += (su.lightRight.xyz * in.corner.x + su.lightUp.xyz * in.corner.y) * length(model[1].xyz);
+        w.xyz -= su.light.xyz * su.light.w;
+    } else {
+        float3 n = (model * float4(in.normal.xyz * 2.0 - 1.0, 0.0)).xyz;
+        n = dot(n, n) > 1e-8 ? normalize(n) : float3(0, 1, 0);
+        const float nl = dot(n, su.light.xyz);
+        w.xyz -= su.light.xyz * (su.light.w / (nl * nl + 1.0 / 4096.0));
+    }
+    ShadowOut o;
+    o.position = su.lightViewProj * w;
+    o.uv = in.uv;
+    return o;
 }
 
+fragment void fsShadowCut(ShadowOut in [[stage_in]], texture2d<float> tDiffuse [[texture(0)]], sampler smp [[sampler(0)]],
+                          constant uint& halfAtlas [[buffer(0)]]) {
+    const float2 uv = halfAtlas != 0 ? float2(in.uv.x * 0.5, in.uv.y) : in.uv;
+    if (tDiffuse.sample(smp, uv).a - 0.5 < 0.0) discard_fragment();
+}
+
+// ---- Objects, vehicles, rider (scat_mesh.phl ph_base) and leaf / impostor sprites (scat_rotshape).
 fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
                        constant FrameUniforms& f [[buffer(1)]],
                        constant MaterialUniforms& m [[buffer(2)]],
@@ -194,31 +338,32 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
                        texture2d<float> tSpecular [[texture(4)]],
                        texture2d<float> tNormalLocal [[texture(5)]],
                        texture2d<float> tDirt [[texture(6)]],
-                       depth2d<float> shadowMap [[texture(7)]],
+                       depth2d_array<float> shadowMap [[texture(7)]],
                        sampler smp [[sampler(0)]]) {
     // Codes 17 and 20 use sheets whose left half is the intact part and the
-    // right half the damaged one; draw the intact half.
+    // right half the damaged one; draw the intact half (bBroken, break amount 0).
     float2 uvHalf = (m.code == 17 || m.code == 20) ? float2(in.uv.x * 0.5, in.uv.y) : in.uv;
     float4 d = tDiffuse.sample(smp, uvHalf);
     if (in.sprite != 0) {
-        // Leaves: the ground's hue with only mild darkening; some leaf textures are
-        // already dark, and a plain multiply turns them black.
+        // Port: leaves take the ground's hue with only mild darkening (some leaf textures are dark).
         const float lum = max(dot(in.tint, float3(0.3, 0.55, 0.15)), 1e-3);
         d.rgb *= in.tint / lum * clamp(lum, 0.6, 1.0);
     }
-    else if (m.features & GroundTint)  // rock: a muted version of the ground colour
+    else if (m.features & GroundTint)  // port: rock, a muted version of the ground colour
         d.rgb *= mix(float3(dot(in.tint, float3(0.3, 0.55, 0.15))), in.tint, 0.35);
     if (m.code == 17 || m.code == 19) {
-        // Car paint shows where the livery's alpha is 0.
+        // bColoured: lerp(gGouraudDefault (the paint), tex, tex.a).
         d.rgb = mix(f.paint.rgb, d.rgb, (m.features & PaintOnly) ? 0.0 : d.a);
         d.a = 1.0;
     }
+    float dirtiness = 0.0;
     if (m.features & HasDirt) {
         float4 dirt = tDirt.sample(smp, in.uv);
         float edge = 1.0 - f.params.x;
-        d.rgb = mix(d.rgb, dirt.rgb, smoothstep(edge, edge + 0.15, dirt.a));
+        dirtiness = smoothstep(edge, edge + 0.15, dirt.a);
+        d.rgb = mix(d.rgb, dirt.rgb, dirtiness);
     }
-    float4 c = d * m.diffuse;
+    float4 c = d * float4(1.0, 1.0, 1.0, m.diffuse.a);
     float alpha = m.alphaMode == 2 ? c.a : 1.0;
     if (m.alphaMode == 1) {
         // Cut-outs: the 0.5 edge sharpened to about a pixel; with MSAA the alpha
@@ -228,43 +373,64 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
         if (m.features & Foliage) alpha *= saturate((distance(in.world, f.eye.xyz) - 1.5) / 2.5);
         if (alpha <= 0.0) discard_fragment();
     }
-    if (m.lit == 0) return float4(c.rgb + m.emissive.rgb, alpha);
+    if (m.lit == 0) return float4(c.rgb * m.diffuse.rgb + m.emissive.rgb, alpha);
+
+    const float shadow = fuelShadow(shadowMap, in.world, f);
+    const float3 sunCol = f.sunColour.rgb, L = f.lightDir.xyz, K = f.skyDir.xyz;
+    if (in.sprite != 0) {
+        // scat_rotshape: normal up; sky = DSKY_COLOR + DSKY_AMBIENT (K.y/2 + 1/2), sunlit = sky + sun sat(L.y),
+        // both x MTL_DIFFUSE x GOURAUD x extinction; lerp(sky, sunlit, sunlighting(shadow, 1)) + emissive.
+        const float3 sky = f.skyColour.rgb + f.skyAmbient.rgb * (K.y * 0.5 + 0.5);
+        const float3 sunlit = sky + sunCol * saturate(L.y);
+        const float3 vcol = m.diffuse.rgb * in.ext;
+        const float3 emis = m.emissive.rgb * f.lightDir.w * in.ext;
+        const float3 rgb = c.rgb * (mix(sky, sunlit, fuelSunlighting(shadow, 1.0)) * vcol + emis) + in.insc;
+        return float4(rgb, alpha);
+    }
 
     // Some foliage stores no normal at all: fall back to up.
     const float3 n0 = dot(in.normal, in.normal) > 1e-8 ? normalize(in.normal) : float3(0, 1, 0);
     float3 N = n0 * (front ? 1.0 : -1.0);
-    // Leaf cards lit as flat quads go black on the side away from the sun (and
-    // many store no useful normal); light cut-outs like a canopy instead:
-    // mostly up, a little of their own direction.
-    const bool foliage = in.sprite != 0 || (m.alphaMode != 0 && !(m.features & Reflective));
-    if (foliage) N = normalize(mix(n0, float3(0, 1, 0), 0.7));
     if (m.features & HasNormalLocal) {
-        // Object-space normal map, two channels plus alpha.
+        // bNormalLocal: object-space normal map (compressed: .xyw).
         const float3 nl = tNormalLocal.sample(smp, uvHalf).xyw * 2.0 - 1.0;
         N = normalize(in.m0 * nl.x + in.m1 * nl.y + in.m2 * nl.z);
-    } else if ((m.features & HasNormal) && in.sprite == 0) {  // sprites have no usable tangent frame
-        // Tangent-space normal map with x in alpha and y in green.
+    } else if (m.features & HasNormal) {
+        // bNormal: tangent-space normal map, x in alpha and y in green, z rebuilt.
         float2 xy = tNormal.sample(smp, uvHalf).wy * 2.0 - 1.0;
         float3 T = in.tangent.xyz - N * dot(N, in.tangent.xyz);
         T = dot(T, T) > 1e-8 ? normalize(T) : normalize(cross(N, abs(N.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0)));
         float3 B = cross(N, T) * in.tangent.w;
         N = normalize(T * xy.x + B * xy.y + N * sqrt(saturate(1.0 - dot(xy, xy))));
     }
-    float ao = (m.features & HasOcclusion) ? tOcclusion.sample(smp, in.uv).r : 1.0;
-    float3 spec = m.specular.rgb * ((m.features & HasSpecular) ? tSpecular.sample(smp, in.uv).rgb : float3(1.0));
-    float specStrength = saturate(dot(spec, float3(1.0 / 6.0)));
-    float rough = clamp(sqrt(2.0 / (max(m.specular.w, 0.0) + 2.0)), 0.08, 1.0);
-    float shadow = shadowFactor(shadowMap, in.sunPos);
-    if (foliage) shadow = mix(0.55, 1.0, shadow);  // leaves let light through
-    float3 V = normalize(f.eye.xyz - in.world);
-    float3 rgb = lighting(c.rgb, N, V, ao, shadow, specStrength, rough, m.fresnel, (m.features & Reflective) != 0, f);
-    return float4(haze(rgb + m.emissive.rgb, in.world, f), alpha);
+    // occlusion = sOcclusion x gDLight.Ambient.w (1); skylight = lerp(DSKY_AMBIENT, DSKY_COLOR, occlusion).
+    const float occ = (m.features & HasOcclusion) ? tOcclusion.sample(smp, in.uv).r : 1.0;
+    const float3 skyCol = mix(f.skyAmbient.rgb, f.skyColour.rgb, occ);
+    float4 spec = m.specular * ((m.features & HasSpecular) ? tSpecular.sample(smp, in.uv) : float4(1.0));
+    if (m.features & HasOcclusion) spec.rgb *= occ;
+    spec.rgb *= shadow * 0.5 + 0.5;
+    spec.rgb *= 1.0 - dirtiness;
+    const float3 V = normalize(f.eye.xyz - in.world);
+    float3 rgb;
+    if (m.features & Reflective) {
+        // bCubemap: Fresnel(FallOff) x 2 (r + g + b) of the specular, x (0.33 shadow + 0.67). The cube is
+        // sGlobalCube in FUEL; the port reflects its sky (approximation).
+        const float fres = mix(m.fresnel.x, m.fresnel.y, pow(1.0 - saturate(dot(V, N)), 5.0));
+        float infl = saturate(fres * dot(spec.rgb, float3(2.0)));
+        infl *= shadow * 0.33 + 0.67;
+        const float3 r = reflect(-V, N);
+        const float3 cube = fuelSky(f, float3(r.x, max(r.y, 0.02), r.z));
+        rgb = fuelCubeLighting(N, L, K, V, sunCol, skyCol, c.rgb, spec.rgb, spec.a, cube, infl, shadow, float3(0), occ);
+    } else {
+        rgb = fuelLightingMaterial(N, L, K, V, sunCol, skyCol, c.rgb, spec.rgb, spec.a, shadow, float3(0), occ, m.diffuse,
+                                   m.emissive.rgb);
+    }
+    return float4(rgb * in.ext + in.insc, alpha);
 }
 
 struct GroundOut {
     float4 position [[position]];
     float3 world;
-    float4 sunPos;
 };
 
 vertex GroundOut vsGround(uint vid [[vertex_id]], constant FrameUniforms& f [[buffer(1)]]) {
@@ -273,18 +439,18 @@ vertex GroundOut vsGround(uint vid [[vertex_id]], constant FrameUniforms& f [[bu
     GroundOut o;
     o.position = f.viewProj * float4(w, 1.0);
     o.world = w;
-    o.sunPos = f.sunViewProj * float4(w, 1.0);
     return o;
 }
 
 fragment float4 fsGround(GroundOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
-                         depth2d<float> shadowMap [[texture(7)]]) {
+                         depth2d_array<float> shadowMap [[texture(7)]]) {
     float2 rel = in.world.xz - f.footprint.xy;
     // Soft contact darkening under the vehicle's footprint.
     float ao = mix(0.45, 1.0, smoothstep(0.5, 1.4, length(rel / max(f.footprint.zw, 0.05))));
-    float shadow = shadowFactor(shadowMap, in.sunPos);
-    float3 V = normalize(f.eye.xyz - in.world);
-    float3 rgb = lighting(float3(0.30, 0.27, 0.23), float3(0, 1, 0), V, ao, shadow, 0.0, 1.0, float2(0), false, f);
+    const float shadow = fuelShadow(shadowMap, in.world, f);
+    const float3 V = normalize(f.eye.xyz - in.world);
+    const float3 rgb = fuelLighting(float3(0, 1, 0), f.lightDir.xyz, f.skyDir.xyz, V, f.sunColour.rgb, f.skyColour.rgb * ao,
+                                    float3(0.55, 0.52, 0.48), float3(0), 1.0, shadow, float3(0), ao);
     float fade = smoothstep(1.0, 0.55, length(rel) / f.params.w);
     return float4(rgb, fade);
 }
@@ -339,7 +505,8 @@ float groundChunk(float2 xz, float2 eye) {
 struct TerrainOut {
     float4 position [[position]];
     float3 world;
-    float4 sunPos;
+    float3 ext;      // ground.vhl scatteringbase at the vertex
+    float3 insc;
     float3 normal;   // FUEL's ground normal at the vertex (central differences of the chunk's points)
     float chunk;     // size of the ground chunk the vertex belongs to
 };
@@ -365,7 +532,9 @@ vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[
     TerrainOut o;
     o.position = f.viewProj * float4(w, 1.0);
     o.world = w;
-    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    const Scatter sc = fuelScattering(f, w);
+    o.ext = sc.ext;
+    o.insc = sc.insc;
     o.normal = float3(v.n);
     o.chunk = v.size;
     return o;
@@ -385,6 +554,22 @@ float4 groundColourAt(float2 xz, float4 gc, texture2d_array<float> fine, constan
         if (w > 0.0) gc = mix(gc, fine.sample(lin, u, uint(l)), w);
     }
     return gc;
+}
+
+// The ground's sky occlusion (ground.vhl SetOcclusion: the vertex occlusion byte / 256) from the fine tiles'
+// alpha; 1 outside them.
+float groundOcclusionAt(float2 xz, texture2d_array<float> fine, constant FrameUniforms& f) {
+    constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    float occ = 1.0;
+    for (int l = 2; l >= 0; --l) {
+        const float4 t = f.groundFine[l];
+        if (t.w <= 0.0) continue;
+        const float2 u = (xz - t.xy) / t.z;
+        const float edge = min(min(u.x, 1.0 - u.x), min(u.y, 1.0 - u.y));
+        const float w = saturate(edge * 8.0);
+        if (w > 0.0) occ = mix(occ, fine.sample(lin, u, uint(l)).a, w);
+    }
+    return occ;
 }
 
 // ---- ground.phl / ground.vhl and the ground vertices of Paysage_BuildVertices (FUEL.exe
@@ -544,7 +729,7 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
                           texture2d<float> hm [[texture(0)]], texture2d<float> groundColour [[texture(1)]],
                           texture2d<uint> groundSurface [[texture(2)]], texture2d_array<float> detail [[texture(3)]],
                           texture2d_array<float> groundFine [[texture(4)]], texture2d_array<ushort> groundTypes [[texture(5)]],
-                          texture2d_array<float> groundDecal [[texture(6)]], depth2d<float> shadowMap [[texture(7)]],
+                          texture2d_array<float> groundDecal [[texture(6)]], depth2d_array<float> shadowMap [[texture(7)]],
                           texture2d<float> decal0 [[texture(8)]], texture2d<float> decal1 [[texture(9)]],
                           texture2d<float> decal2 [[texture(10)]], texture2d<float> decal3 [[texture(11)]],
                           texture2d<float> decal4 [[texture(12)]], texture2d<float> decal5 [[texture(13)]]) {
@@ -556,11 +741,14 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
     float slope = 1.0 - N.y;
     float n = valueNoise(xz * 0.004) * 0.6 + valueNoise(xz * 0.03) * 0.3 + valueNoise(xz * 0.25) * 0.1;
     float3 c;
+    float occ = 1.0;
     if (f.fog.y > 0.0) {
         constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
         float2 uv = (xz + 70000.0) / 140000.0;
-        const float4 gc = groundColourAt(xz, groundColour.sample(lin, uv), groundFine, f);
+        const float4 map60 = groundColour.sample(lin, uv);
+        const float4 gc = groundColourAt(xz, map60, groundFine, f);
+        occ = groundOcclusionAt(xz, groundFine, f);
         // Decoded map (p16): the point colour ctx+0x70 as is; the heuristic map gets the old grade.
         c = f.groundFar.w > 0.0 ? gc.rgb : groundGrade(gc.rgb);
         // Bump uv: the world position warped by two sines (0x7f9b50).
@@ -604,16 +792,10 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         // Vertex colour by band (0x7f9b50): chunks >= 600 m (the 768 m leaves, from about
         // 1.6 km) use ctx+0x90, the colour with the forest floor (palette 57) by weight k (map
         // alpha); nearer ones ctx+0x70/0x80 (equal on land). Faded by distance.
-        if (f.groundFar.w > 0.0) c = mix(c, f.groundFar.rgb, gc.a * smoothstep(1400.0, 1800.0, dist));
-        // ground.phl: albedo = lerp(vcol * tN.w * 2, tDiffuse.rgb, tDiffuse.a * decal weight), in gamma
-        // space (DX9 without sRGB reads, see vsGrass).
-        if (f.groundFar.w > 0.0) {
-            float3 g = pow(c, 1.0 / 2.2) * b.n.b * 2.0;
-            g = mix(g, pow(b.decal.rgb, 1.0 / 2.2), saturate(b.decal.a));
-            c = pow(g, 2.2);
-        } else {
-            c = mix(c * b.n.b * 2.0, b.decal.rgb, saturate(b.decal.a));
-        }
+        if (f.groundFar.w > 0.0) c = mix(c, f.groundFar.rgb, map60.a * smoothstep(1400.0, 1800.0, dist));
+        // ground.phl: albedo = lerp(vcol * tN.w * 2, tDiffuse.rgb, tDiffuse.a * decal weight), all in gamma
+        // space like the game (textures and vertex colours are read without sRGB decoding).
+        c = mix(c * b.n.b * 2.0, b.decal.rgb, saturate(b.decal.a));
         float3 nt = normalize(float3(b.n.r, b.n.g, b.n.a) * 2.0 - 1.0);
         // ground.vhl tangent frame: x = cross(z, N), y = N, z = cross(x, N).
         float3 T = normalize(cross(float3(0, 0, 1), N)), B = normalize(cross(T, N));
@@ -626,12 +808,36 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
         c = mix(c, rock, smoothstep(0.16, 0.32, slope + (n - 0.5) * 0.08));
         c = mix(c, snow, smoothstep(3100.0, 3500.0, in.world.y + n * 300.0) * (1.0 - smoothstep(0.35, 0.6, slope)));
     }
-    float shadow = shadowFactor(shadowMap, in.sunPos);
-    float3 V = normalize(f.eye.xyz - in.world);
-    float3 rgb = lighting(c, N, V, 1.0, shadow, 0.0, 1.0, float2(0), false, f);
-    return float4(haze(rgb, in.world, f), 1.0);
+    // ground.phl lighting(): sun / sky in the bump frame, skylight = lerp(DSKY_AMBIENT, DSKY_COLOR, occlusion),
+    // specular power 15 with the per-vertex specular (port: 0, not carried by the tiles), no omnis, then
+    // ApplyScattering with the vertex's extinction / inscatter.
+    const float shadow = fuelShadow(shadowMap, in.world, f);
+    const float3 V = normalize(f.eye.xyz - in.world);
+    const float3 rgb = fuelLighting(N, f.lightDir.xyz, f.skyDir.xyz, V, f.sunColour.rgb, mix(f.skyAmbient.rgb, f.skyColour.rgb, occ), c,
+                                    float3(0.0), 15.0, shadow, float3(0), occ);
+    return float4(rgb * in.ext + in.insc, 1.0);
 }
 
+
+// ground.vhl vh_shadow: the terrain chunk with the colour pass's geomorph, pushed away from the light
+// along its normal (ReAddShadowBiasNormal); no alpha test.
+struct TerrainShadowUniforms {
+    float4x4 lightViewProj;
+    float4 light;  // xyz towards the sun, w ADDBIAS
+    float4 eye;    // camera position (the geomorph distance)
+};
+
+vertex float4 vsTerrainShadow(uint vid [[vertex_id]], constant TerrainShadowUniforms& su [[buffer(1)]],
+                              const device TerrainVertexIn* verts [[buffer(0)]]) {
+    const TerrainVertexIn v = verts[vid];
+    const float3 p0 = float3(v.p0), p1 = float3(v.p1);
+    const float t = clamp((distance(su.eye.xz, p0.xz) - v.tweenStart) * v.tweenInv, 0.0, 1.0);
+    float3 w = mix(p0, p1, t);
+    const float3 n = normalize(float3(v.n));
+    const float nl = dot(n, su.light.xyz);
+    w -= su.light.xyz * (su.light.w / (nl * nl + 1.0 / 4096.0));
+    return su.lightViewProj * float4(w, 1.0);
+}
 
 // ---- Lake water: ground_water.vhl / .phl (vh_water_anim, ph_water), notes p22 / water.md 3.3.
 // Port: no scene-colour copy or depth texture; the refraction lerps are done by blending
@@ -650,7 +856,8 @@ struct WaterOut {
     float4 colour;
     float4 uv;
     float depth;
-    float4 sunPos;
+    float3 ext;   // scattering() at the vertex (ground_water.vhl)
+    float3 insc;
 };
 
 vertex WaterOut vsWater(uint vid [[vertex_id]], const device WaterVertex* v [[buffer(0)]], constant FrameUniforms& f [[buffer(1)]],
@@ -665,13 +872,15 @@ vertex WaterOut vsWater(uint vid [[vertex_id]], const device WaterVertex* v [[bu
     const float2 uv = v[vid].uv;
     o.uv = float4(uv * W[1].z + W[1].xy * t, uv * W[2].z + W[2].xy * t);
     o.depth = v[vid].depth;
-    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    const Scatter sc = fuelScattering(f, w);
+    o.ext = sc.ext;
+    o.insc = sc.insc;
     return o;
 }
 
 fragment float4 fsWater(WaterOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], constant float4* W [[buffer(2)]],
                         texture2d<float> foamTex [[texture(0)]], texture2d<float> normalTex [[texture(1)]],
-                        depth2d<float> shadowMap [[texture(7)]]) {
+                        depth2d_array<float> shadowMap [[texture(7)]]) {
     constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(4));
     const float4 S0 = W[4], S1 = W[5], S2 = W[6], S3 = W[7];
     const float3 V = normalize(f.eye.xyz - in.world);
@@ -681,16 +890,17 @@ fragment float4 fsWater(WaterOut in [[stage_in]], constant FrameUniforms& f [[bu
     const float3 ns = normalize(float3(n.x, n.y * S3.x * 3.0, n.z));
     n = normalize(float3(n.x, n.y * S0.w * 0.2, n.z));
     const float fog = saturate(1.0 - exp(-waterDepth * 0.1 * S2.z * in.colour.a));
-    const float shadow = shadowFactor(shadowMap, in.sunPos);
-    // Light = shadow * sunlight + skylight (scattering terms of the engine; port sun and sky).
-    const float3 L = normalize(f.sunDir.xyz);
-    const float3 light = kSunColour * f.sunDir.w * shadow * 0.6 + skyColor(float3(0, 1, 0), L) * 0.6;
+    const float shadow = fuelShadow(shadowMap, in.world, f);
+    // light = shadow * sunlight + skylight (scattering(): DLIGHT_COLOR * SC1.z and DSKY_COLOR).
+    const float3 L = f.lightDir.xyz;
+    const float3 light = f.sunColour.rgb * shadow + f.skyColour.rgb;
     const float3 wc = in.colour.rgb * light * S0.x;
     // c = refr * k + K, tracked through the shader's lerps with the refraction.
     float k = 1.0 - fog;
     float3 K = wc * fog;
     const float3 r = reflect(-V, n);
-    const float3 env = skyColor(float3(r.x, abs(r.y), r.z), L) * (0.25 + 0.75 * shadow);
+    // sGlobalCube in FUEL; the port reflects its sky (approximation).
+    const float3 env = fuelSky(f, float3(r.x, max(abs(r.y), 0.02), r.z)) * (0.25 + 0.75 * shadow);
     const float F = saturate(pow(1.0 - saturate(dot(V, n)), 5.0) * (1.0 - saturate(S1.w)) + S1.w) * S2.y;
     k *= 1.0 - F;
     K = K * (1.0 - F) + env * F;
@@ -702,7 +912,7 @@ fragment float4 fsWater(WaterOut in [[stage_in]], constant FrameUniforms& f [[bu
     K = K * (1.0 - ff) + light * ff;
     const float b = saturate(waterDepth * 0.02 * S2.x);
     // out = lerp(refr, c, b): premultiplied, blended One / OneMinusSourceAlpha.
-    return float4(haze(K, in.world, f) * b, b * (1.0 - k));
+    return float4((K * in.ext + in.insc) * b, b * (1.0 - k));
 }
 
 struct SkyOut {
@@ -721,8 +931,18 @@ vertex SkyOut vsSky(uint vid [[vertex_id]]) {
 fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]]) {
     float4 w = f.invViewProj * float4(in.ndc, 1.0, 1.0);
     float3 dir = normalize(w.xyz / w.w - f.eye.xyz);
-    const float3 sun = normalize(f.sunDir.xyz);
-    float3 c = skyColor(dir, sun) * 1.05 + float3(1.0, 0.85, 0.6) * smoothstep(0.99975, 0.99990, dot(dir, sun)) * 40.0;
+    // ph_sky: the inscatter of the sky box (no texture).
+    float3 c = fuelSky(f, dir);
+    // ph_skysun: the sun (or moon) sprite: DLIGHT_COLOR x tex.a x extinction x 1000 (moon: x tex.rgb x 100),
+    // picked by saturate(blueShift.w - 0.5). Port: a soft disc of 0.5 degrees radius stands in for the
+    // sprite texture, the extinction is taken along the sun direction.
+    const float3 sd = normalize(f.sunRaw.xyz);
+    const float disc = smoothstep(0.99996, 0.999975, dot(dir, sd));
+    if (disc > 0.0) {
+        const Scatter sc = fuelScattering(f, f.eye.xyz + sd * 20000.0);
+        const float3 sunDisc = f.dlight.rgb * disc * sc.ext * 1000.0, moonDisc = f.dlight.rgb * disc * sc.ext * 100.0;
+        c += mix(moonDisc, sunDisc, saturate(f.dlight.w - 0.5));
+    }
     return float4(c, 1.0);
 }
 
@@ -785,15 +1005,12 @@ vertex DustOut vsDust(uint vid [[vertex_id]], uint iid [[instance_id]], const de
     o.depth = dot(p.position.xyz - f.eye.xyz, fwd);
     o.radius = p.position.w;
     o.seed = p.extra.y;
-    // Lit by the sun through the cloud (no normal: a thin cloud scatters light from
-    // every side); strong forward scattering (Henyey-Greenstein, g = 0.55) makes
-    // plumes glow when the camera looks towards the low sun.
-    const float3 L = normalize(f.sunDir.xyz);
-    const float mu = dot(normalize(p.position.xyz - f.eye.xyz), L);
-    const float g = 0.55;
-    const float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5) / (4.0 * M_PI_F);
-    float3 light = kSunColour * f.sunDir.w * (0.35 + hg * 1.2) + float3(0.28, 0.28, 0.29);
-    o.rgb = haze(p.colour.rgb * light, p.position.xyz, f);
+    // Lit like FUEL's billboard_soft (sfx.vhl, p26-work/particles.md 2.5): scattering() at the particle,
+    // lit = (sky + sun x saturate(L.y)) x vcol (the shadowed variant lerps to sky x vcol; port: unshadowed),
+    // + inscatter. The port's dust colours are albedos stored linear: taken to gamma space here.
+    const Scatter sc = fuelScattering(f, p.position.xyz);
+    const float3 vcol = pow(max(p.colour.rgb, 0.0), 1.0 / 2.2) * sc.ext;
+    o.rgb = (f.skyColour.rgb + f.sunColour.rgb * saturate(f.lightDir.y)) * vcol + sc.insc;
     o.alpha = p.colour.a;
     return o;
 }
@@ -808,18 +1025,26 @@ fragment float4 fsDust(DustOut in [[stage_in]], depth2d<float> depth [[texture(0
     // The resolved depth turns back into a view distance with zn and q (fog.zw).
     float d = depth.read(uint2(in.position.xy));
     float scene = f.fog.z * f.fog.w / (d + f.fog.w);
-    float fade = saturate((scene - in.depth) / max(in.radius * 0.6, 0.1)) * saturate((in.depth - 0.4) / max(1.2, in.radius * 1.2));
+    // ph_billboard_soft: a *= saturate((sceneViewZ - particleViewZ) x 4); port: also thinned near the camera.
+    float fade = saturate((scene - in.depth) * 4.0) * saturate((in.depth - 0.4) / max(1.2, in.radius * 1.2));
     float a = saturate(in.alpha * blob * fade);
     return float4(in.rgb, a);
 }
 
-// ---- post-processing: bloom, light shafts, radial blur, tone mapping and grade ----
+// ---- FUEL's HDR post chain (fx.phl; p26-work/post.md P3): 128 x 128 scene shrink, log luminance,
+// 2 x 2 reductions to 1 x 1, eye adaptation, bright pass, 11-tap gaussian, two star streaks, tone map
+// (blue shift, exposure, bloom + star, x + x^2 + x^3 + x^4 curve, tint), radial speed blur.
 
 struct PostUniforms {
-    float4 sun;      // xy the sun in uv, z 0..1 how far it is on screen and in front, w glare strength
-    float4 texel;    // xy 1 / source size, z aspect (width / height), w frame number
-    float4 params;   // x exposure, y radial blur strength, z bloom strength, w light shaft strength
-    float4 grade;    // x saturation, y contrast, z vignette, w 1 = grade (0: plain tone map)
+    float4 bloom;      // gBloom: LumScale, Bias, Scale, Star amount
+    float4 hdr;        // x k = 0.94^(30 dt), y SCREENLUMINANCE, z min exposure, w max exposure
+    float4 blueShift;  // gBlueShift
+    float4 tint;       // gTintLerp
+    float4 mb0;        // gMotionBlurSettings0 (1/(Max-Min), -Min/(Max-Min), FallOff, scale)
+    float4 texel;      // xy: 1 / source size of the pass; zw: 1 / scene size
+    float4 flags;      // x 1: adaptation init; y 1: bloom and star; z 1: the output target is sRGB-encoded
+    float4 taps[11];   // gSampleOffsetWeight: xy offset (uv), z weight
+    float4 mbw[8];     // radial blur weights in .x
 };
 
 struct FullOut {
@@ -836,113 +1061,138 @@ vertex FullOut vsFull(uint vid [[vertex_id]]) {
 }
 
 constexpr sampler postLin(coord::normalized, filter::linear, address::clamp_to_edge);
+constexpr sampler postPoint(coord::normalized, filter::nearest, address::clamp_to_edge);
 
-// Half resolution: a 4x4 box of the scene above a soft threshold; alpha is the
-// share of sky (depth at the far plane), which the shafts and the glare use.
-fragment float4 fsBright(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], depth2d<float> depth [[texture(1)]],
-                         constant PostUniforms& u [[buffer(0)]]) {
-    float2 t = u.texel.xy;
-    float3 c = 0.0;
-    float sky = 0.0;
+// 1. The scene shrunk to 128 x 128 (ph_2d, one bilinear tap).
+fragment float4 fsShrink(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]]) { return src.sample(postLin, in.uv); }
+
+// 2. ph_lumlogavg: mean of ln(max(lum, 0.001)) over four point taps of the full scene at +-half a scene pixel.
+fragment float4 fsLumLog(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    float s = 0.0;
     for (int k = 0; k < 4; ++k) {
-        float2 o = float2((k & 1) ? 1.0 : -1.0, (k & 2) ? 1.0 : -1.0) * t;
-        c += min(src.sample(postLin, in.uv + o).rgb, float3(60.0));
-        sky += depth.sample(postLin, in.uv + o) >= 1.0 ? 0.25 : 0.0;
+        const float2 o = float2((k & 1) ? 0.5 : -0.5, (k & 2) ? 0.5 : -0.5) * u.texel.zw;
+        s += 0.25 * log(max(dot(src.sample(postPoint, in.uv + o).rgb, float3(0.3, 0.59, 0.11)), 0.001));
     }
-    c *= 0.25;
-    const float threshold = 1.4, knee = 0.7;
-    float lum = max(c.r, max(c.g, c.b));
-    float soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
-    soft = soft * soft / (4.0 * knee + 1e-4);
-    float w = max(soft, lum - threshold) / max(lum, 1e-4);
-    return float4(c * w, sky);
+    return float4(s, 0, 0, 1);
 }
 
-fragment float4 fsDown(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
-    float2 t = u.texel.xy;
-    return 0.25 * (src.sample(postLin, in.uv + float2(-t.x, -t.y)) + src.sample(postLin, in.uv + float2(t.x, -t.y)) +
-                   src.sample(postLin, in.uv + float2(-t.x, t.y)) + src.sample(postLin, in.uv + float2(t.x, t.y)));
+// 3. ph_lumavg: exact 2 x 2 box mean of the level above.
+fragment float4 fsLumAvg(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    float s = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        const float2 o = float2((k & 1) ? 0.5 : -0.5, (k & 2) ? 0.5 : -0.5) * u.texel.xy;
+        s += 0.25 * src.sample(postPoint, in.uv + o).r;
+    }
+    return float4(s, 0, 0, 1);
 }
 
-// A 3x3 tent of the smaller level, added onto the larger one (rgb only).
-fragment float4 fsUp(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
-    float2 t = u.texel.xy;
-    float3 c = src.sample(postLin, in.uv).rgb * 4.0;
-    c += (src.sample(postLin, in.uv + float2(-t.x, 0)).rgb + src.sample(postLin, in.uv + float2(t.x, 0)).rgb +
-          src.sample(postLin, in.uv + float2(0, -t.y)).rgb + src.sample(postLin, in.uv + float2(0, t.y)).rgb) * 2.0;
-    c += src.sample(postLin, in.uv + float2(-t.x, -t.y)).rgb + src.sample(postLin, in.uv + float2(t.x, -t.y)).rgb +
-         src.sample(postLin, in.uv + float2(-t.x, t.y)).rgb + src.sample(postLin, in.uv + float2(t.x, t.y)).rgb;
-    return float4(c / 16.0, 0.0);
+// 4. ph_lumadaptation(init): the exposure S = 1 / adapted luminance.
+fragment float4 fsAdapt(FullOut in [[stage_in]], texture2d<float> avg [[texture(0)]], texture2d<float> prev [[texture(1)]],
+                        constant PostUniforms& u [[buffer(0)]]) {
+    const float A = avg.read(uint2(0, 0)).r;
+    const float sl = u.hdr.y;
+    if (u.flags.x > 0.0) return float4(sl / exp(A), 0, 0, 1);
+    const float c = clamp(1.5 * exp(A) / sl, 1.0 / u.hdr.w, 1.0 / u.hdr.z);
+    const float a = 1.0 / prev.read(uint2(0, 0)).r;
+    const float an = c * pow(a / c, u.hdr.x);
+    float S = 1.0 / an;
+    if (!(S > 0.01 && S < 100.0)) S = 1.0 / c;
+    return float4(S, 0, 0, 1);
 }
 
-// Quarter resolution: light shafts, marching from each pixel towards the sun
-// through the sky mask (sky near the sun shines through gaps in the trees).
-fragment float4 fsShafts(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
-    if (u.sun.z <= 0.0) return float4(0.0);
-    const int n = 28;
-    float2 aspect = float2(u.texel.z, 1.0);
-    float2 delta = (u.sun.xy - in.uv) / float(n) * 0.9;
-    float2 p = in.uv + delta * hash12(in.position.xy + u.texel.w);  // jitter against banding
-    float sum = 0.0, decay = 1.0;
-    for (int i = 0; i < n; ++i) {
-        float near = exp(-length((p - u.sun.xy) * aspect) * 3.5);
-        sum += src.sample(postLin, p).a * near * decay;
-        decay *= 0.965;
-        p += delta;
-    }
-    return float4(kSunColour * sum / float(n) * u.sun.z, 0.0);
+// 5. ph_hdrbloominit: bright pass into the 8-bit bloom target (clamped to [0, 1] by the format).
+fragment float4 fsBright(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], texture2d<float> expo [[texture(1)]],
+                         constant PostUniforms& u [[buffer(0)]]) {
+    const float S = expo.read(uint2(0, 0)).r;
+    const float3 c = src.sample(postLin, in.uv).rgb;
+    return float4(max(float3(0.0), (4.0 * c * u.bloom.x * (0.3 / u.hdr.y) * S - u.bloom.y) * u.bloom.z), 1.0);
 }
 
-float3 acesFitted(float3 x) {  // Narkowicz
-    return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
-}
-
-fragment float4 fsComposite(FullOut in [[stage_in]], texture2d<float> hdr [[texture(0)]], texture2d<float> bloom [[texture(1)]],
-                            texture2d<float> shafts [[texture(2)]], texture2d<float> skyShare [[texture(3)]],
-                            constant PostUniforms& u [[buffer(0)]]) {
-    float2 uv = in.uv;
-    float2 fromCentre = uv - float2(0.5, 0.48);
-    float radial = length(fromCentre * float2(u.texel.z, 1.0)) / (0.5 * u.texel.z);  // ~1 at the side edges
-    // Speed blur: samples along the ray from the centre, longer towards the edges.
-    float blur = u.params.y * smoothstep(0.15, 1.0, radial);
-    float3 c;
-    if (blur > 0.002) {
-        const int n = 10;
-        c = 0.0;
-        float j = hash12(in.position.xy + u.texel.w) - 0.5;
-        for (int i = 0; i < n; ++i) c += hdr.sample(postLin, uv - fromCentre * blur * ((float(i) + j) / float(n))).rgb;
-        c /= float(n);
-    } else {
-        c = hdr.sample(postLin, uv).rgb;
-    }
-    if (u.params.z > 0.0) c += bloom.sample(postLin, uv).rgb * u.params.z;
-    if (u.params.w > 0.0) c += shafts.sample(postLin, uv).rgb * u.params.w;
-    if (u.sun.z > 0.0) {
-        // Glare around the sun, as strong as there is open sky round it.
-        float vis = skyShare.sample(postLin, u.sun.xy).a;
-        float d = length((uv - u.sun.xy) * float2(u.texel.z, 1.0));
-        c += kSunColour * vis * u.sun.z * u.sun.w * (exp(-d * 6.0) * 0.3 + exp(-d * 24.0) * 1.2);
-    }
-    c *= u.params.x;
-    if (u.grade.w > 0.0) {
-        c *= float3(1.03, 1.0, 0.94);  // warm white balance
-        c = acesFitted(c);
-        // Grade in display space: contrast around mid grey, lift the blacks a touch
-        // towards brown, golden highlights, then saturation.
-        float3 g = pow(c, 1.0 / 2.2);
-        g = saturate((g - 0.45) * u.grade.y + 0.45);
-        g = g * mix(float3(0.97, 1.0, 1.02), float3(1.04, 0.99, 0.90), g) + float3(0.016, 0.011, 0.004) * (1.0 - g);
-        float l = dot(g, float3(0.2126, 0.7152, 0.0722));
-        g = mix(float3(l), g, u.grade.x);
-        // Vignette: dark corners and edges.
-        float v = smoothstep(1.25, 0.35, length(fromCentre * float2(1.0, 1.15)) * 1.6);
-        g *= mix(1.0, v, u.grade.z);
-        g += (hash12(in.position.xy * 1.37 + u.texel.w * 7.0) - 0.5) / 255.0;  // dither
-        c = pow(saturate(g), 2.2);
-    } else {
-        c = acesFitted(c);
-    }
+// 6, 7. ph_hdrbloom: 11 weighted bilinear taps (gaussian, or a diagonal star streak with scaled offsets).
+fragment float4 fsGauss(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    float3 c = 0.0;
+    for (int k = 0; k < 11; ++k) c += u.taps[k].z * src.sample(postLin, in.uv + u.taps[k].xy).rgb;
     return float4(c, 1.0);
+}
+
+// The display value v goes out through the inverse sRGB curve when the target encodes sRGB, so the
+// stored byte is v itself (FUEL writes the tone-mapped value straight into an 8-bit buffer).
+float3 displayOut(float3 v, constant PostUniforms& u) {
+    v = saturate(v);
+    if (u.flags.z <= 0.0) return v;
+    return select(pow((v + 0.055) / 1.055, 2.4), v / 12.92, v <= 0.04045);
+}
+
+// 8. ph_tonemapping.
+float3 toneMapFuel(float3 c, float S, float3 bloom, constant PostUniforms& u) {
+    const float bw = dot(c, float3(0.2125, 0.7154, 0.0721));
+    float t = 1.0 - min(1.0, u.blueShift.w * bw);
+    t *= t;
+    c = mix(c, u.blueShift.rgb * bw, t);
+    c = c * S + bloom;
+    const float3 P = c + c * c + c * c * c + c * c * c * c;
+    c = P / (1.0 + P);
+    const float br = dot(c, float3(0.2125, 0.7154, 0.0721));
+    return mix(c, br * u.tint.rgb, u.tint.a);
+}
+
+fragment float4 fsToneMap(FullOut in [[stage_in]], texture2d<float> scene [[texture(0)]], texture2d<float> expo [[texture(1)]],
+                          texture2d<float> bloom [[texture(2)]], texture2d<float> starA [[texture(3)]], texture2d<float> starB [[texture(4)]],
+                          constant PostUniforms& u [[buffer(0)]]) {
+    const float3 c = scene.read(uint2(in.position.xy)).rgb;
+    const float S = expo.read(uint2(0, 0)).r;
+    float3 b = 0.0;
+    if (u.flags.y > 0.0) {
+        const float2 buv = in.uv + 1.0 / 128.0;
+        b = bloom.sample(postLin, buv).rgb + u.bloom.w * (starA.sample(postLin, buv).rgb + starB.sample(postLin, buv).rgb);
+    }
+    return float4(displayOut(toneMapFuel(c, S, b, u), u), 1.0);
+}
+
+// 9. ph_motionblur: 8 taps towards the screen centre, stronger at the edges and the bottom.
+fragment float4 fsRadial(FullOut in [[stage_in]], texture2d<float> src [[texture(0)]], constant PostUniforms& u [[buffer(0)]]) {
+    const float2 H = in.uv * 2.0 - 1.0;
+    const float l = length(H);
+    const float2 dir = l > 1e-6 ? H / l : float2(0.0);
+    float a = saturate(l * u.mb0.x + u.mb0.y);
+    a = a * a * a * a * u.mb0.w * in.uv.y;
+    const float2 step = -dir * a;
+    float3 c = 0.0;
+    for (int i = 0; i < 8; ++i) c += u.mbw[i].x * src.sample(postLin, in.uv + float(i) * step).rgb;
+    return float4(displayOut(c, u), 1.0);
+}
+
+// ---- --rendercheck: the shader maths on test inputs (see rendercheck.mm for the input layout).
+kernel void kRenderCheck(constant FrameUniforms& f [[buffer(0)]], const device float4* in [[buffer(1)]], device float4* out [[buffer(2)]],
+                         uint id [[thread_position_in_grid]]) {
+    const float4 a = in[id * 4], b = in[id * 4 + 1], c = in[id * 4 + 2], d = in[id * 4 + 3];
+    float4 r0 = 0.0, r1 = 0.0;
+    switch (int(a.w)) {
+        case 0: {  // scattering of point a.xyz
+            const Scatter s = fuelScattering(f, a.xyz);
+            r0 = float4(s.ext, 0);
+            r1 = float4(s.insc, 0);
+            break;
+        }
+        case 1: {  // lighting(): n = a.xyz, V = b.xyz, albedo = c.xyz, shadow = c.w, occ = d.x, spec = d.y, power = d.z
+            const float3 col = fuelLighting(normalize(a.xyz), f.lightDir.xyz, f.skyDir.xyz, normalize(b.xyz), f.sunColour.rgb,
+                                            mix(f.skyAmbient.rgb, f.skyColour.rgb, d.x), c.xyz, float3(d.y), d.z, c.w, float3(0), d.x);
+            r0 = float4(col, 0);
+            break;
+        }
+        case 2: {  // tone curve of a.x, a.y, a.z
+            const float3 x = a.xyz;
+            const float3 P = x + x * x + x * x * x + x * x * x * x;
+            r0 = float4(P / (1.0 + P), 0);
+            break;
+        }
+        case 3: {  // the sky along a.xyz
+            r0 = float4(fuelSky(f, normalize(a.xyz)), 0);
+            break;
+        }
+    }
+    out[id * 2] = r0;
+    out[id * 2 + 1] = r1;
 }
 )METAL";
 
@@ -966,9 +1216,10 @@ struct GrassOut {
     float4 position [[position]];
     float3 world;
     float2 uv;
-    float3 tint;
-    float occlusion;
-    float4 sunPos;
+    float3 vcol;      // colour x 2 x extinction (ground_rotshape.vhl)
+    float3 sky;       // lerp(DSKY_AMBIENT, DSKY_COLOR, occlusion)
+    float3 sunlit;    // sky + sun x saturate(L.n), n = up (port: the tufts carry no normal)
+    float3 insc;
 };
 
 constant uint kGrassCorner[9] = {0, 1, 2, 0, 2, 3, 0, 3, 4};
@@ -1000,28 +1251,26 @@ vertex GrassOut vsGrass(uint vid [[vertex_id]], uint iid [[instance_id]], consta
     o.world = w;
     const uint tile = t.info.x;
     o.uv = float2(float(tile & 3u), float(tile >> 2u)) * 0.25 + kGrassUv[c];
-    // ground_rotshape.vhl: vcolor = colour x 2 (x the scattering extinction, which the port's haze
-    // applies later); the colour is the decoded point colour lerp(ctx+0x80, ctx+0x50, road) and its
-    // alpha the sky occlusion. The texel multiplies it in the pixel shader.
-    // FUEL multiplies in gamma space (DX9, no sRGB reads), so x2 is applied before linearising:
-    // linear(2 c x tex) = linear(2 c) x linear(tex) (power law).
-    o.tint = pow(2.0 * float3(t.colour.rgb) / 255.0, 2.2);
-    o.occlusion = float(t.colour.a) / 255.0;
-    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    // ground_rotshape.vhl: vcolor = colour x 2 x extinction (gamma space, like the game); the colour is the
+    // decoded point colour lerp(ctx+0x80, ctx+0x50, road) and its alpha the sky occlusion.
+    const Scatter sc = fuelScattering(f, w);
+    o.vcol = 2.0 * float3(t.colour.rgb) / 255.0 * sc.ext;
+    o.insc = sc.insc;
+    const float occ = float(t.colour.a) / 255.0;
+    o.sky = mix(f.skyAmbient.rgb, f.skyColour.rgb, occ);
+    o.sunlit = o.sky + f.sunColour.rgb * saturate(f.lightDir.y);
     return o;
 }
 
 fragment float4 fsGrass(GrassOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], texture2d<float> atlas [[texture(0)]],
-                        depth2d<float> shadowMap [[texture(7)]]) {
+                        depth2d_array<float> shadowMap [[texture(7)]]) {
     constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge, max_anisotropy(4));
     float4 d = atlas.sample(smp, in.uv);
     if (d.a < 0.4) discard_fragment();
-    d.rgb *= in.tint;
-    const float shadow = mix(0.55, 1.0, shadowFactor(shadowMap, in.sunPos));
-    const float3 V = normalize(f.eye.xyz - in.world);
-    // The occlusion scales the sky light only (ground_rotshape.vhl: lerp(DSKY_AMBIENT, sky, occlusion)).
-    const float3 rgb = lighting(d.rgb, float3(0, 1, 0), V, in.occlusion, shadow, 0.0, 1.0, float2(0), false, f);
-    return float4(haze(rgb, in.world, f), d.a);
+    // ground_rotshape.phl: vcol x tex x lerp(sky, sunlit, sunlighting(shadow, 0.5)) + inscatter.
+    const float shadow = fuelShadow(shadowMap, in.world, f);
+    const float3 rgb = d.rgb * in.vcol * mix(in.sky, in.sunlit, fuelSunlighting(shadow, 0.5)) + in.insc;
+    return float4(rgb, d.a);
 }
 )METAL";
 
@@ -1043,6 +1292,11 @@ struct FrameUniforms {
     simd_float4 camUp;
     simd_float4 groundFar;
     simd_float4 groundFine[3];
+    simd_float4 lightDir, skyDir, sunColour, dlight, skyColour, skyAmbient, sunRaw;
+    simd_float4 scat[11];
+    simd_float4 shadowSplit, shadowSize;
+    simd_float4x4 shadowMat[4];
+    simd_float4x4 view;
 };
 
 namespace {
@@ -1061,10 +1315,16 @@ struct MaterialUniforms {
 };
 
 struct PostUniforms {
-    simd_float4 sun;
-    simd_float4 texel;
-    simd_float4 params;
-    simd_float4 grade;
+    simd_float4 bloom, hdr, blueShift, tint, mb0, texel, flags;
+    simd_float4 taps[11];
+    simd_float4 mbw[8];
+};
+
+struct ShadowUniforms {
+    simd_float4x4 lightViewProj;
+    simd_float4 light;
+    simd_float4 eye;  // the terrain caster's geomorph (unused by mesh casters)
+    simd_float4 lightRight, lightUp;
 };
 
 // Right-handed view and projection with clip z in [0, 1]. FUEL's data is
@@ -1185,10 +1445,13 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     const uint32_t px = 0xFFFFFFFF;
     [white_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&px bytesPerRow:4];
 
+    // FUEL's shadow atlas: 4 slices of W x W (0x837660: 1024 x 4096 R32F; 2048 with -HS), here a depth array.
     MTLTextureDescriptor* sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                                     width:kShadowMapSize
                                                                                    height:kShadowMapSize
                                                                                 mipmapped:NO];
+    sd.textureType = MTLTextureType2DArray;
+    sd.arrayLength = 4;
     sd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     sd.storageMode = MTLStorageModePrivate;
     shadowMap_ = [device newTextureWithDescriptor:sd];
@@ -1278,28 +1541,64 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         return ps;
     };
     dustPipeline_ = makePost(@"vsDust", @"fsDust", kRenderColorFormat, 1);
-    brightPipeline_ = makePost(@"vsFull", @"fsBright", kRenderColorFormat, 0);
-    downPipeline_ = makePost(@"vsFull", @"fsDown", kRenderColorFormat, 0);
-    upPipeline_ = makePost(@"vsFull", @"fsUp", kRenderColorFormat, 2);
-    shaftsPipeline_ = makePost(@"vsFull", @"fsShafts", kRenderColorFormat, 0);
-    compositePipeline_ = makePost(@"vsFull", @"fsComposite", kOutputColorFormat, 0);
+    shrinkPipeline_ = makePost(@"vsFull", @"fsShrink", kRenderColorFormat, 0);
+    lumLogPipeline_ = makePost(@"vsFull", @"fsLumLog", MTLPixelFormatR32Float, 0);
+    lumAvgPipeline_ = makePost(@"vsFull", @"fsLumAvg", MTLPixelFormatR32Float, 0);
+    adaptPipeline_ = makePost(@"vsFull", @"fsAdapt", MTLPixelFormatR32Float, 0);
+    brightPipeline_ = makePost(@"vsFull", @"fsBright", MTLPixelFormatRGBA8Unorm, 0);
+    gaussPipeline_ = makePost(@"vsFull", @"fsGauss", MTLPixelFormatRGBA8Unorm, 0);
+    toneMapPipeline_ = makePost(@"vsFull", @"fsToneMap", kOutputColorFormat, 0);
+    toneMapFxPipeline_ = makePost(@"vsFull", @"fsToneMap", MTLPixelFormatRGBA8Unorm, 0);
+    radialPipeline_ = makePost(@"vsFull", @"fsRadial", kOutputColorFormat, 0);
+    {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [shaders_ newFunctionWithName:@"vsTerrainShadow"];
+        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        NSError* e = nil;
+        terrainShadowPipeline_ = [device newRenderPipelineStateWithDescriptor:d error:&e];
+        if (terrainShadowPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
+        // Reversed depth: 1 at the light camera, cleared to 0, the nearest caster to the sun wins.
+        MTLDepthStencilDescriptor* sds = [MTLDepthStencilDescriptor new];
+        sds.depthCompareFunction = MTLCompareFunctionGreaterEqual;
+        sds.depthWriteEnabled = YES;
+        shadowDepth_ = [device newDepthStencilStateWithDescriptor:sds];
+    }
 
-    // A low, warm evening sun (about 22 degrees up), as in most of FUEL's races.
-    sunDir_ = simd_normalize(simd_make_float3(0.718f, 0.375f, 0.587f));
+    sunDir_ = simd_make_float3(0, 1, 0);  // replaced every frame by FUEL's sun (fillAtmosphere)
 }
 
 void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
-    // Colour map (sRGB, mipmapped) and surface-type map (one byte per sample).
-    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+    // Engine settings read from the player's files: the post defaults and shadow table from FUEL.exe,
+    // the clock scale PP371 from pp001.tsc.
+    if (!engineSettingsRead_) {
+        engineSettingsRead_ = true;
+        const std::string exe = engineExePath(world);
+        readEngineRenderSettings(exe.c_str(), postDefaults_, shadowSettings_);
+        const std::filesystem::path pp = std::filesystem::path(world.path()).parent_path().parent_path().parent_path() / "CommonComponent" /
+                                         "Param" / "pp001.tsc";
+        if (FILE* fp = std::fopen(pp.string().c_str(), "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, fp)) {
+                int row = 0;
+                float v = 0;
+                if (std::sscanf(line, "PP %d %f", &row, &v) == 2 && row == 371) {
+                    clockScale = v;
+                    break;
+                }
+            }
+            std::fclose(fp);
+        }
+    }
+    // Colour map (gamma-space bytes read as they are, mipmapped) and surface-type map (one byte per sample).
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                     width:maps.size
                                                                                    height:maps.size
                                                                                 mipmapped:YES];
     groundColour_ = [device_ newTextureWithDescriptor:td];
-    groundFar_ = simd_make_float4(srgbToLinear(maps.farColour[0]), srgbToLinear(maps.farColour[1]), srgbToLinear(maps.farColour[2]),
-                                  maps.decoded ? 1.0f : 0.0f);
+    groundFar_ = simd_make_float4(maps.farColour[0], maps.farColour[1], maps.farColour[2], maps.decoded ? 1.0f : 0.0f);
     [groundColour_ replaceRegion:MTLRegionMake2D(0, 0, maps.size, maps.size) mipmapLevel:0 withBytes:maps.colour.data() bytesPerRow:maps.size * 4];
     {
-        MTLTextureDescriptor* fd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+        MTLTextureDescriptor* fd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                       width:kGroundTile
                                                                                      height:kGroundTile
                                                                                   mipmapped:YES];
@@ -1322,7 +1621,7 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
             const uint32_t bm = genWorldEnumTexture(world, enums[k]);
             const DpcFile::Entry* e = bm != 0 ? world.find(bm) : nullptr;
             uint8_t alpha = 0;
-            decalTex_[k] = e != nullptr ? uploadBitmap(world, *e, true, &alpha) : nil;
+            decalTex_[k] = e != nullptr ? uploadBitmap(world, *e, false, &alpha) : nil;
         }
     }
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:maps.size height:maps.size mipmapped:NO];
@@ -1435,16 +1734,18 @@ id<MTLRenderPipelineState> MeshRenderer::pipeline(uint32_t stride, AlphaMode mod
     return ps;
 }
 
-id<MTLRenderPipelineState> MeshRenderer::shadowPipeline(uint32_t stride) {
-    if (auto it = shadowPipelines_.find(stride); it != shadowPipelines_.end()) return it->second;
+id<MTLRenderPipelineState> MeshRenderer::shadowPipeline(uint32_t stride, bool cut) {
+    const uint32_t key = stride << 1 | (cut ? 1u : 0u);
+    if (auto it = shadowPipelines_.find(key); it != shadowPipelines_.end()) return it->second;
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = [shaders_ newFunctionWithName:@"vsShadow"];
+    if (cut) pd.fragmentFunction = [shaders_ newFunctionWithName:@"fsShadowCut"];
     pd.vertexDescriptor = meshVertexDescriptor(stride);
     pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     NSError* err = nil;
     id<MTLRenderPipelineState> ps = [device_ newRenderPipelineStateWithDescriptor:pd error:&err];
     if (ps == nil) [NSException raise:@"pipeline" format:@"%@", err];
-    shadowPipelines_[stride] = ps;
+    shadowPipelines_[key] = ps;
     return ps;
 }
 
@@ -1571,12 +1872,13 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId, uint32
                 gm.features |= PaintOnly;
         }
         uint8_t alphaKind = 0, ignored = 0;
-        if (id<MTLTexture> t = texture(diffuseTex, true, &alphaKind)) gm.textures[kDiffuse] = t;
+        // Gamma space like the game: colour textures are read without sRGB decoding.
+        if (id<MTLTexture> t = texture(diffuseTex, false, &alphaKind)) gm.textures[kDiffuse] = t;
         const TextureStats& ts = textureStats(diffuseTex);
         if (ts.greyDetail) gm.features |= GroundTint;
         const struct { Slot slot; bool srgb; uint32_t feature; } maps[] = {
             {kOcclusion, false, HasOcclusion}, {kNormal, false, HasNormal},     {kSpecular, false, HasSpecular},
-            {kNormalLocal, false, HasNormalLocal}, {kDirt, true, HasDirt},
+            {kNormalLocal, false, HasNormalLocal}, {kDirt, false, HasDirt},
         };
         for (const auto& mp : maps) {
             if (id<MTLTexture> t = texture(m.textures[size_t(mp.slot)], mp.srgb, &ignored)) {
@@ -1865,52 +2167,238 @@ void MeshRenderer::setVehicleWorlds(size_t k, const std::vector<simd_float4x4>& 
 }
 
 simd_float4x4 MeshRenderer::sunViewProj() const {
+    // Legacy single-map matrix (kept for FrameUniforms.sunViewProj; the shaders use the 4 slices).
     const simd_float3 up = std::fabs(sunDir_.y) > 0.99f ? simd_make_float3(0, 0, 1) : simd_make_float3(0, 1, 0);
     const float r = shadowHalfSize() / 1.05f;
     const simd_float3 eye = center_ + sunDir_ * (r * 3.0f);
     return simd_mul(orthoRH(r * 1.05f, r * 0.5f, r * 6.0f), lookAtRH(eye, center_, up));
 }
 
-void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.depthAttachment.texture = shadowMap_;
-    rp.depthAttachment.loadAction = MTLLoadActionClear;
-    rp.depthAttachment.clearDepth = 1.0;
-    rp.depthAttachment.storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-    FrameUniforms fu{};
-    fu.sunViewProj = sunViewProj();
-    [enc setVertexBytes:&fu length:sizeof fu atIndex:1];
-    [enc setDepthStencilState:depthWrite_];
-    [enc setDepthBias:1.0f slopeScale:2.0f clamp:0.01f];
-    [enc setCullMode:MTLCullModeNone];
-    // World objects cast shadows only near the focus (the shadow map covers the scene radius).
-    std::vector<const Instance*> casters;
-    for (const Instance& inst : instances_) casters.push_back(&inst);
-    for (const Instance& inst : worldInstances_)
-        if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
-    for (const Instance& inst : propInstances_)
-        if (simd_distance(inst.world.columns[3].xyz, center_) < radius_ * 3.0f + 30.0f) casters.push_back(&inst);
-    for (const OtherVehicle& ov : vehicles_)
-        for (const Instance& inst : ov.instances)
-            if (simd_distance(inst.world.columns[3].xyz, center_) < shadowHalfSize() * 1.5f + 5.0f) casters.push_back(&inst);
-    for (const Instance* ip : casters) {
-        const Instance& inst = *ip;
-        const GpuMesh& gm = *inst.mesh;
-        [enc setVertexBytes:&inst.world length:sizeof inst.world atIndex:2];
-        for (uint32_t pass = 0; pass < 2; ++pass) {  // opaque and alpha-tested parts cast shadows
-            for (const Draw& d : gm.draws[pass]) {
-                [enc setRenderPipelineState:shadowPipeline(gm.vbStrides[d.vb])];
-                [enc setVertexBuffer:gm.vbs[d.vb] offset:0 atIndex:0];
-                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                indexCount:d.indexCount
-                                 indexType:MTLIndexTypeUInt32
-                               indexBuffer:gm.indices
-                         indexBufferOffset:size_t(d.firstIndex) * 4];
+double MeshRenderer::timeOfDay() const {
+    if (forcedTimeOfDay >= 0) return forcedTimeOfDay;  // ForceDayTime
+    // WeatherManager_G 0x5b89e0: t = game clock (s) x PP371 + 28800 (08:00).
+    const double clock = gameClock >= 0 ? gameClock : std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch_).count();
+    return clock * double(clockScale) + 28800.0;
+}
+
+namespace {
+
+simd_float4 f4(const F3& v, float w) { return simd_make_float4(v[0], v[1], v[2], w); }
+
+using Mat4d = std::array<double, 16>;  // row-major
+Mat4d mul(const Mat4d& a, const Mat4d& b) {
+    Mat4d r{};
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            double v = 0;
+            for (int k = 0; k < 4; ++k) v += a[size_t(i * 4 + k)] * b[size_t(k * 4 + j)];
+            r[size_t(i * 4 + j)] = v;
+        }
+    return r;
+}
+simd_float4x4 toSimd(const Mat4d& m) {  // simd is column-major
+    simd_float4x4 r;
+    for (int c = 0; c < 4; ++c)
+        r.columns[c] = simd_make_float4(float(m[size_t(c)]), float(m[size_t(4 + c)]), float(m[size_t(8 + c)]), float(m[size_t(12 + c)]));
+    return r;
+}
+
+}  // namespace
+
+void MeshRenderer::fillAtmosphere(FrameUniforms& fu, simd_float3 eye, const simd_float4x4&, float, float, float) {
+    AtmosphereInput in;
+    in.timeOfDay = timeOfDay();
+    in.weather = weather;
+    in.brightness = brightness;
+    in.camera = {eye.x, eye.y, eye.z};
+    atmo_ = computeAtmosphere(in);
+    const Atmosphere& a = atmo_;
+    sunDir_ = simd_make_float3(a.lightDir[0], a.lightDir[1], a.lightDir[2]);
+    fu.sunDir = simd_make_float4(sunDir_, 1.0f);
+    fu.lightDir = f4(a.lightDir, a.invIntensity);
+    fu.skyDir = f4(a.skyDir, 0);
+    fu.sunColour = f4(a.sunColour, 1);
+    fu.dlight = f4(a.dlightColor, a.blueShift[3]);
+    fu.skyColour = f4(a.dskyColor, 0);
+    fu.skyAmbient = f4(a.dskyAmbient, 0);
+    fu.sunRaw = f4(a.sunRaw, a.day ? 1.0f : 0.0f);
+    for (int i = 0; i < 11; ++i) fu.scat[i] = simd_make_float4(a.c[size_t(i)][0], a.c[size_t(i)][1], a.c[size_t(i)][2], a.c[size_t(i)][3]);
+    // FUEL's view space: camera-relative, +z forward (WorldToViewVertex).
+    const simd_float3 r = fu.camRight.xyz, u = fu.camUp.xyz, fwd = simd_cross(fu.camUp.xyz, fu.camRight.xyz);
+    fu.view = simd_matrix(simd_make_float4(r.x, u.x, fwd.x, 0), simd_make_float4(r.y, u.y, fwd.y, 0), simd_make_float4(r.z, u.z, fwd.z, 0),
+                          simd_make_float4(-simd_dot(r, eye), -simd_dot(u, eye), -simd_dot(fwd, eye), 1));
+}
+
+// FUEL's cascaded shadow map (p26-work/shadows.md S2, ShadowMap_RenderSlices 0x7566b0 / FitOrtho 0x753740).
+void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb, FrameUniforms& fu, const std::vector<std::shared_ptr<const TerrainChunk>>& chunks) {
+    const ShadowSettings& ss = shadowSettings_;
+    const double W = double(kShadowMapSize);
+    fu.shadowSplit = simd_make_float4(ss.splits[0], ss.splits[1], ss.splits[2], ss.splits[3]);
+    fu.shadowSize = simd_make_float4(float(W), float(1 / W), float(1 / W), float(W));
+    // Slice 0 every frame, 1..3 in turn (all four on the first frame).
+    unsigned mask;
+    if (shadowCounter_ < 0) {
+        mask = 0xF;
+        shadowCounter_ = 0;
+    } else {
+        shadowCounter_ = (shadowCounter_ + 1) % 3;
+        mask = (1u << (shadowCounter_ + 1)) | 1u;
+    }
+    for (int i = 0; i < 4; ++i)
+        if (!sliceValid_[size_t(i)]) mask |= 1u << i;
+
+    // Camera: eye, axes and the projection (from the frame's matrices).
+    const simd_float3 eyeF = fu.eye.xyz;
+    const double ex = eyeF.x, ey = eyeF.y, ez = eyeF.z;
+    const simd_float3 R = fu.camRight.xyz, U = fu.camUp.xyz, F = simd_cross(fu.camUp.xyz, fu.camRight.xyz);
+    const simd_float4x4 proj = simd_mul(fu.viewProj, simd_inverse(simd_mul(simd_matrix(simd_make_float4(1, 0, 0, 0), simd_make_float4(0, 1, 0, 0),
+                                                                                         simd_make_float4(0, 0, -1, 0), simd_make_float4(0, 0, 0, 1)),
+                                                                             fu.view)));
+    const double tanY = 1.0 / double(proj.columns[1].y), tanX = 1.0 / double(proj.columns[0].x);
+    const double zn = double(fu.fog.z);
+    // Light basis: towards the sun L, right = normalize(cross(-L, up)) (fallback -x), up = cross(right, -L).
+    const double L[3] = {fu.lightDir.x, fu.lightDir.y, fu.lightDir.z};
+    double rt[3] = {L[2], 0, -L[0]};  // cross(-L, (0,1,0))
+    double rl = std::sqrt(rt[0] * rt[0] + rt[2] * rt[2]);
+    if (rl * rl <= 0.001) rt[0] = -1, rt[1] = 0, rt[2] = 0, rl = 1;
+    for (double& v : rt) v /= rl;
+    // up = cross(-L, right)
+    const double up[3] = {-(L[1] * rt[2] - L[2] * rt[1]), -(L[2] * rt[0] - L[0] * rt[2]), -(L[0] * rt[1] - L[1] * rt[0])};
+
+    // Receiver matrices need view -> world (double).
+    const Mat4d invView = {R.x, U.x, F.x, ex, R.y, U.y, F.y, ey, R.z, U.z, F.z, ez, 0, 0, 0, 1};
+    const Mat4d tex = {0.5, 0, 0, 0.5, 0, -0.5, 0, 0.5, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    struct Box { double cx, cy, hx, hy, minH; };
+    std::array<Box, 4> boxes{};
+    for (int i = 3; i >= 0; --i) {
+        if (!(mask & (1u << i))) continue;
+        const double nearZ = i == 0 ? zn : ss.splits[size_t(i - 1)], farZ = ss.splits[size_t(i)];
+        double minX = 1e30, maxX = -1e30, minY = 1e30, maxY = -1e30, minH = 1e30;
+        for (int c = 0; c < 8; ++c) {
+            const double z = (c & 4) ? farZ : nearZ, x = ((c & 1) ? 1 : -1) * z * tanX, y = ((c & 2) ? 1 : -1) * z * tanY;
+            const double p[3] = {ex + R.x * x + U.x * y + F.x * z, ey + R.y * x + U.y * y + F.y * z, ez + R.z * x + U.z * y + F.z * z};
+            const double lx = p[0] * rt[0] + p[1] * rt[1] + p[2] * rt[2], ly = p[0] * up[0] + p[1] * up[1] + p[2] * up[2],
+                         lh = p[0] * L[0] + p[1] * L[1] + p[2] * L[2];
+            minX = std::min(minX, lx), maxX = std::max(maxX, lx), minY = std::min(minY, ly), maxY = std::max(maxY, ly), minH = std::min(minH, lh);
+        }
+        const double p7 = i == 0 ? 1.0 : 0.95;  // border factor
+        const double sx = 2.0 / ((2.0 - p7) * (maxX - minX)), sy = 2.0 / ((2.0 - p7) * (maxY - minY));
+        const double cx = (minX + maxX) * 0.5, cy = (minY + maxY) * 0.5, ZE = ss.zExtent;
+        // Camera ZExtent towards the sun from just behind the box (maxZ + 0.1 away from the sun):
+        // z_clip = 1 - zLight / ZExtent = (h - minH + 0.1) / ZExtent.
+        sliceLvp_[size_t(i)] = {sx * rt[0], sx * rt[1], sx * rt[2], -sx * cx, sy * up[0], sy * up[1], sy * up[2], -sy * cy,
+                                L[0] / ZE, L[1] / ZE, L[2] / ZE, (-minH + 0.1) / ZE, 0, 0, 0, 1};
+        sliceBias_[size_t(i)] = float((farZ - nearZ) * ss.zbias[size_t(i)] * ss.zbiasAdd);
+        sliceValid_[size_t(i)] = true;
+        boxes[size_t(i)] = {cx, cy, 1.0 / sx, 1.0 / sy, minH};
+    }
+    for (int i = 0; i < 4; ++i) fu.shadowMat[i] = toSimd(mul(tex, mul(sliceLvp_[size_t(i)], invView)));
+
+    for (int i = 3; i >= 0; --i) {
+        if (!(mask & (1u << i))) continue;
+        const Box& bx = boxes[size_t(i)];
+        auto visible = [&](double px, double py, double pz, double rad) {
+            const double lx = px * rt[0] + py * rt[1] + pz * rt[2], ly = px * up[0] + py * up[1] + pz * up[2], lh = px * L[0] + py * L[1] + pz * L[2];
+            return std::fabs(lx - bx.cx) <= bx.hx + rad && std::fabs(ly - bx.cy) <= bx.hy + rad && lh >= bx.minH - rad &&
+                   lh <= bx.minH + ss.zExtent + rad;
+        };
+        // Casters grouped by mesh: one instanced draw each.
+        std::unordered_map<const GpuMesh*, std::vector<simd_float4x4>> groups;
+        auto consider = [&](const Instance& inst) {
+            const GpuMesh& gm = *inst.mesh;
+            const simd_float3 c = (gm.boundsMin + gm.boundsMax) * 0.5f;
+            const simd_float4 w = simd_mul(inst.world, simd_make_float4(c, 1));
+            const float sc = std::max(simd_length(inst.world.columns[0].xyz), std::max(simd_length(inst.world.columns[1].xyz), simd_length(inst.world.columns[2].xyz)));
+            const float rad = simd_length(gm.boundsMax - gm.boundsMin) * 0.5f * sc + 2.0f;
+            if (visible(w.x, w.y, w.z, rad)) groups[&gm].push_back(inst.world);
+        };
+        for (const Instance& inst : instances_) consider(inst);
+        for (const OtherVehicle& ov : vehicles_)
+            if (!ov.instances.empty() && simd_distance(ov.instances[0].world.columns[3].xyz, center_) <= kVehicleDrawDistance)
+                for (const Instance& inst : ov.instances) consider(inst);
+        for (const Instance& inst : worldInstances_) consider(inst);
+        for (const Instance& inst : propInstances_) consider(inst);
+
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.depthAttachment.texture = shadowMap_;
+        rp.depthAttachment.slice = NSUInteger(i);
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.clearDepth = 0.0;  // reversed depth
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setDepthStencilState:shadowDepth_];
+        [enc setCullMode:MTLCullModeNone];
+        ShadowUniforms su{};
+        su.lightViewProj = toSimd(sliceLvp_[size_t(i)]);
+        su.light = simd_make_float4(float(L[0]), float(L[1]), float(L[2]), sliceBias_[size_t(i)]);
+        su.eye = fu.eye;
+        su.lightRight = simd_make_float4(float(rt[0]), float(rt[1]), float(rt[2]), 0);
+        su.lightUp = simd_make_float4(float(up[0]), float(up[1]), float(up[2]), 0);
+        [enc setVertexBytes:&su length:sizeof su atIndex:1];
+
+        size_t total = 0;
+        for (const auto& g : groups) total += g.second.size();
+        if (total > 0) {
+            id<MTLBuffer> mats = [device_ newBufferWithLength:total * sizeof(simd_float4x4) options:MTLResourceStorageModeShared];
+            auto* out = static_cast<simd_float4x4*>(mats.contents);
+            size_t at = 0;
+            for (const auto& [gm, worlds] : groups) {
+                std::memcpy(out + at, worlds.data(), worlds.size() * sizeof(simd_float4x4));
+                [enc setVertexBuffer:mats offset:at * sizeof(simd_float4x4) atIndex:2];
+                at += worlds.size();
+                for (uint32_t pass = 0; pass < 3; ++pass) {
+                    for (const Draw& d : gm->draws[pass]) {
+                        const GpuMaterial& m = gm->materials[d.material];
+                        if (!m.lit) continue;  // unlit / additive materials do not cast (pass 7 skips flag 0x1000)
+                        const bool cut = pass != 0;
+                        [enc setRenderPipelineState:shadowPipeline(gm->vbStrides[d.vb], cut)];
+                        [enc setVertexBuffer:gm->vbs[d.vb] offset:0 atIndex:0];
+                        const uint32_t sprite = d.sprite ? 1u : 0u;
+                        [enc setVertexBytes:&sprite length:sizeof sprite atIndex:3];
+                        if (cut) {
+                            const uint32_t half = (m.code == 17 || m.code == 20) ? 1u : 0u;
+                            [enc setFragmentBytes:&half length:sizeof half atIndex:0];
+                            [enc setFragmentTexture:m.textures[kDiffuse] atIndex:0];
+                            [enc setFragmentSamplerState:samplers_[m.samplerIndex] atIndex:0];
+                        }
+                        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                        indexCount:d.indexCount
+                                         indexType:MTLIndexTypeUInt32
+                                       indexBuffer:gm->indices
+                                 indexBufferOffset:size_t(d.firstIndex) * 4
+                                     instanceCount:worlds.size()];
+                    }
+                }
             }
         }
+        // Terrain chunks cast too (ground.vhl vh_shadow).
+        if (!chunks.empty() && terrainIndices_ != nil) {
+            [enc setRenderPipelineState:terrainShadowPipeline_];
+            for (const auto& c : chunks) {
+                auto git = chunkGpu_.find(c->key);
+                if (git == chunkGpu_.end() || git->second.vb == nil) continue;
+                ChunkBounds& b = chunkBounds_[c->key];
+                if (b.maxY <= b.minY) {
+                    b.minY = 1e30f, b.maxY = -1e30f;
+                    for (const TerrainVertex& v : c->verts) b.minY = std::min(b.minY, v.p0[1]), b.maxY = std::max(b.maxY, v.p0[1]);
+                    b.maxY = std::max(b.maxY, b.minY + 0.01f);
+                }
+                const double rad = c->size * 0.7072 + (b.maxY - b.minY) * 0.5;
+                if (!visible(c->cx, (b.minY + b.maxY) * 0.5, c->cz, rad)) continue;
+                [enc setVertexBuffer:git->second.vb offset:0 atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:terrainIndexCount_
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:terrainIndices_
+                         indexBufferOffset:0];
+            }
+        }
+        [enc endEncoding];
     }
-    [enc endEncoding];
+    if (chunkBounds_.size() > 4 * chunkGpu_.size() + 256)
+        for (auto it = chunkBounds_.begin(); it != chunkBounds_.end();)
+            it = chunkGpu_.count(it->first) ? std::next(it) : chunkBounds_.erase(it);
 }
 
 void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam) {
@@ -1984,6 +2472,16 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             it = chunkFrame_ - it->second.lastFrame > 240 ? chunkGpu_.erase(it) : std::next(it);
     }
 
+    // ---- FUEL's lights, scattering and shadow slices for this frame (P28), then the scene pass.
+    fu.paint = simd_make_float4(paint_.color.x, paint_.color.y, paint_.color.z, 1);  // gamma space, like the game
+    fillAtmosphere(fu, eye, fu.viewProj, 0, aspect, zn);
+    const bool ownEncoder = enc == nil;
+    if (ownEncoder) {
+        encodeShadows(frameCb_, fu, terrainChunks);
+        enc = [frameCb_ renderCommandEncoderWithDescriptor:frameRp_];
+    }
+    lastFrame_ = std::make_shared<FrameUniforms>(fu);
+
     [enc setVertexBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentBytes:&fu length:sizeof fu atIndex:1];
     [enc setFragmentTexture:shadowMap_ atIndex:7];
@@ -2033,7 +2531,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         for (const OtherVehicle& ov : vehicles_) {  // each with its own paint colour
             if (ov.instances.empty() || simd_distance(ov.instances[0].world.columns[3].xyz, center_) > kVehicleDrawDistance) continue;
             FrameUniforms vu = fu;
-            vu.paint = simd_make_float4(srgbToLinear(ov.paint.x), srgbToLinear(ov.paint.y), srgbToLinear(ov.paint.z), 1);
+            vu.paint = simd_make_float4(ov.paint.x, ov.paint.y, ov.paint.z, 1);  // gamma space
             [enc setFragmentBytes:&vu length:sizeof vu atIndex:1];
             for (const Instance& inst : ov.instances) {
                 if (inst.mesh->draws[pass].empty()) continue;
@@ -2116,12 +2614,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         [enc setVertexBytes:markers_.data() length:markers_.size() * sizeof(simd_float4) atIndex:2];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:66 instanceCount:markers_.size()];
     }
+    if (ownEncoder) [enc endEncoding];
 }
 
 
 void MeshRenderer::ensureTargets(NSUInteger width, NSUInteger height) {
-    if (width == targetWidth_ && height == targetHeight_) return;
-    targetWidth_ = width, targetHeight_ = height;
     auto make = [&](MTLPixelFormat pf, NSUInteger w, NSUInteger h, NSUInteger samples, MTLTextureUsage usage) {
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
                                                                                       width:std::max<NSUInteger>(w, 1)
@@ -2134,19 +2631,28 @@ void MeshRenderer::ensureTargets(NSUInteger width, NSUInteger height) {
         return [device_ newTextureWithDescriptor:td];
     };
     const MTLTextureUsage rt = MTLTextureUsageRenderTarget, rw = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    if (shrink_ == nil) {
+        // The fixed-size HDR chain targets (Renderer_CreatePostTargets 0x837010).
+        shrink_ = make(kRenderColorFormat, 128, 128, 1, rw);
+        for (size_t k = 0; k < lum_.size(); ++k) lum_[k] = make(MTLPixelFormatR32Float, 128 >> k, 128 >> k, 1, rw);
+        for (auto& t : adapted_) t = make(MTLPixelFormatR32Float, 1, 1, 1, rw);
+        for (auto& t : bloomRt_) t = make(MTLPixelFormatRGBA8Unorm, 128, 128, 1, rw);
+    }
+    if (width == targetWidth_ && height == targetHeight_) return;
+    targetWidth_ = width, targetHeight_ = height;
     hdrMsaa_ = make(kRenderColorFormat, width, height, sampleCount_, rt);
     depthMsaa_ = make(kRenderDepthFormat, width, height, sampleCount_, rt);
     hdr_ = make(kRenderColorFormat, width, height, 1, rw);
     depth_ = make(kRenderDepthFormat, width, height, 1, rw);
-    for (int i = 0; i < kBloomLevels; ++i) bloom_[size_t(i)] = make(kRenderColorFormat, width >> (i + 1), height >> (i + 1), 1, rw);
-    shafts_ = make(kRenderColorFormat, width >> 2, height >> 2, 1, rw);
+    postFx_ = make(MTLPixelFormatRGBA8Unorm, width, height, 1, rw);
 }
 
 void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const OrbitCamera& cam) {
+    if (frame_ == 0) epoch_ = std::chrono::steady_clock::now();  // the running clock starts with the first frame
     ensureTargets(target.width, target.height);
-    encodeShadows(cb);
 
-    // The scene, multisampled; colour and depth resolve for the passes after it.
+    // The scene, multisampled; colour and depth resolve for the passes after it. The scene encoder is
+    // made inside encode(), after the frame's shadow slices.
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = hdrMsaa_;
     rp.colorAttachments[0].resolveTexture = hdr_;
@@ -2159,10 +2665,17 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
     rp.depthAttachment.clearDepth = 1.0;
     rp.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
     rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterMin;  // the nearest sample
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     lastFrame_.reset();
-    encode(enc, float(target.width) / float(std::max<NSUInteger>(target.height, 1)), cam);
-    [enc endEncoding];
+    frameCb_ = cb;
+    frameRp_ = rp;
+    if (instances_.empty()) {
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc endEncoding];
+    } else {
+        encode(nil, float(target.width) / float(std::max<NSUInteger>(target.height, 1)), cam);
+    }
+    frameCb_ = nil;
+    frameRp_ = nil;
 
     if (lastFrame_ && !dust_.empty()) encodeDust(cb);
     encodePost(cb, target);
@@ -2197,52 +2710,131 @@ void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     [enc endEncoding];
 }
 
+// FUEL's HDR chain (post.md P3 / P6), with the per-frame exposure, bloom scale and blue shift of
+// GenWorld_FrameUpdate 0x77a3b0 (p26-renderer.md L1 step 2).
 void MeshRenderer::encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target) {
     const float w = float(target.width), h = float(std::max<NSUInteger>(target.height, 1));
+    // Seconds since the last frame (the adaptation rate k = 0.94^(30 dt)).
+    const auto now = std::chrono::steady_clock::now();
+    float dt = haveLastRender_ ? std::min(0.25f, std::chrono::duration<float>(now - lastRender_).count()) : 1.0f / 60;
+    lastRender_ = now, haveLastRender_ = true;
+    if (exposureDt >= 0) dt = exposureDt;
+
+    const Atmosphere& a = atmo_;
     PostUniforms pu{};
-    pu.texel = simd_make_float4(1.0f / w, 1.0f / h, w / h, float(frame_ % 1024));
-    pu.params = postEffects ? simd_make_float4(1.0f, std::clamp(speedBlur, 0.0f, 1.0f) * 0.11f, 0.10f, 0.55f) : simd_make_float4(1, 0, 0, 0);
-    pu.grade = simd_make_float4(1.0f, 1.22f, 0.8f, postEffects ? 1.0f : 0.0f);
-    if (postEffects && lastFrame_ && lastFrame_->fog.x > 0) {
-        // Where the sun is on screen; glare and shafts fade out as it leaves the frame.
-        const simd_float4 clip = simd_mul(lastFrame_->viewProj, simd_make_float4(lastFrame_->eye.xyz + sunDir_ * 1000.0f, 1.0f));
-        if (clip.w > 0) {
-            const simd_float2 uv = simd_make_float2(clip.x / clip.w * 0.5f + 0.5f, 0.5f - clip.y / clip.w * 0.5f);
-            const float out = std::max(std::max(-uv.x, uv.x - 1.0f), std::max(-uv.y, uv.y - 1.0f));
-            pu.sun = simd_make_float4(uv, std::clamp(1.0f - out / 0.35f, 0.0f, 1.0f), 1.0f);
-        }
-    }
-    auto pass = [&](id<MTLTexture> dst, MTLLoadAction load, id<MTLRenderPipelineState> ps, std::initializer_list<id<MTLTexture>> textures,
-                    id<MTLTexture> texelOf) {
+    pu.bloom = simd_make_float4(a.bloomLumScale, postDefaults_.bloom[1], postDefaults_.bloom[2], postDefaults_.bloom[3]);
+    pu.hdr = simd_make_float4(adaptationRate(dt), a.screenLuminance, a.minExposure, a.maxExposure);
+    pu.blueShift = simd_make_float4(a.blueShift[0], a.blueShift[1], a.blueShift[2], a.blueShift[3]);
+    pu.tint = simd_make_float4(postDefaults_.tint[0], postDefaults_.tint[1], postDefaults_.tint[2], postDefaults_.tint[3]);
+    // gMotionBlurSettings0 from MinRadius 0, MaxRadius 1, FallOff 6 (0x64ff38), scale = viewport +0x1dc.
+    const float blur = postEffects ? std::clamp(speedBlur, 0.0f, 1.0f) * speedBlurMax : 0.0f;
+    pu.mb0 = simd_make_float4(1.0f, 0.0f, 6.0f, blur);
+    pu.texel = simd_make_float4(0, 0, 1.0f / w, 1.0f / h);
+    const bool srgbOut = target.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB || target.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
+    pu.flags = simd_make_float4(0, postEffects && postDefaults_.fromExe ? 1.0f : 0.0f, srgbOut ? 1.0f : 0.0f, 0);
+    float mbw[8];
+    motionBlurWeights(0.95f, mbw);  // WeightDecrease [0x9dc5cc]
+    for (int i = 0; i < 8; ++i) pu.mbw[i] = simd_make_float4(mbw[i], 0, 0, 0);
+    float goff[11], gw[11];
+    gaussian11(goff, gw);
+
+    auto pass = [&](id<MTLTexture> dst, id<MTLRenderPipelineState> ps, std::initializer_list<id<MTLTexture>> textures, const PostUniforms& u) {
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = dst;
-        rp.colorAttachments[0].loadAction = load;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        if (ps == nil) {  // just clear
-            [enc endEncoding];
-            return;
-        }
         [enc setRenderPipelineState:ps];
-        PostUniforms u = pu;
-        if (texelOf != nil) u.texel.x = 1.0f / float(texelOf.width), u.texel.y = 1.0f / float(texelOf.height);
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
         NSUInteger slot = 0;
         for (id<MTLTexture> t : textures) [enc setFragmentTexture:t atIndex:slot++];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
     };
-    if (postEffects) {
-        pass(bloom_[0], MTLLoadActionDontCare, brightPipeline_, {hdr_, depth_}, hdr_);
-        for (int i = 1; i < kBloomLevels; ++i) pass(bloom_[size_t(i)], MTLLoadActionDontCare, downPipeline_, {bloom_[size_t(i - 1)]}, bloom_[size_t(i - 1)]);
-        if (pu.sun.z > 0) pass(shafts_, MTLLoadActionDontCare, shaftsPipeline_, {bloom_[1]}, nil);
-        else pass(shafts_, MTLLoadActionClear, nil, {}, nil);
-        for (int i = kBloomLevels - 1; i > 0; --i) pass(bloom_[size_t(i - 1)], MTLLoadActionLoad, upPipeline_, {bloom_[size_t(i)]}, bloom_[size_t(i)]);
+    // 1-3: shrink, log luminance, reductions to 1 x 1.
+    pass(shrink_, shrinkPipeline_, {hdr_}, pu);
+    pass(lum_[0], lumLogPipeline_, {hdr_}, pu);
+    for (size_t k = 1; k < lum_.size(); ++k) {
+        PostUniforms u = pu;
+        u.texel.x = 1.0f / float(lum_[k - 1].width), u.texel.y = 1.0f / float(lum_[k - 1].height);
+        pass(lum_[k], lumAvgPipeline_, {lum_[k - 1]}, u);
     }
-    pass(target, MTLLoadActionDontCare, compositePipeline_, {hdr_, bloom_[0], shafts_, bloom_[kBloomLevels - 1]}, nil);
+    // 4: adaptation. The first frame initialises (S = SCREENLUMINANCE / e^A) and, so that single shots
+    // show the settled exposure, then takes one step with k = 0 (port).
+    auto adapt = [&](bool init, float k) {
+        PostUniforms u = pu;
+        u.flags.x = init ? 1.0f : 0.0f;
+        u.hdr.x = k;
+        const int prev = adaptedIndex_;
+        adaptedIndex_ ^= 1;
+        pass(adapted_[size_t(adaptedIndex_)], adaptPipeline_, {lum_.back(), adapted_[size_t(prev)]}, u);
+    };
+    if (adaptInit_) {
+        adapt(true, pu.hdr.x);
+        adapt(false, 0.0f);
+        adaptInit_ = false;
+    } else {
+        adapt(false, pu.hdr.x);
+    }
+    id<MTLTexture> S = adapted_[size_t(adaptedIndex_)];
+    // 5-7: bright pass, gaussian H / V, the two star streaks.
+    if (pu.flags.y > 0) {
+        pass(bloomRt_[0], brightPipeline_, {shrink_, S}, pu);
+        auto gauss = [&](id<MTLTexture> src, id<MTLTexture> dst, float dx, float dy) {
+            PostUniforms u = pu;
+            for (int k = 0; k < 11; ++k) u.taps[k] = simd_make_float4(goff[k] / 128.0f * dx, goff[k] / 128.0f * dy, gw[k], 0);
+            pass(dst, gaussPipeline_, {src}, u);
+        };
+        gauss(bloomRt_[0], bloomRt_[1], 1, 0);
+        gauss(bloomRt_[1], bloomRt_[0], 0, 1);
+        gauss(bloomRt_[0], bloomRt_[1], 3, 3);
+        gauss(bloomRt_[1], bloomRt_[2], 6, 6);
+        gauss(bloomRt_[0], bloomRt_[1], -3, 3);
+        gauss(bloomRt_[1], bloomRt_[3], -6, 6);
+    }
+    // 8-9: tone map, then the radial speed blur when it is on (viewport flag 0x8000).
+    if (blur > 0) {
+        PostUniforms u = pu;
+        u.flags.z = 0;  // the intermediate stores the display value as is
+        pass(postFx_, toneMapFxPipeline_, {hdr_, S, bloomRt_[0], bloomRt_[2], bloomRt_[3]}, u);
+        pass(target, radialPipeline_, {postFx_}, pu);
+    } else {
+        pass(target, toneMapPipeline_, {hdr_, S, bloomRt_[0], bloomRt_[2], bloomRt_[3]}, pu);
+    }
 }
 
+std::vector<simd_float4> MeshRenderer::shaderCheck(const Atmosphere& a, simd_float3 eye, const std::vector<simd_float4>& inputs) {
+    FrameUniforms fu{};
+    fu.eye = simd_make_float4(eye, 1);
+    fu.lightDir = f4(a.lightDir, a.invIntensity);
+    fu.skyDir = f4(a.skyDir, 0);
+    fu.sunColour = f4(a.sunColour, 1);
+    fu.dlight = f4(a.dlightColor, a.blueShift[3]);
+    fu.skyColour = f4(a.dskyColor, 0);
+    fu.skyAmbient = f4(a.dskyAmbient, 0);
+    for (int i = 0; i < 11; ++i) fu.scat[i] = simd_make_float4(a.c[size_t(i)][0], a.c[size_t(i)][1], a.c[size_t(i)][2], a.c[size_t(i)][3]);
+    const size_t n = inputs.size() / 4;
+    std::vector<simd_float4> out(n * 2);
+    if (n == 0) return out;
+    NSError* err = nil;
+    id<MTLComputePipelineState> ps = [device_ newComputePipelineStateWithFunction:[shaders_ newFunctionWithName:@"kRenderCheck"] error:&err];
+    if (ps == nil) return {};
+    id<MTLBuffer> inb = [device_ newBufferWithBytes:inputs.data() length:inputs.size() * sizeof(simd_float4) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> outb = [device_ newBufferWithLength:out.size() * sizeof(simd_float4) options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> q = [device_ newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBytes:&fu length:sizeof fu atIndex:0];
+    [enc setBuffer:inb offset:0 atIndex:1];
+    [enc setBuffer:outb offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(n, 64), 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    std::memcpy(out.data(), outb.contents, out.size() * sizeof(simd_float4));
+    return out;
+}
 
 // ---- Grass tufts (p14) -------------------------------------------------------
 
@@ -2313,7 +2905,7 @@ void MeshRenderer::setWaterLook(const std::array<simd_float4, 8>& constants, con
 
 void MeshRenderer::setGrassAtlas(uint32_t bitmapId) {
     uint8_t alpha = 0;
-    grassAtlas_ = texture(bitmapId, true, &alpha);
+    grassAtlas_ = texture(bitmapId, false, &alpha);
 }
 
 void MeshRenderer::setGrass(const std::vector<GrassTuft>& tufts) {

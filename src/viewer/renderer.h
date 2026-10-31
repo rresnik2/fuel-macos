@@ -1,16 +1,19 @@
 // Metal renderer for FUEL meshes and assembled vehicles.
 //
-// A modern forward renderer driven by the game's material data: physically
-// based shading of the diffuse, normal, specular, occlusion and dirt texture
-// slots, car paint and liveries, a sun with a shadow map, sky lighting and
-// reflections, a ground plane and soft dust particles, drawn in linear HDR and
-// finished by a post pass (bloom, sun glare and shafts, speed blur, filmic tone
-// mapping and a warm grade, vignette) into an sRGB target.
+// A forward renderer driven by the game's material data, lit the way FUEL lights its world (P28 port of
+// the P26 renderer decode, ~/re-work/fuel/notes/p26-renderer.md): the sun path and Preetham colours, the
+// warm sky light, the atmospheric scattering that is FUEL's fog, the per-material lighting of
+// scattering_light.h, the 4-slice cascaded sun shadow, the sky inscatter with the sun / moon disc, and
+// the HDR post chain (log-luminance auto exposure, bright pass, gaussian bloom and star, blue shift,
+// the x+x^2+x^3+x^4 tone curve, tint, radial speed blur). Like the game everything is in gamma space:
+// textures are read without sRGB decoding and the tone-mapped value is the display value (written
+// through the inverse sRGB curve, so the sRGB output target stores it unchanged).
 #pragma once
 
 #import <Metal/Metal.h>
 #include <simd/simd.h>
 
+#include "core/atmosphere.hpp"
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
 #include "core/ground.hpp"
@@ -63,7 +66,7 @@ struct OrbitCamera {
 // livery texture (per LOD 1..3) that replaces slot 0 of LIVERY_XX_LOD<k>
 // materials. Without a livery those materials show plain paint.
 struct Paint {
-    simd_float3 color = {60.0f / 255, 60.0f / 255, 60.0f / 255};  // sRGB
+    simd_float3 color = {60.0f / 255, 60.0f / 255, 60.0f / 255};  // gamma-space (as stored), like the game
     std::array<uint32_t, 3> livery{};
 };
 
@@ -82,7 +85,7 @@ inline constexpr MTLPixelFormat kOutputColorFormat = MTLPixelFormatBGRA8Unorm_sR
 // One dust particle, a soft sprite facing the camera.
 struct DustParticle {
     simd_float4 position;  // xyz, w radius in metres
-    simd_float4 colour;    // linear albedo, a opacity
+    simd_float4 colour;    // albedo (linear; the renderer takes it to gamma space), a opacity
     simd_float4 extra;     // x rotation (radians), y noise seed 0..1
 };
 
@@ -151,9 +154,27 @@ public:
 
     // Dust drawn with the next frames (replaces the earlier list).
     void setDust(const std::vector<DustParticle>& particles) { dust_ = particles; }
-    // Speed effects for this frame, 0..1: radial blur towards the screen edges.
+    // Speed effects for this frame, 0..1: FUEL's radial blur (ph_motionblur) at speedBlur x speedBlurMax
+    // (viewport +0x1dc = VehiclePP 574 x the speed fraction; 0.015 for most vehicles).
     float speedBlur = 0;
-    bool postEffects = true;  // false: plain tone mapping (no bloom, glare, blur, grade)
+    float speedBlurMax = 0.015f;
+    bool postEffects = true;  // false: tone mapping and auto exposure only (no bloom, star, radial blur)
+
+    // ---- Time of day and weather (p26-renderer.md L1-L5)
+    // The game's clock: 08:00 + elapsed seconds x PP371 (96 in pp001.tsc), or ForceDayTime.
+    double forcedTimeOfDay = -1;   // seconds of the day (--time HH.MM / capture spots); < 0: the running clock
+    bool timeFromCommandLine = false;  // --time given: capture spots keep it
+    double gameClock = -1;         // elapsed game seconds; < 0: wall time since the renderer started
+    float clockScale = 96.0f;      // PP371, read from pp001.tsc by setGround when present
+    Weather weather;               // clear and dry unless set (the port has no weather fields yet)
+    float brightness = 1.0f;       // the Brightness option (0.5..2), default 1 (U2)
+    // Seconds the auto exposure adapts over in the next frame (< 0: wall time since the last frame).
+    float exposureDt = -1;
+    double timeOfDay() const;      // the time used for the next frame, seconds
+    const Atmosphere& atmosphere() const { return atmo_; }
+    // CPU-vs-GPU check of the shader maths (--rendercheck): evaluates the MSL scattering, lighting and tone
+    // curve on `inputs` (float4 each, see rendercheck.mm) for the given atmosphere.
+    std::vector<simd_float4> shaderCheck(const Atmosphere& a, simd_float3 eye, const std::vector<simd_float4>& inputs);
     bool grass = true;        // false: no grass tufts (settings file; FUEL_NO_GRASS=1 also disables)
     float sceneRadius() const { return radius_; }
     // GPU time of the last completed frame, in milliseconds (0 until one finished).
@@ -202,7 +223,10 @@ public:
 
 private:
     // Renders the sun's shadow map.
-    void encodeShadows(id<MTLCommandBuffer> cb);
+    void encodeShadows(id<MTLCommandBuffer> cb, FrameUniforms& fu, const std::vector<std::shared_ptr<const TerrainChunk>>& chunks);
+    id<MTLCommandBuffer> frameCb_;          // render(): the scene pass encoder is made inside encode(), after the shadows
+    MTLRenderPassDescriptor* frameRp_ = nil;
+    void fillAtmosphere(FrameUniforms& fu, simd_float3 eye, const simd_float4x4& viewRH, float fovY, float aspect, float zn);
     // Draws the scene into a pass with kRenderColorFormat/kRenderDepthFormat.
     void encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam);
     void ensureTargets(NSUInteger width, NSUInteger height);
@@ -280,7 +304,7 @@ private:
     const TextureStats& textureStats(uint32_t bitmapId);
     std::unordered_map<uint32_t, TextureStats> textureStats_;
     id<MTLRenderPipelineState> pipeline(uint32_t stride, AlphaMode mode);
-    id<MTLRenderPipelineState> shadowPipeline(uint32_t stride);
+    id<MTLRenderPipelineState> shadowPipeline(uint32_t stride, bool cut);
     GpuMaterial makeMaterial(uint32_t materialId, uint32_t diffuseOverride = 0, uint32_t specularOverride = 0);
     simd_float4x4 sunViewProj() const;
 
@@ -290,7 +314,22 @@ private:
     id<MTLLibrary> shaders_;
     id<MTLDepthStencilState> depthWrite_, depthNoWrite_;
     id<MTLSamplerState> samplers_[4];
-    id<MTLTexture> white_, shadowMap_;
+    id<MTLTexture> white_, shadowMap_;  // shadowMap_: the 4-slice atlas, W x 4W depth (reversed)
+    // ---- FUEL's cascaded shadow (shadows.md): settings from FUEL.exe, per-slice light matrices
+    ShadowSettings shadowSettings_;
+    PostDefaults postDefaults_;
+    bool engineSettingsRead_ = false;
+    int shadowCounter_ = -1;                            // scene+0x190
+    std::array<std::array<double, 16>, 4> sliceLvp_{};  // world -> light clip of each slice (row-major)
+    std::array<bool, 4> sliceValid_{};
+    std::array<float, 4> sliceBias_{};
+    id<MTLRenderPipelineState> terrainShadowPipeline_;
+    id<MTLDepthStencilState> shadowDepth_;
+    struct ChunkBounds { float minY = 0, maxY = 0; };
+    std::unordered_map<uint64_t, ChunkBounds> chunkBounds_;
+    Atmosphere atmo_;
+    std::chrono::steady_clock::time_point epoch_ = std::chrono::steady_clock::now(), lastRender_{};
+    bool haveLastRender_ = false;
     id<MTLRenderPipelineState> groundPipeline_, terrainPipeline_, skyPipeline_, markerPipeline_;
     std::vector<simd_float4> markers_;
     id<MTLDepthStencilState> depthAlways_;
@@ -348,12 +387,18 @@ private:
     };
     std::vector<OtherVehicle> vehicles_;
     std::map<std::pair<uint32_t, std::array<uint32_t, 3>>, std::unique_ptr<GpuMesh>> liveryMeshes_;
-    // Offscreen targets (rebuilt when the output size changes) and post pipelines.
-    static constexpr int kBloomLevels = 5;  // 1/2 .. 1/32 of the output
+    // Offscreen targets (rebuilt when the output size changes) and the HDR post chain (post.md P1/P3).
     NSUInteger targetWidth_ = 0, targetHeight_ = 0;
-    id<MTLTexture> hdrMsaa_, depthMsaa_, hdr_, depth_, shafts_;
-    std::array<id<MTLTexture>, kBloomLevels> bloom_;
-    id<MTLRenderPipelineState> dustPipeline_, brightPipeline_, downPipeline_, upPipeline_, shaftsPipeline_, compositePipeline_;
+    id<MTLTexture> hdrMsaa_, depthMsaa_, hdr_, depth_;
+    id<MTLTexture> shrink_;                       // 128 x 128 FP16 scene copy
+    std::array<id<MTLTexture>, 8> lum_;           // log luminance 128 .. 1 (R32F)
+    std::array<id<MTLTexture>, 2> adapted_;       // exposure S, 1 x 1 R32F ping-pong
+    int adaptedIndex_ = 0;
+    bool adaptInit_ = true;
+    std::array<id<MTLTexture>, 4> bloomRt_;       // 128 x 128 8-bit: bloom, scratch, star A, star B
+    id<MTLTexture> postFx_;                       // tone-mapped frame before the radial blur
+    id<MTLRenderPipelineState> dustPipeline_, shrinkPipeline_, lumLogPipeline_, lumAvgPipeline_, adaptPipeline_, brightPipeline_,
+        gaussPipeline_, toneMapPipeline_, toneMapFxPipeline_, radialPipeline_;
     std::vector<DustParticle> dust_;
     std::shared_ptr<FrameUniforms> lastFrame_;  // the uniforms of the last encode, for dust and the post pass
     std::atomic<double> gpuMs_{0};

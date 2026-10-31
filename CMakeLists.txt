@@ -40,6 +40,7 @@ add_library(fuelcore STATIC
   src/core/sound.cpp
   src/core/rider.cpp
   src/core/settings.cpp
+  src/core/atmosphere.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 
@@ -78,6 +79,7 @@ add_executable(fuelview
   src/viewer/capture.mm
   src/viewer/eventcheck.mm
   src/viewer/game_settings.mm
+  src/viewer/rendercheck.mm
   src/audio/drive_audio.mm
   src/ui/ui_renderer.mm
   src/ui/menu.mm
