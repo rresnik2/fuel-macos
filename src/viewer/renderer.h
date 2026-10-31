@@ -17,6 +17,7 @@
 #include "core/ground_point.hpp"
 #include "core/rider.hpp"
 #include "core/terrain.hpp"
+#include "core/terrain_mesh.hpp"
 #include "core/vehicle.hpp"
 
 #include <algorithm>
@@ -289,6 +290,15 @@ private:
     id<MTLBuffer> terrainIndices_;
     uint32_t terrainIndexCount_ = 0;
     Heightfield terrainData_;
+    // FUEL's ground mesh (terrain_mesh.hpp): quadtree chunks built on worker threads.
+    std::unique_ptr<TerrainLod> terrainLod_;
+    struct ChunkGpu {
+        id<MTLBuffer> vb;
+        uint64_t lastFrame = 0;
+    };
+    std::unordered_map<uint64_t, ChunkGpu> chunkGpu_;
+    uint64_t chunkFrame_ = 0;
+    simd_float3 lastTerrainEye_ = {1e9f, 0, 1e9f};
     simd_float4 terrainInfo_ = {0, 0, 1, 0};  // origin x, origin z, spacing, metres for a texel value of 1.0
     std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
     std::unordered_map<uint32_t, id<MTLRenderPipelineState>> shadowPipelines_;

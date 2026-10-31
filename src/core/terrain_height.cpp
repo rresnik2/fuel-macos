@@ -790,6 +790,19 @@ double TerrainDetail::roadCarve(double x, double z, double& y, double omc, doubl
     return cov;
 }
 
+double TerrainDetail::baseNormal(double x, double z, float n[3]) const {
+    double d[3];
+    const double h = baseWithNormal(x, z, d);
+    n[0] = float(d[0]), n[1] = float(d[1]), n[2] = float(d[2]);
+    return h;
+}
+
+double TerrainDetail::farHeight(double x, double z, float n[3]) const {
+    const double h0 = baseNormal(x, z, n);
+    const double v = floorLevel(x, z, h0);
+    return h0 + ((h0 > v + double(0.01f)) ? 0.0 : (h0 > v ? 0.0 : v - h0));
+}
+
 double TerrainDetail::height(double x, double z) const { return sample(x, z).ground; }
 double TerrainDetail::detailHeight(double x, double z) const { return detailOnly(x, z, nullptr); }
 

@@ -52,10 +52,13 @@ namespace {
 constexpr ObjectLayer kStatic = 0, kMoving = 1, kProp = 2, kWheel = 3;  // kWheel: tyre casts, which see only static ground
 constexpr float kStep = 1.0f / 60.0f;  // FUEL's own physics rate
 constexpr float kGravity = 9.81f;
-constexpr uint32_t kPatchSamples = 512;  // terrain collision patch, samples per side
-constexpr float kPatchSpacing = 4.0f;    // metres (the source grid is 30 m; B-spline resampled)
-constexpr double kPatchReach = 600.0;    // a vehicle further than this from every patch centre gets a new patch
-constexpr double kPatchKeep = 900.0;     // a patch stays while some vehicle is within this of its centre
+// Terrain collision patches sample FUEL's ground (AGW_Altitude, terrain_height.hpp) every
+// metre, the vertex spacing of the engine's nearest ground chunks (24 m / 24), so the
+// wheels roll on the same detail the player sees.
+constexpr uint32_t kPatchSamples = 384;  // terrain collision patch, samples per side (383 m)
+constexpr float kPatchSpacing = 1.0f;    // metres
+constexpr double kPatchReach = 120.0;    // a vehicle further than this from every patch centre gets a new patch
+constexpr double kPatchKeep = 260.0;     // a patch stays while some vehicle is within this of its centre
 
 void initJoltOnce() {
     static std::once_flag once;
@@ -287,9 +290,16 @@ struct DriveWorld::Impl {
     // The heightfield shape of the patch with corner (x0, z0); thread-safe.
     static RefConst<Shape> makePatchShape(const Heightfield& terrain, double x0, double z0) {
         std::vector<float> samples(size_t(kPatchSamples) * kPatchSamples);
-        for (uint32_t r = 0; r < kPatchSamples; ++r)
-            for (uint32_t c = 0; c < kPatchSamples; ++c)
-                samples[size_t(r) * kPatchSamples + c] = terrain.smoothHeightAt(x0 + c * kPatchSpacing, z0 + r * kPatchSpacing);
+        // Rows on four threads (the procedural ground costs ~10 us a point).
+        constexpr uint32_t kThreads = 4;
+        std::vector<std::future<void>> jobs;
+        for (uint32_t t = 0; t < kThreads; ++t)
+            jobs.push_back(std::async(std::launch::async, [&, t] {
+                for (uint32_t r = t; r < kPatchSamples; r += kThreads)
+                    for (uint32_t c = 0; c < kPatchSamples; ++c)
+                        samples[size_t(r) * kPatchSamples + c] = terrain.smoothHeightAt(x0 + c * kPatchSpacing, z0 + r * kPatchSpacing);
+            }));
+        for (auto& j : jobs) j.get();
         HeightFieldShapeSettings hs(samples.data(), Vec3::sZero(), Vec3(kPatchSpacing, 1.0f, kPatchSpacing), kPatchSamples);
         auto result = hs.Create();
         if (result.HasError()) throw std::runtime_error(std::string("terrain patch: ") + result.GetError().c_str());

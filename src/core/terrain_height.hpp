@@ -59,6 +59,11 @@ public:
     double detailHeight(double x, double z) const;      // flags 3: no gulches/flats/roads/snow
     GroundSample sample(double x, double z) const;
     double baseHeight(double x, double z) const { return base_.value(x, z); }
+    // Map height and normal (0x64a2a0 step 1 / 0x45de10).
+    double baseNormal(double x, double z, float n[3]) const;
+    // The height far ground chunks (>= 240 m) use, 0x64be70: the map raised to the canyon
+    // floor (0x7a2610), no detail fractals, rock, gulches, flats or roads. `n` = map normal.
+    double farHeight(double x, double z, float n[3]) const;
     // Ground normal by central differences of height() over +-e metres.
     void normal(double x, double z, double e, float out[3]) const;
 
