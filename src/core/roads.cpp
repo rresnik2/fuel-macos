@@ -116,6 +116,24 @@ RoadNetwork loadRoads(const DpcFile& world) {
     return net;
 }
 
+uint32_t genWorldEnumTexture(const DpcFile& world, uint32_t e) {
+    const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
+    if (gens.empty()) return 0;
+    const auto gen = world.body(*world.find(gens.front()));
+    if (!gen) return 0;
+    size_t p = 12;
+    p += 4 + size_t(rd32(*gen, p)) * 4;
+    p += 4 + size_t(rd32(*gen, p)) * 4;
+    if (e >= rd32(*gen, p)) return 0;
+    const DpcFile::Entry* me = world.find(rd32(*gen, p + 4 + size_t(e) * 4));
+    const auto mb = me ? world.body(*me) : std::nullopt;
+    try {
+        return mb ? parseMaterialBody(*mb).textures[0] : 0;
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
 bool isTarmacRoad(int t) { return t == 10 || t == 11 || t == 12 || t == 15 || t == 18 || t == 19; }
 
 int roadSurfaceAt(const RoadNetwork& net, double x, double z) {
