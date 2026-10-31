@@ -15,6 +15,7 @@
 namespace fuel {
 
 class TerrainDetail;
+class RoadSampler;
 
 struct Heightfield {
     uint32_t width = 0, height = 0;  // samples; column = x, row = z
@@ -25,6 +26,9 @@ struct Heightfield {
 
     // FUEL's procedural ground on top of the map (null for the bare map).
     std::shared_ptr<const TerrainDetail> detail;
+    // FUEL's road segments (p22), when the world has them: the ground carves roads with them
+    // (0x6fcaa0) and the decals sample them.
+    std::shared_ptr<RoadSampler> roads;
 
     float sampleHeight(uint32_t col, uint32_t row) const { return float(raw[size_t(row) * width + col]) * metresPerUnit; }
     // Bilinear height of the raw samples at a world position (clamped to the edges).

@@ -483,11 +483,88 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
             bg.plants.push_back({p.meshId, simd_matrix(col(0), col(1), col(2), simd_make_float4(p.position[0], p.position[1], p.position[2], 1))});
         }
     }
-    if (roads_ && terrain_) {
-        bg.roads = buildRoads(player);
-        bg.haveRoads = true;
-    }
+    if (lakes_ && ground_ && terrain_) buildWater(player, bg);
     return bg;
+}
+
+// Lake water around the player, by Paysage_BuildWaterMesh's rules (0x7fbc10, water.md 3.1) on
+// one 8 m grid (the engine builds it per terrain chunk at the chunk's vertex spacing).
+void WorldStreamer::buildWater(simd_float3 player, Background& bg) const {
+    constexpr int n = 257;
+    constexpr double sp = 8.0, half = sp * (n - 1) / 2;
+    const double ox = std::round(player.x / 64.0) * 64.0 - half, oz = std::round(player.z / 64.0) * 64.0 - half;
+    bg.haveWater = true;
+    bool any = false;
+    for (const fuel::Lake& L : lakes_->lakes())
+        if (L.maxX >= ox && L.minX <= ox + 2 * half && L.maxZ >= oz && L.minZ <= oz + 2 * half) any = true;
+    if (!any) return;
+    struct P {
+        float y, W, S;
+        bool flag;
+        float c60[3], c70[3];
+    };
+    std::vector<P> pts(size_t(n) * n);
+    for (int r = 0; r < n; ++r)
+        for (int c = 0; c < n; ++c) {
+            const double x = ox + c * sp, z = oz + r * sp;
+            P& p = pts[size_t(r) * n + c];
+            p.y = float(terrain_->smoothHeightAt(x, z));
+            const fuel::WaterPoint w = fuel::waterAt(*lakes_, x, z, p.y);
+            p.flag = w.depth - w.base > 0.001f;
+            p.W = p.flag ? p.y + (w.depth - w.base) : p.y;
+            p.S = std::max(p.y, p.W);
+            if (w.depth > 0) {  // the colours are needed near water only
+                const fuel::GroundPoint gp = ground_->at(x, z);
+                const fuel::GroundColours gc = ground_->colours(x, z, gp);
+                for (int i = 0; i < 3; ++i) p.c60[i] = gc.water[i], p.c70[i] = gc.base[i];
+            } else {
+                for (int i = 0; i < 3; ++i) p.c60[i] = p.c70[i] = 0;
+            }
+        }
+    std::vector<uint8_t> alpha(pts.size(), 0);
+    bg.water.resize(pts.size());
+    for (int r = 0; r < n; ++r)
+        for (int c = 0; c < n; ++c) {
+            const P& p = pts[size_t(r) * n + c];
+            float W = p.W, S = p.S;
+            const float* c60 = p.c60;
+            if (S <= p.y + 0.01f) {  // dry: a wet diagonal neighbour's level (last one wins)
+                for (int rr = std::max(r - 1, 0); rr <= std::min(r + 1, n - 1); ++rr)
+                    for (int cc = std::max(c - 1, 0); cc <= std::min(c + 1, n - 1); ++cc) {
+                        if (rr == r || cc == c) continue;
+                        const P& q = pts[size_t(rr) * n + cc];
+                        if (q.y + 0.01f < q.S) W = q.W, S = q.S, c60 = q.c60;
+                    }
+            }
+            auto pack = [](const float* v, float scale) {  // BGRA bytes; 0x7fd280 packs floor(v * 128)
+                uint32_t out = 0;
+                for (int i = 0; i < 3; ++i) out |= uint32_t(std::clamp(int(std::floor(v[2 - i] * scale)), 0, 255)) << (8 * i);
+                return out;
+            };
+            uint32_t col;
+            uint8_t a;
+            if (S - p.y < 0.01f) col = pack(c60, 128.0f), a = 0;
+            else if (W - p.y <= 0.01f) col = pack(p.c70, 255.0f), a = 10;
+            else {
+                const float m[3] = {(p.c70[0] + c60[0]) * 0.5f, (p.c70[1] + c60[1]) * 0.5f, (p.c70[2] + c60[2]) * 0.5f};
+                col = pack(m, 128.0f), a = 40;
+            }
+            alpha[size_t(r) * n + c] = a;
+            fuel::MeshRenderer::WaterVertex& v = bg.water[size_t(r) * n + c];
+            const float x = float(ox + c * sp), z = float(oz + r * sp);
+            v.position[0] = x, v.position[1] = S, v.position[2] = z;
+            v.colour = col | uint32_t(a) << 24;
+            v.uv[0] = x, v.uv[1] = z;
+            v.depth = S - p.y;
+        }
+    for (int r = 1; r < n; ++r)
+        for (int c = 1; c < n; ++c) {
+            const uint32_t v = uint32_t(r * n + c), a = v - n - 1, b = v - n, l = v - 1;
+            if (alpha[a] || alpha[b] || alpha[v]) bg.waterIndices.insert(bg.waterIndices.end(), {a, b, v});
+            if (alpha[a] || alpha[v] || alpha[l]) bg.waterIndices.insert(bg.waterIndices.end(), {a, v, l});
+        }
+    if (bg.waterIndices.empty()) bg.water.clear();
+    if (std::getenv("FUEL_STREAM_TRACE")) std::printf("water: %zu triangles\n", bg.waterIndices.size() / 3);
 }
 
 // A unit cylinder (radius 1, y from 0 to 1) for tree trunks.
@@ -519,7 +596,7 @@ void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& rendere
     std::vector<fuel::MeshInstance> draw = cellDraw_;
     draw.insert(draw.end(), plantDraw_.begin(), plantDraw_.end());
     renderer.setWorldInstances(draw);
-    if (bg.haveRoads) renderer.setRoads(bg.roads.vertices, bg.roads.indices, bg.roads.batches);
+    if (bg.haveWater) renderer.setWater(bg.water, bg.waterIndices);
 }
 
 void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics) {
@@ -666,85 +743,6 @@ std::vector<WorldStreamer::GroundGap> WorldStreamer::groundGaps(double x, double
     return out;
 }
 
-WorldStreamer::RoadMesh WorldStreamer::buildRoads(simd_float3 player) const {
-    // Nearby lines from the road grid.
-    std::set<uint32_t> lines;
-    const int32_t r = int32_t(std::ceil(kRoadRadius / fuel::RoadNetwork::kCell));
-    const int32_t cx = int32_t(std::floor(player.x / fuel::RoadNetwork::kCell)), cz = int32_t(std::floor(player.z / fuel::RoadNetwork::kCell));
-    for (int32_t dz = -r; dz <= r; ++dz)
-        for (int32_t dx = -r; dx <= r; ++dx)
-            if (auto it = roads_->cells.find(fuel::RoadNetwork::cellKey(cx + dx, cz + dz)); it != roads_->cells.end())
-                lines.insert(it->second.begin(), it->second.end());
-    // One vertex/index list per road type, then batches by type.
-    std::map<uint8_t, std::pair<std::vector<fuel::MeshRenderer::RoadVertex>, std::vector<uint32_t>>> byType;
-    for (uint32_t li : lines) {
-        const fuel::RoadNetwork::Line& line = roads_->lines[li];
-        const fuel::RoadStyle& st = roads_->styles[line.type];
-        auto& [verts, idx] = byType[line.type];
-        // Resample to at most 6 m between points so the ribbon follows the ground.
-        std::vector<simd_float2> pts;
-        for (size_t k = 0; k + 1 < line.points.size(); ++k) {
-            const simd_float2 a = simd_make_float2(line.points[k][0], line.points[k][1]);
-            const simd_float2 b = simd_make_float2(line.points[k + 1][0], line.points[k + 1][1]);
-            const int steps = std::max(1, int(std::ceil(simd_distance(a, b) / 6.0f)));
-            for (int s = 0; s < steps; ++s) pts.push_back(a + (b - a) * (float(s) / float(steps)));
-        }
-        pts.push_back(simd_make_float2(line.points.back()[0], line.points.back()[1]));
-        // Lines are stored in pieces; extend both ends by half the width so joints overlap.
-        if (pts.size() >= 2) {
-            const float ext = st.width * 0.5f;
-            const simd_float2 d0 = pts[0] - pts[1], d1 = pts.back() - pts[pts.size() - 2];
-            if (simd_length(d0) > 1e-3f) pts.front() += simd_normalize(d0) * ext;
-            if (simd_length(d1) > 1e-3f) pts.back() += simd_normalize(d1) * ext;
-        }
-        float along = 0;
-        for (size_t k = 0; k < pts.size(); ++k) {
-            const simd_float2 prev = pts[k > 0 ? k - 1 : k], next = pts[k + 1 < pts.size() ? k + 1 : k];
-            simd_float2 dir = next - prev;
-            if (simd_length(dir) < 1e-4f) dir = simd_make_float2(1, 0);
-            dir = simd_normalize(dir);
-            // Miter at corners: widen the offset by 1/cos(half the turn) so the road keeps its width.
-            float miter = 1.0f;
-            if (k > 0 && k + 1 < pts.size() && simd_length(pts[k] - prev) > 1e-3f) {
-                const simd_float2 d1 = simd_normalize(pts[k] - prev);
-                miter = 1.0f / std::max(0.35f, simd_dot(simd_make_float2(-dir.y, dir.x), simd_make_float2(-d1.y, d1.x)));
-            }
-            const simd_float2 side = simd_make_float2(-dir.y, dir.x) * (st.width * 0.5f * miter);
-            if (k > 0) along += simd_distance(pts[k], pts[k - 1]);
-            const auto base = uint32_t(verts.size());
-            for (int e = 0; e < 2; ++e) {
-                const simd_float2 p = pts[k] + (e == 0 ? -side : side);
-                const float y = terrain_->smoothHeightAt(p.x, p.y) + 0.35f;
-                verts.push_back({simd_make_float4(p.x, y, p.y, st.opacity), simd_make_float4(float(e), along / std::max(st.width, 4.0f), 0, 0)});
-            }
-            if (k > 0) idx.insert(idx.end(), {base - 2, base - 1, base, base - 1, base + 1, base});
-        }
-        // Round caps at both ends hide the notches where pieces meet at an angle.
-        for (const auto& end : {line.points.front(), line.points.back()}) {
-            const float y = terrain_->smoothHeightAt(end[0], end[1]) + 0.2f;
-            const auto centre = uint32_t(verts.size());
-            verts.push_back({simd_make_float4(end[0], y, end[1], st.opacity), simd_make_float4(0.5f, 0, 0, 0)});
-            constexpr int kSegments = 10;
-            for (int s = 0; s <= kSegments; ++s) {
-                const float a = float(s) / kSegments * 6.2831853f;
-                const float px = end[0] + std::cos(a) * st.width * 0.5f, pz = end[1] + std::sin(a) * st.width * 0.5f;
-                verts.push_back({simd_make_float4(px, terrain_->smoothHeightAt(px, pz) + 0.2f, pz, st.opacity),
-                                 simd_make_float4(0.08f, std::sin(a) * 0.5f, 0, 0)});
-                if (s > 0) idx.insert(idx.end(), {centre, centre + uint32_t(s), centre + uint32_t(s) + 1});
-            }
-        }
-    }
-    RoadMesh out;
-    for (auto& [type, vi] : byType) {  // narrow, faint types first so tarmac draws on top
-        const auto base = uint32_t(out.vertices.size());
-        const auto first = uint32_t(out.indices.size());
-        out.vertices.insert(out.vertices.end(), vi.first.begin(), vi.first.end());
-        for (uint32_t i : vi.second) out.indices.push_back(base + i);
-        const bool tarmac = (type >= 10 && type <= 12) || type == 15 || type == 18 || type == 19;
-        out.batches.push_back({roads_->styles[type].texture, first, uint32_t(vi.second.size()), !tarmac});
-    }
-    return out;
-}
 
 // ---- Grass (p14) ----
 
@@ -803,10 +801,12 @@ void WorldStreamer::updateGrass(simd_float3 player, fuel::MeshRenderer& renderer
 WorldStreamer::GroundTile WorldStreamer::buildGroundTile(int level, simd_float3 player) const {
     constexpr uint32_t n = fuel::MeshRenderer::kGroundTile;
     const double sp = kTileSpacing[level], extent = sp * n;
-    // Snap to 16 texels so a rebuilt tile lines up with the last one.
+    // Snap to 16 texels so a rebuilt tile lines up with the last one; texel centres fall on
+    // multiples of the spacing, i.e. on FUEL's ground vertices (Paysage_FillPoints 0x7f92c0).
     const double snap = 16 * sp;
-    GroundTile t{level, std::round(player.x / snap) * snap - extent / 2, std::round(player.z / snap) * snap - extent / 2, float(extent),
-                 std::vector<uint8_t>(size_t(n) * n * 4)};
+    GroundTile t{level, std::round(player.x / snap) * snap - extent / 2 - sp / 2, std::round(player.z / snap) * snap - extent / 2 - sp / 2,
+                 float(extent), std::vector<uint8_t>(size_t(n) * n * 4), std::vector<uint16_t>(size_t(n) * n * 4),
+                 std::vector<float>(size_t(n) * n * 4)};
     const auto t0 = std::chrono::steady_clock::now();
     // Two threads: more starve physics and streaming on the main thread (4 performance cores).
     constexpr unsigned threads = 2;
@@ -816,19 +816,48 @@ WorldStreamer::GroundTile WorldStreamer::buildGroundTile(int level, simd_float3 
             for (uint32_t j = k; j < n; j += threads)
                 for (uint32_t i = 0; i < n; ++i) {
                     const double x = t.originX + (i + 0.5) * sp, z = t.originZ + (j + 0.5) * sp;
-                    // Without the road blend: roads are the port's textured ribbons (tan dirt), and the
-                    // decoded road colour under them would show as grey shoulders beside every road
-                    // (the 60 m colour map is built without roads too).
-                    fuel::GroundPoint p = ground_->at(x, z);
-                    p.road = 0;
-                    // The 6 m palette-half noise is taken at the point (1 m) or averaged over the texel (4 m).
+                    const fuel::GroundPoint p = ground_->at(x, z);
+                    // The 6 m palette-half noise is taken at the point (1 m) or averaged over the texel.
                     const fuel::GroundColours c = ground_->colours(x, z, p, level == 0 ? -1.0f : ground_->meanT0(x, z, sp, 2));
-                    uint8_t* px = &t.rgba[(size_t(j) * n + i) * 4];
+                    const size_t o = (size_t(j) * n + i) * 4;
+                    uint8_t* px = &t.rgba[o];
                     for (int q = 0; q < 3; ++q) px[q] = uint8_t(std::clamp(c.base[q], 0.0f, 1.0f) * 255.0f + 0.5f);
                     px[3] = uint8_t(std::clamp(c.forest, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    // Record bytes R+0x3a..0x41 (0x6ac120): weight byte = floor(255 w + 0.5).
+                    for (int q = 0; q < 4; ++q)
+                        t.types[o + size_t(q)] =
+                            uint16_t(p.surfaceType[q] | uint16_t(std::floor(std::clamp(p.surfaceWeight[q], 0.0f, 1.0f) * 255.0f + 0.5f)) << 8);
+                    // Decal: R+0x43 = byte(64 w) / 64 (0x6a5500), uv floats, material slot.
+                    const float w = std::floor(std::clamp(p.decal, 0.0f, 3.98f) * 64.0f + 0.5f) / 64.0f;
+                    t.decal[o] = p.decalU;
+                    t.decal[o + 1] = p.decalV;
+                    t.decal[o + 2] = p.decalMaterial == 0xfff ? 0.0f : w;
+                    t.decal[o + 3] = float(fuel::MeshRenderer::decalSlot(p.decalMaterial));
                 }
         });
     for (auto& th : pool) th.join();
+    // Seam rule (0x7f9b50): neighbouring vertices whose decal uv differ by more than 0.5 both
+    // lose their decal (junctions, where two roads' uv meet).
+    {
+        std::vector<uint8_t> kill(size_t(n) * n, 0);
+        for (uint32_t j = 0; j < n; ++j)
+            for (uint32_t i = 0; i < n; ++i) {
+                const float* a = &t.decal[(size_t(j) * n + i) * 4];
+                if (!(a[2] > 0.01f)) continue;
+                for (int dj = 0; dj <= 1; ++dj)
+                    for (int di = -1; di <= 1; ++di) {
+                        if (dj == 0 && di <= 0) continue;
+                        const int64_t ii = int64_t(i) + di, jj = int64_t(j) + dj;
+                        if (ii < 0 || jj < 0 || ii >= int64_t(n) || jj >= int64_t(n)) continue;
+                        const float* b = &t.decal[(size_t(jj) * n + size_t(ii)) * 4];
+                        if (!(b[2] > 0.01f)) continue;
+                        if (std::fabs(a[0] - b[0]) > 0.5f || std::fabs(a[1] - b[1]) > 0.5f)
+                            kill[size_t(j) * n + i] = kill[size_t(jj) * n + size_t(ii)] = 1;
+                    }
+            }
+        for (size_t q = 0; q < kill.size(); ++q)
+            if (kill[q]) t.decal[q * 4 + 2] = 0;
+    }
     if (std::getenv("FUEL_STREAM_TRACE"))
         std::printf("ground tile %d: %.0f m at (%.0f, %.0f) in %.1f ms\n", level, extent, t.originX, t.originZ,
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -837,10 +866,10 @@ WorldStreamer::GroundTile WorldStreamer::buildGroundTile(int level, simd_float3 
 
 void WorldStreamer::updateGroundTiles(simd_float3 player, fuel::MeshRenderer& renderer, bool force) {
     if (ground_ == nullptr || !ground_->hasPalette()) return;
-    auto apply = [&](GroundTile&& t) { renderer.setGroundTile(t.level, t.originX, t.originZ, t.extent, t.rgba); };
+    auto apply = [&](GroundTile&& t) { renderer.setGroundTile(t.level, t.originX, t.originZ, t.extent, t.rgba, t.types, t.decal); };
     if (tileJob_.valid() && (force || tileJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) apply(tileJob_.get());
     if (tileJob_.valid()) return;
-    for (int level = 0; level < 2; ++level) {
+    for (int level = 0; level < kTileLevels; ++level) {
         if (std::hypot(player.x - tileAt_[level].x, player.z - tileAt_[level].y) < kTileStep[level]) continue;
         tileAt_[level] = simd_make_float2(player.x, player.z);
         if (force) {

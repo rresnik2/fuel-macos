@@ -29,6 +29,9 @@
 #include <string>
 #include <vector>
 
+#include "core/road_segments.hpp"
+#include "core/water.hpp"
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: fuelterrain USA1.DPC [--pgm REFERENCE.pgm] [--at X Z ...] [--ground OUT.ppm SIZE]\n");
@@ -106,6 +109,15 @@ int main(int argc, char** argv) {
                 const float X = std::strtof(argv[i + 1], nullptr), Z = std::strtof(argv[i + 2], nullptr), R = std::strtof(argv[i + 3], nullptr);
                 i += 3;
                 const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                // FUEL_P22_CARVE=1: the ground with the roads work's 0x6fcaa0 (RoadSampler::carve)
+                // instead of terrain_height's own road decode, to compare the two against placed objects.
+                std::unique_ptr<fuel::RoadSampler> p22;
+                if (std::getenv("FUEL_P22_CARVE") && ground.detail) {
+                    p22 = std::make_unique<fuel::RoadSampler>(dpc, fuel::loadRoadTypeTable(dpc),
+                                                              [&](double px, double pz) { return ground.detail->detailHeight(px, pz); });
+                    const_cast<fuel::TerrainDetail*>(ground.detail.get())
+                        ->setRoadCarver([&](double px, double pz, double& y, double c, double w) { return p22->carve(px, pz, y, c, w); });
+                }
                 for (const auto& e : std::filesystem::directory_iterator(std::filesystem::path(argv[1]).parent_path())) {
                     if (e.path().extension() != ".DPC" || e.path().filename() == "USA1.DPC") continue;
                     try {
@@ -255,6 +267,105 @@ int main(int argc, char** argv) {
                     std::printf("  plants: %zu without the ground tests, %zu with\n", before.size(), after.size());
                 } catch (const std::exception& e) {
                     std::printf("  plants: %s\n", e.what());
+                }
+            } else if (a == "--lakes") {
+                // --lakes: the 19 lakes the engine adds from code (read from FUEL.exe), flood-filled.
+                const auto l0 = std::chrono::steady_clock::now();
+                const fuel::Lakes lakes(dpc, [&](double px, double pz) { return double(hf.smoothHeightAt(px, pz)); });
+                std::printf("lakes: %zu (%.2f s)\n", lakes.lakes().size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - l0).count());
+                for (const fuel::Lake& L : lakes.lakes()) {
+                    size_t cells = 0;
+                    for (uint32_t w : L.mask) cells += size_t(__builtin_popcount(w));
+                    // Area under water: 25 m samples inside the mask with B-spline ground below level - 2.
+                    size_t wet = 0;
+                    for (double z = L.minZ; z < L.maxZ; z += 25)
+                        for (double x = L.minX; x < L.maxX; x += 25)
+                            if (L.contains(x, z) && hf.smoothHeightAt(x, z) < L.level - 2) ++wet;
+                    std::printf("  %s x %.2f z %.2f level %.2f R %.0f: %d x %d cells of %.2f m, %zu set, %.1f km2 under water\n",
+                                L.flood ? "basin" : "pond ", L.x, L.z, L.level, L.radius, L.w, L.h, L.cell, cells, double(wet) * 625e-6);
+                }
+            } else if (a == "--roads" && i + 3 < argc) {
+                // --roads X Z R: FUEL's road segments, point sampler and height carve around (X, Z)
+                // (AGW_TerraRoad, notes p22). Writes roads.ppm (R weight, G decal, B carve depth).
+                const double x = std::strtod(argv[i + 1], nullptr), z = std::strtod(argv[i + 2], nullptr);
+                const int r = std::atoi(argv[i + 3]);
+                i += 3;
+                const auto r0 = std::chrono::steady_clock::now();
+                const fuel::Heightfield levelled = fuel::loadLevelledHeightfield(dpc);
+                fuel::RoadTypeTable types = fuel::loadRoadTypeTable(dpc);
+                std::printf("road types: %s\n", types.valid ? "rebuilt from FUEL.exe" : "NOT AVAILABLE");
+                if (!types.valid) return 1;
+                for (int t = 4; t <= 20; ++t) {
+                    const fuel::RoadType& T = types.types[size_t(t)];
+                    std::printf("  %2d %-24s C %5.2f half %5.2f bc %6.2f cc %6.2f d4 %6.2f decal 0x%03x tarmac %.0f\n", t, T.name.c_str(), T.at(0x1f0),
+                                T.at(0x00), T.at(0xbc), T.at(0xcc), T.at(0xd4), T.u32(0xa8), T.at(0x38));
+                }
+                fuel::RoadSampler rs(dpc, std::move(types), [&](double px, double pz) {  // flags 3: ground without roads
+                    return levelled.detail ? levelled.detail->detailHeight(px, pz) : double(levelled.smoothHeightAt(px, pz));
+                });
+                std::printf("  %zu records (%.2f s)\n", rs.recordCount(), std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count());
+                const auto s0 = std::chrono::steady_clock::now();
+                const int n = 2 * r + 1;
+                std::vector<uint8_t> img(size_t(n) * size_t(n) * 3);
+                double maxCarve = 0, sumCarve = 0;
+                size_t onRoad = 0, decal = 0;
+                for (int jz = 0; jz < n; ++jz)
+                    for (int jx = 0; jx < n; ++jx) {
+                        const double px = x - r + jx, pz = z - r + jz;
+                        const fuel::RoadFields f = rs.sample(px, pz);
+                        double y = levelled.smoothHeightAt(px, pz);
+                        const double y0 = y;
+                        rs.carve(px, pz, y, 1.0, 1.0);
+                        const double dy = y - y0;
+                        maxCarve = std::max(maxCarve, std::fabs(dy));
+                        sumCarve += std::fabs(dy);
+                        onRoad += f.weight > 0.5f;
+                        decal += f.decal > 0.01f;
+                        uint8_t* o = &img[(size_t(jz) * size_t(n) + size_t(jx)) * 3];
+                        o[0] = uint8_t(std::lround(f.weight * 255));
+                        o[1] = uint8_t(std::lround(f.decal * 255));
+                        o[2] = uint8_t(std::clamp(128.0 + dy * 32.0, 0.0, 255.0));
+                    }
+                const double ss = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+                std::printf("  %d x %d points in %.2f s (%.1f us each incl. building %zu segments): road %zu, decal %zu, |carve| max %.2f m mean %.3f m\n", n,
+                            n, ss, ss * 1e6 / double(n * n), rs.builtSegments(), onRoad, decal, maxCarve, sumCarve / double(n * n));
+                std::ofstream out("roads.ppm", std::ios::binary);
+                out << "P6\n" << n << " " << n << "\n255\n";
+                out.write(reinterpret_cast<const char*>(img.data()), std::streamsize(img.size()));
+                // Cross-check against the terrain's own decode of 0x6fcaa0 (p21 H6): the ground with
+                // P21's road carve vs with this sampler's carve through the RoadCarver hook.
+                if (levelled.detail) {
+                    std::vector<double> a;
+                    for (int k = 0; k <= 400; ++k) a.push_back(levelled.detail->height(x - r + k * (2.0 * r / 400), z));
+                    auto* d = const_cast<fuel::TerrainDetail*>(levelled.detail.get());
+                    d->setRoadCarver([&rs](double px, double pz, double& y, double c, double w) { return rs.carve(px, pz, y, c, w); });
+                    double maxd = 0, sumd = 0;
+                    for (int k = 0; k <= 400; ++k) {
+                        const double b = levelled.detail->height(x - r + k * (2.0 * r / 400), z), dd = std::fabs(b - a[size_t(k)]);
+                        maxd = std::max(maxd, dd), sumd += dd;
+                    }
+                    d->setRoadCarver(nullptr);
+                    std::printf("  carve vs terrain_height's own road decode, 401 points along x: max |diff| %.4f m, mean %.5f m\n", maxd, sumd / 401);
+                }
+                if (std::getenv("FUEL_ROAD_DEBUG")) {
+                    std::vector<const fuel::RoadSampler::Segment*> segs;
+                    rs.segmentsNear(x, z, segs);
+                    for (const auto* sg : segs) {
+                        const float t = (sg->tx * float(x) + sg->tz * float(z)) - sg->c34;
+                        std::printf("  seg rec %u type %u len %.1f t %.2f H(t) %.2f base %d wid %u/%u curv %d/%d\n", sg->record, sg->type, sg->len, t,
+                                    sg->heightAt(t, rs.types().types[sg->type]), sg->base, sg->wid0, sg->wid1, sg->curv0, sg->curv1);
+                    }
+                    if (levelled.detail)
+                        std::printf("  flags-3 height %.3f\n", levelled.detail->detailHeight(x, z));
+                }
+                // A transect along x through (X, Z).
+                for (int k = -20; k <= 20; k += 2) {
+                    const fuel::RoadFields f = rs.sample(x + k, z);
+                    double y = levelled.smoothHeightAt(x + k, z);
+                    const double y0 = y;
+                    const double rr = rs.carve(x + k, z, y, 1.0, 1.0);
+                    std::printf("  x%+3d: w %.2f tarmac %.2f rough %.2f decal %.2f mat 0x%03x uv (%.2f, %.2f) h %.2f -> %.2f (r %.2f)\n", k, f.weight, f.tarmac,
+                                f.roughness, f.decal, f.material, f.across, f.along, y0, y, rr);
                 }
             } else if (a == "--at" && i + 2 < argc) {
                 const float x = std::strtof(argv[i + 1], nullptr), z = std::strtof(argv[i + 2], nullptr);

@@ -38,6 +38,7 @@
 #include "eventcheck.h"
 #include "hubcheck.h"
 #include "capture.h"
+#include "core/terrain_height.hpp"
 #include "core/hubs.hpp"
 #import <GameController/GameController.h>
 #include "audio/drive_audio.h"
@@ -1479,6 +1480,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
+        std::unique_ptr<fuel::Lakes> lakes;
         std::unique_ptr<fuel::GroundGenerator> ground;  // p14: grass and the trees' ground tests
         std::unique_ptr<WorldStreamer> streamer;  // after what its worker reads, so it is destroyed (and waits) first
         std::unique_ptr<Garage> garage;
@@ -1578,6 +1580,35 @@ int main(int argc, const char** argv) {
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
                             std::printf("vegetation: %zu tree and %zu bush species\n", vegetation->trees.size(), vegetation->bushes.size());
                             ground = std::make_unique<fuel::GroundGenerator>(*f, *terrain, roads.get());  // p14
+                            // p22: FUEL's road segments (roads painted into the ground, decal path), shared
+                            // with the ground, which carves the roads with them (loadLevelledHeightfield).
+                            if (terrain->roads)
+                                ground->setRoadSampler(terrain->roads.get());
+                            else
+                                std::fprintf(stderr, "fuelview: road table not rebuilt from FUEL.exe; roads use the port's widths\n");
+                            // p22: the lakes the engine adds from code (FUEL.exe table, flood-filled on
+                            // the bare height map) and their water meshes.
+                            try {
+                                // Flood fill on the map's B-spline (0x445570 = the base height h0).
+                                std::unique_ptr<fuel::Heightfield> bare;
+                                if (!terrain->detail) bare = std::make_unique<fuel::Heightfield>(fuel::loadWorldHeightfield(*f));
+                                const fuel::Heightfield* hf = terrain.get();
+                                lakes = std::make_unique<fuel::Lakes>(*f, [hf, &bare](double x, double z) {
+                                    return hf->detail ? hf->detail->baseHeight(x, z) : double(bare->smoothHeightAt(x, z));
+                                });
+                                if (lakes->valid()) {
+                                    ground->setLakes(lakes.get());
+                                    streamer->setLakes(lakes.get());
+                                    const std::vector<float> wc = fuel::readEngineFloats(*f, 0xa26880, 32);  // WaterConstant_Z defaults
+                                    if (wc.size() == 32) {
+                                        std::array<simd_float4, 8> c;
+                                        for (int k = 0; k < 8; ++k) c[size_t(k)] = simd_make_float4(wc[size_t(4 * k)], wc[size_t(4 * k + 1)], wc[size_t(4 * k + 2)], wc[size_t(4 * k + 3)]);
+                                        renderer.setWaterLook(c, *f);
+                                    }
+                                }
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "fuelview: lakes: %s\n", e.what());
+                            }
                             streamer->setGround(ground.get());
                             renderer.setGrassAtlas(ground->grassAtlas());
                         } catch (const std::exception& e) {
