@@ -4,6 +4,7 @@
 #include "terrain.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -72,6 +73,11 @@ WeatherAmounts WeatherFields::sample(double x, double y, double z) const {
     // fog = max(fog field, PP5444 snow, PP5445 rain)
     w.fog = std::max(std::max(field(fog_), P(5444) * w.snow), w.rain * P(5445));
     w.cloud = clamp01(w.cloud), w.fog = clamp01(w.fog), w.rain = clamp01(w.rain), w.snow = clamp01(w.snow);
+    // The debug menu's "Force Rain" / "Force Snow" (0x5f7f90: flags 0xa654d9 / 0xa654da; 0x5b89e0 sets rain = 1,
+    // 0x5bba30 starts the tanks with amount 1): FUEL_FORCE_RAIN=1 / FUEL_FORCE_SNOW=1.
+    static const bool forceRain = std::getenv("FUEL_FORCE_RAIN") != nullptr, forceSnow = std::getenv("FUEL_FORCE_SNOW") != nullptr;
+    if (forceRain) w.rain = 1;
+    if (forceSnow) w.snow = 1;
     return w;
 }
 

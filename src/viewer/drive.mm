@@ -336,6 +336,10 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
     frame_.clock = sys_->clock();
     if (std::getenv("FUEL_SFX_DEBUG") && !frame_.sprites.empty() && int(sys_->clock() * 60) % 60 == 0) {
         const fuel::SfxSprite& s = frame_.sprites.back();
+        if (std::atoi(std::getenv("FUEL_SFX_DEBUG")) == 3)
+            for (const fuel::SfxSprite& q : frame_.sprites)
+                std::fprintf(stderr, "  sprite rel (%.2f %.2f %.2f) a %.2f size %.2f\n", q.posAngle.x - eye.x, q.posAngle.y - eye.y, q.posAngle.z - eye.z,
+                             q.colour.w, q.vel.w);
         std::fprintf(stderr, "sfx: %zu sprites (%zu gpu), last: pos %.1f %.1f %.1f size %.2f col %.2f %.2f %.2f a %.2f life %.2f gpu %.0f uv %.2f %.2f %.2f %.2f\n",
                      frame_.sprites.size(), sys_->gpuCount(), s.posAngle.x, s.posAngle.y, s.posAngle.z, s.vel.w, s.colour.x, s.colour.y,
                      s.colour.z, s.colour.w, s.life.y, s.life.z, s.uv.x, s.uv.y, s.uv.z, s.uv.w);
