@@ -27,6 +27,8 @@ add_library(fuelcore STATIC
   src/core/surface.cpp
   src/core/vehicle_params.cpp
   src/core/races.cpp
+  src/core/events.cpp
+  src/core/race_rules.cpp
   src/core/hubs.cpp
   src/core/assembly.cpp
   src/core/sound.cpp
@@ -47,6 +49,10 @@ target_link_libraries(fuelscene PRIVATE fuelcore)
 add_executable(fuelrider src/tools/fuelrider.cpp)
 target_link_libraries(fuelrider PRIVATE fuelcore)
 
+# The event catalogue and a physics-free run of every event's rules.
+add_executable(fuelevents src/tools/fuelevents.cpp)
+target_link_libraries(fuelevents PRIVATE fuelcore)
+
 # Mesh viewer: the first native Metal program (P5 spike).
 add_executable(fuelview
   src/viewer/main.mm
@@ -54,6 +60,7 @@ add_executable(fuelview
   src/viewer/drive.mm
   src/viewer/recorder.mm
   src/viewer/hubcheck.mm
+  src/viewer/eventcheck.mm
   src/viewer/game_settings.mm
   src/audio/drive_audio.mm
 )

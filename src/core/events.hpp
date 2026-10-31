@@ -25,7 +25,18 @@ struct Event {
     bool playable = false;     // false when the port cannot run it yet (say why in `note`)
     std::string note;
     Race race;                 // start, checkpoints, finish, laps, mode
+
+    // Added by P17 (all decoded from hubinfos.tsc; see notes/p17-events.md):
+    uint32_t descText = 0;     // challenges: rule description text (6013..6022; the challenge kind)
+    uint32_t surfaceText = 0, vehicleText = 0;  // AddMissionSurfaceType: e.g. 930 "Mostly Offroad", 2955 "Buggy"
+    std::string vehicle;       // challenges: the forced variant, e.g. "BUGGY_OFF_3" ("" = the player's choice)
+    float times[3] = {0, 0, 0};  // AddMissionTime 1st..3rd values (career: three target times; challenges: 1st only)
+    std::string aiVehicles;    // AddMissionParam AI vehicle ids ("18_61_33_..."; "NONE" = none)
+    int hubIndex = 0;          // position of `hub` in the hub list (SetHubTargetInfos order)
 };
+
+// Short English name of a game mode (Race::gameMode()), e.g. "knock out".
+const char* gameModeName(int gameMode);
 
 // All events in career order (hub, then tier), challenges after the career races
 // of their hub. `dataDir` is the extracted game folder (the one holding CommonComponent).
