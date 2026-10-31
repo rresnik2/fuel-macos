@@ -1,6 +1,7 @@
 #include "terrain.hpp"
 #include "genworld_noise.hpp"
 #include "terrain_height.hpp"
+#include "road_segments.hpp"
 
 
 #include <algorithm>
@@ -141,6 +142,23 @@ Heightfield loadWorldHeightfield(const DpcFile& world) {
 Heightfield loadLevelledHeightfield(const DpcFile& world) {
     Heightfield hf = loadWorldHeightfield(world);
     hf.detail = makeTerrainDetail(world, hf.width, hf.height, kHeightRange / hf.metresPerUnit, hf.raw);
+    // Roads carve the ground through FUEL's segments (0x6fcaa0 as decoded by p22): against every
+    // placement it fits better than terrain_height's own road decode (within 0.5 m 7,266 vs 5,314,
+    // > 4 m off 1,730 vs 2,146). Profiles use the ground without roads (flags 3, 0x6f8a00).
+    if (hf.detail) {
+        try {
+            RoadTypeTable types = loadRoadTypeTable(world);
+            if (types.valid) {
+                const TerrainDetail* d = hf.detail.get();
+                auto rs = std::make_shared<RoadSampler>(world, std::move(types), [d](double x, double z) { return d->detailHeight(x, z); });
+                const_cast<TerrainDetail*>(d)->setRoadCarver(
+                    [rs](double x, double z, double& y, double c, double w) { return rs->carve(x, z, y, c, w); });
+                hf.roads = std::move(rs);
+            }
+        } catch (const std::exception&) {
+            // no road graph: the ground keeps terrain_height's own road decode
+        }
+    }
     return hf;
 }
 
