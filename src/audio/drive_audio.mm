@@ -135,6 +135,8 @@ struct DriveAudio::Impl {
     float load = 0, prevSpeed = 0, airTime = 0, sinceImpact = 1;
     int prevGround = 4;
     float prevRpm = 0, rpmRate = 0, sincePop = 1, popGap = 0.15f;
+    float sinceLift = 10;  // seconds since the throttle was last released
+    int popsThisLift = 0;
     std::vector<float> compressionPeak, sinceThump;
 
     static AVAudioPCMBuffer* makeBuffer(const Sound& s, bool loop) {
@@ -240,6 +242,9 @@ struct DriveAudio::Impl {
             return;
         }
         started = true;
+        // AVAudioPlayerNode -play throws ("player did not see an IO cycle") when the engine has no
+        // working output (device busy, e.g. another copy of the game): play silently instead of crashing.
+        @try {
         for (int c : kUsedClasses)
             for (const Voice* v : {&tyres[size_t(c)].rollSlow, &tyres[size_t(c)].rollFast, &tyres[size_t(c)].skid})
                 if (v->valid()) [v->player play];
@@ -252,10 +257,15 @@ struct DriveAudio::Impl {
         for (AVAudioPlayerNode* p : impactPlayers) [p play];
         for (OneShots* set : {&backfire, &absorber})
             for (AVAudioPlayerNode* p : set->players) [p play];
+        } @catch (NSException* e) {
+            std::fprintf(stderr, "fuelview: audio: %s; continuing without sound\n", e.reason.UTF8String);
+            started = false;
+            [engine stop];
+        }
     }
 
     static void fire(OneShots& set, size_t index, float volume) {
-        if (set.buffers.empty()) return;
+        if (set.buffers.empty() || set.players.empty()) return;
         AVAudioPlayerNode* p = set.players[set.next++ % set.players.size()];
         p.volume = std::clamp(volume, 0.0f, 1.0f);
         [p scheduleBuffer:set.buffers[std::min(index, set.buffers.size() - 1)] atTime:nil options:AVAudioPlayerNodeBufferInterrupts completionHandler:nil];
@@ -363,10 +373,20 @@ void DriveAudio::update(float dt, const VehicleState& st, float throttle) {
     m.prevRpm = st.rpm;
     m.sincePop += dt;
     const float rpmNorm = (st.rpm - s.engine.idleRpm) / (s.engine.maxRpm - s.engine.idleRpm);
+    // Port limits until FUEL's audio mixing is decoded (Phase 6): with FUEL's physics the revs swing
+    // fast enough to trigger pops almost continuously, so pops only follow a throttle lift (within
+    // 1 s, at most 3), at least 0.6 s apart, at about a third of the old volume.
+    if (throttle >= s.engine.popThrottleMax) {
+        m.sinceLift = 0;
+        m.popsThisLift = 0;
+    } else {
+        m.sinceLift += dt;
+    }
     if (!m.backfire.buffers.empty() && m.rpmRate < s.engine.popRateThreshold && rpmNorm > s.engine.popRpmMin &&
-        throttle < s.engine.popThrottleMax && m.sincePop > m.popGap) {
-        Impl::fire(m.backfire, size_t(std::rand()) % m.backfire.buffers.size(), 0.55f + 0.45f * float(std::rand() % 100) / 100.0f);
+        throttle < s.engine.popThrottleMax && m.sincePop > std::max(m.popGap, 0.6f) && m.sinceLift < 1.0f && m.popsThisLift < 3) {
+        Impl::fire(m.backfire, size_t(std::rand()) % m.backfire.buffers.size(), 0.18f + 0.14f * float(std::rand() % 100) / 100.0f);
         m.sincePop = 0;
+        ++m.popsThisLift;
         m.popGap = s.engine.popInterval * (1.0f + 0.5f * float(std::rand() % 100) / 100.0f);
     }
 
