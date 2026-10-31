@@ -148,6 +148,7 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
     t28_ = Fractal(perm_, 5, 500.0f, 79.442329f, 0.3f, 0.3f, 0.5f);
     // Colour noises: bank+0x0004 (T0, palette half), bank+0x9e4c (colour layer), bank+0xcdc8 (strata).
     f0004_ = Fractal(perm_, 2, 6.13931f, 39.37579f, 0.3f, 0.5f, 0.5f);
+    f3f54_ = Fractal(perm_, 1, 10.0f, 25.148701f, 0.3f, 0.3f, 5.0f);
     f9e4c_ = Fractal(perm_, 1, 100.0f, 65.145248f, 0.3f, 0.3f, 5.0f);
     fcdc8_ = Fractal(perm_, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
     palette_ = loadGroundPalette(world);
@@ -295,8 +296,8 @@ void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarse
     const float slope = std::acos(clamp01(p.normal[1]));
     float rockSlope = clamp01((slope >= 45 * kDeg ? 1.0f : std::max(0.0f, (slope - 40 * kDeg) / (5 * kDeg))) + rock);
     if (p.height > 3000 - 500 * p.normal[2]) rock = rockSlope = 1;
-    rock = clamp01(rock - p.cover - p.road);  // - junction term (ctx+0x238, not ported)
-    rockSlope = clamp01(rockSlope - p.cover - p.road);
+    rock = clamp01(rock - p.cover - p.road - p.junction);
+    rockSlope = clamp01(rockSlope - p.cover - p.road - p.junction);
     p.rock = clamp01(rock - p.highGround);  // - water (ctx+0x228, not ported)
     p.rockSlope = clamp01(rockSlope - p.highGround);
 }
@@ -346,8 +347,37 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     bool nearRoad = false;
     const SurfaceWeights fs = surfaceWeights(x, z);
     p.cover = fs.cover;
-    // Bit 12: road weight plus the flat surfaces that clear grass.
-    p.road = clamp01(roadWeight(x, z, &nearRoad, &p.tarmac) + clamp01(1 - (fs.add + fs.noise)) * fs.cut);
+    // Bit 12 (0x6b9bb0): road weight plus the flat surfaces that clear grass.
+    if (sampler_ != nullptr) {
+        const RoadFields rf = sampler_->sample(x, z);
+        float r = clamp01(rf.weight + clamp01(1 - (fs.add + fs.noise)) * fs.cut);
+        float u = rf.inside2;
+        u = u >= 1 ? clamp01(1 - (u - 1) * 0.25f) : clamp01(u);
+        float rough = clamp01(u * 0.5f + rf.roughness);
+        float tarmac = rf.tarmac, decal = rf.decal;
+        float puddle = clamp01((p.surfaceHumidity - 0.66f) * 10) * rf.puddle;
+        puddle = clamp01((clamp01(p.normal[1] * 1.02f) - 0.99f) * 100 * (1 - fs.cover) * puddle);
+        float junction = 0;
+        if (rf.junction > 0.01f && p.normal[1] < 0.95f) {
+            const float t2 = clamp01((0.95f - p.normal[1]) * 20);
+            junction = rf.junction * t2;
+            const float k = 1 - t2;
+            r *= k, tarmac *= k, decal *= k, puddle *= k, rough *= k;
+        }
+        p.road = r;
+        p.tarmac = tarmac;
+        p.roughness = rough;
+        p.decal = decal;
+        p.decalU = rf.across;
+        p.decalV = rf.along;
+        p.decalMaterial = decal < 0.01f ? uint16_t(0xfff) : rf.material;
+        p.puddle = puddle;
+        p.junction = junction;
+        p.roadEdge = rf.berm;
+        nearRoad = rf.inside > 0;  // ctx+0x1bc = 0 when ctx+0x214 > 0, else 1000
+    } else {
+        p.road = clamp01(roadWeight(x, z, &nearRoad, &p.tarmac) + clamp01(1 - (fs.add + fs.noise)) * fs.cut);
+    }
     // Bit 4: high ground (p13 V2 0x4de850) minus road.
     {
         float a = clamp01(p.height - (2500.0f + 250.0f * p.normal[2]));
@@ -366,6 +396,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     if (!(p.rock > 0.5f) && p.field != 1 && !(p.height > 3000 - 500 * p.normal[2])) {
         g = 1 - fs.cut + fs.noise * n10;
         g -= (2 - p.road) * p.road;
+        g -= p.junction * (2 - p.junction);
         if (g > 0.1f) {
             const float h = p.surfaceHumidity;
             const float patch = clamp01(std::fabs((ffd8_.at(x, z) + f1fac_.at(x, z)) * 0.5f));
@@ -395,6 +426,15 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     p.groundGrass = clamp01(ground + addAll);
     // Bit 23: grass size.
     p.grassSize = clamp01(clamp01((1 - p.normal[1] - 0.1f) * 10) + s4c(ffd44_.at(x, z)) - (1 - fs.keep));
+    // Bit 24 (0x6b8980), dry land: Stones; Caillou (pebbles) only under water (no water yet).
+    if (p.road <= 0.95f) {
+        const float F = ffd44_.at(x, z);
+        const float nst = clamp01(0.5f + 0.5f * contrast8(2 * F * (2 - std::fabs(F)) - 1));
+        const float st = clamp01(nst * band(slope, 30 * kDeg, 45 * kDeg, 5 * kDeg) - p.grass - p.road + p.junction);
+        const float uu = 2 * st - 1, au = std::fabs(uu);
+        p.stones = clamp01(0.5f + 0.5f * uu * (4 - 6 * au + (4 - au) * uu * uu) - p.highGround);
+    }
+    surfaceTypes(x, z, p);
     return p;
 }
 
@@ -482,7 +522,7 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     } else {
         X = lerp(L(8, 67), L(7, 66), s);
     }
-    const float q = occ;  // (1 - 0.5 (1 - cover) ctx+0x21c) * occ, with the road-edge term 0x21c taken as 0
+    const float q = (1 - 0.5f * (1 - p.cover) * p.roadEdge) * occ;
     if (q < 0.99f) X = lerp(lerp(L(121, 122), L(119, 120), s), X, q);
     if (burn > 0.01f) {
         const float lum = X[0] + X[1] + X[2];  // weights g 0xa066f0 = (1, 1, 1)
@@ -495,16 +535,8 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     const float dry = clamp01(1 - 2 * clamp01((H - 0.33f) * 1.5625f + burn));
     const float g = clamp01(p.grass - 0.8f * dry);
 
-    // Stones ctx+0x1dc (bit 24), dry land.
-    float stones = 0;
-    if (p.road <= 0.95f) {
-        const float F = ffd44_.at(x, z);
-        const float nst = clamp01(0.5f + 0.5f * contrast8(2 * F * (2 - std::fabs(F)) - 1));
-        const float slope = std::acos(clamp01(p.normal[1]));
-        const float st = clamp01(nst * band(slope, 30 * kDeg, 45 * kDeg, 5 * kDeg) - p.grass - p.road);
-        const float uu = 2 * st - 1, au = std::fabs(uu);
-        stones = clamp01(0.5f + 0.5f * uu * (4 - 6 * au + (4 - au) * uu * uu) - p.highGround);
-    }
+    // Stones ctx+0x1dc (bit 24), computed by at().
+    const float stones = p.stones + p.caillou;
 
     // Bit 14 (0x6bc230): the composer.
     C A = lerp(M1, X, g);
@@ -529,6 +561,65 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     out.occlusion = occ;
     out.forest = k;
     return out;
+}
+
+// Point_SurfaceTypes (bit 21, 0x6bb670; notes p22 S1): weights of the 40 ground textures, the
+// four strongest kept.
+void GroundGenerator::surfaceTypes(double x, double z, GroundPoint& p) const {
+    float w[kSurfaceTypes] = {};
+    const float r = p.road, tk = p.tarmac;
+    const float asph = tk * r, dirt = (1 - tk) * r, s3 = p.roughness * 3;
+    w[11] = asph;
+    w[13] = clamp01(1 - s3) * dirt;
+    w[25] = clamp01(1 - std::fabs(1 - s3)) * dirt;
+    w[2] = clamp01(1 - std::fabs(2 - s3)) * dirt;
+    w[14] = clamp01(1 - std::fabs(3 - s3)) * dirt;
+    const float cr = clamp01(mapAt(18, x, z) - r);  // ctx+0x184 = map 18
+    w[24] = cr;
+    const float m = 1 - cr;
+    w[22] = p.grass * p.surfaceHumidity * m;
+    w[15] = clamp01(p.rockSlope - p.caillou - p.stones - p.grass) * m;
+    w[5] = m * p.caillou;
+    w[3] = m * p.stones;
+    w[8] = p.highGround * m;
+    w[6] = m * p.sand;
+    const float M = std::max({dirt, w[22], cr, w[5], w[8], w[3], asph, w[15], w[6]});
+    const float steep = clamp01(1 - clamp01((p.normal[1] - 0.866f) * 7.4626865f) - p.sand), flat = 1 - steep;
+    const float sz = p.grassSize;
+    w[28] = steep * (1 - M);
+    float bare = (1 - M) * flat;
+    w[29] = (w[3] + w[5]) * steep;
+    w[5] *= flat;
+    w[32] = bare * sz;
+    bare *= 1 - sz;
+    w[30] = p.surfaceHumidity * bare;
+    w[38] = w[6] * sz;
+    w[6] *= 1 - sz;
+    w[3] = w[3] * flat * (1 - sz);
+    w[26] = w[3] * sz;
+    w[34] = w[15] * sz;
+    w[15] *= 1 - sz;
+    if (p.field == 1) {
+        w[10] = std::min((1 - p.surfaceHumidity) * bare + w[6], 1.0f);
+        w[6] = 0;
+    }
+    const float v = clamp01(contrast8(2 * f3f54_.at(x, z) - 1) * 0.5f + 0.5f);  // 0x6a81f0
+    for (const auto& [a, b] : {std::pair{38, 39}, {34, 35}, {32, 33}, {30, 31}, {11, 12}, {15, 16}, {22, 23}, {3, 4}, {8, 9}, {26, 27}})
+        if (w[a] > 0.025f) w[b] = w[a] * (1 - v), w[a] *= v;
+    if (w[6] > 0.025f) w[7] = w[6] * (1 - v), w[6] *= v;  // dry land (under water: WETSAND 36/37)
+    // Keep weights > 0.025, strongest first, normalised by their total.
+    int idx[kSurfaceTypes];
+    int n = 0;
+    float total = 0;
+    for (int k = 0; k < kSurfaceTypes; ++k)
+        if (w[k] > 0.025f) idx[n++] = k, total += w[k];
+    for (int i = 0; i < n; ++i)  // the engine's exchange sort (not stable for equal weights)
+        for (int j = i + 1; j < n; ++j)
+            if (w[idx[i]] < w[idx[j]]) std::swap(idx[i], idx[j]);
+    for (int k = 0; k < 4; ++k) {
+        p.surfaceType[k] = k < n ? uint8_t(idx[k]) : uint8_t(0xff);
+        p.surfaceWeight[k] = k < n ? w[idx[k]] / total : 0.0f;
+    }
 }
 
 bool GroundGenerator::rejectsPlant(double x, double z) const {

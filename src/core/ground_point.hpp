@@ -8,6 +8,7 @@
 
 #include "dpc.hpp"
 #include "genworld_noise.hpp"
+#include "road_segments.hpp"
 #include "roads.hpp"
 #include "terrain.hpp"
 
@@ -34,6 +35,21 @@ struct GroundPoint {
     float grass = 0;            // Grass (ctx+0x1c8)
     float groundGrass = 0;      // GroundGrass (ctx+0x1cc): what the grass tufts use
     float grassSize = 0;        // ctx+0x234
+    // Road fields (bit 12 = 0x6b9bb0 over the road sampler 0x6fbab0; zero without a RoadSampler).
+    float roughness = 0;        // ctx+0x1f0: dirt road roughness (picks DIRT_FLAT .. DIRT_ROUGH)
+    float decal = 0;            // ctx+0x204: road decal weight
+    float decalU = 0, decalV = 0;  // ctx+0x1f8 / 0x1fc: decal uv (across, along)
+    uint16_t decalMaterial = 0xfff;  // ctx+0x2dc: GenWorld texture enum of the decal (0xfff none)
+    float puddle = 0;           // ctx+0x208
+    float junction = 0;         // ctx+0x238
+    float roadEdge = 0;         // ctx+0x21c (berm beside the road)
+    float stones = 0;           // ctx+0x1dc "Stones" (bit 24, dry land)
+    float caillou = 0;          // ctx+0x1d8 "Caillou" (pebbles; only under water)
+    float sand = 0;             // ctx+0x220 "SandTexture" (bit 22; from the Dune layer)
+    // Surface types (bit 21 = 0x6bb670): the four strongest of the 40 ground textures and their
+    // weights (normalised by the sum of every weight > 0.025); type 0xff = none.
+    uint8_t surfaceType[4] = {0xff, 0xff, 0xff, 0xff};
+    float surfaceWeight[4] = {0, 0, 0, 0};
 };
 
 // The point's ground colours (sRGB 0..1, as the palette stores them), decoded from the
@@ -64,6 +80,9 @@ public:
     // `terrain` is the levelled heightfield; `roads` may be null.
     GroundGenerator(const DpcFile& world, const Heightfield& terrain, const RoadNetwork* roads);
     bool valid() const { return terrain_ != nullptr; }
+    // FUEL's road segments (point bit 12 reads them); without it the port's road widths are used.
+    void setRoadSampler(const RoadSampler* s) { sampler_ = s; }
+    const RoadSampler* roadSampler() const { return sampler_; }
 
     // Evaluates the point (x, z). With `full` false only what the tree filter needs.
     GroundPoint at(double x, double z, bool full = true) const;
@@ -105,12 +124,14 @@ private:
     double insideDistance(const Surface& s, double x, double z) const;
     float edgeJitter(double x, double z) const;
     float roadWeight(double x, double z, bool* nearRoad, float* tarmac = nullptr) const;
+    void surfaceTypes(double x, double z, GroundPoint& p) const;
     void rockCover(double x, double z, GroundPoint& p, float coarseNy) const;
     int fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover, float* random) const;
     float mapAt(int slot, double x, double z) const;
 
     const Heightfield* terrain_ = nullptr;
     const RoadNetwork* roads_ = nullptr;
+    const RoadSampler* sampler_ = nullptr;
     Permutation perm_{};
     std::array<Raster, 31> maps_{};
     std::vector<Surface> surfaces_;
@@ -118,6 +139,7 @@ private:
     // Noise bank (genWorld+0x4498) and terrain-detail object T, by their offsets.
     Fractal f1fac_, ffd8_, f2f80_, ffd44_, f7ea4_, f6ed0_, edgeA_, edgeB_;
     Fractal t0c_, t18_, t24_, t28_;
+    Fractal f3f54_;                                 // surface variant noise (0x6a81f0)
     Fractal f0004_, f9e4c_, fcdc8_;                 // colour noises (p16 C8, C11)
     std::vector<std::array<float, 4>> palette_;    // GenWorld Colors by slot
     std::vector<float> tileWeight_, tileSize_;
