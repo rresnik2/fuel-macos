@@ -432,6 +432,36 @@ struct AssemblyMode {
 static fuel::GroundMaps gGround;
 static fuel::SurfaceMap gSurfaces;
 
+// Per-frame physics cost of the headless runs (--ai-check prints it).
+static struct PhysStats {
+    std::vector<double> frame, vehicle, cpu;
+    int vehicles = 0;
+    void add(double ms, double vehicleMs, double cpuMs, int n) {
+        frame.push_back(ms);
+        vehicle.push_back(vehicleMs);
+        cpu.push_back(cpuMs);
+        vehicles = n;
+    }
+    void print() const {
+        if (frame.empty()) return;
+        auto stats = [](std::vector<double> v, double& mean, double& p99, double& worst) {
+            mean = 0;
+            for (double x : v) mean += x;
+            mean /= double(v.size());
+            std::sort(v.begin(), v.end());
+            p99 = v[std::min(v.size() - 1, size_t(double(v.size()) * 0.99))];
+            worst = v.back();
+        };
+        double m, p, w, vm, vp, vw, cm, cp, cw;
+        stats(frame, m, p, w);
+        stats(vehicle, vm, vp, vw);
+        stats(cpu, cm, cp, cw);
+        std::printf("physics cost, %d vehicles, %zu frames: mean %.2f ms, p99 %.2f ms, worst %.2f ms per frame "
+                    "(FUEL vehicle model: mean %.2f, p99 %.2f, worst %.2f ms wall; CPU mean %.2f, p99 %.2f, worst %.2f ms)\n",
+                    vehicles, frame.size(), m, p, w, vm, vp, vw, cm, cp, cw);
+    }
+} gPhysStats;
+
 struct Garage {
     std::vector<std::unique_ptr<AssemblyMode>> archives;  // one per vehicle DPC
     std::vector<std::pair<size_t, size_t>> entries;       // (archive, variant)
@@ -1571,6 +1601,16 @@ int main(int argc, const char** argv) {
                                 if (lakes->valid()) {
                                     ground->setLakes(lakes.get());
                                     streamer->setLakes(lakes.get());
+                                    if (drive) {  // p24: water for FUEL's vehicle physics, 0x4df5a0's first term (depth above the 2 m floor)
+                                        const fuel::Lakes* lk = lakes.get();
+                                        const fuel::Heightfield* th = terrain.get();
+                                        drive->physics().setWaterDepthQuery([lk, th](double x, double z) {
+                                            bool inside = false;
+                                            for (const fuel::Lake& l : lk->lakes()) inside = inside || l.contains(x, z);
+                                            if (!inside) return 0.0f;
+                                            return float(std::max(0.0, lk->depthAbove(x, z, th->smoothHeightAt(x, z)) - 2.0));
+                                        });
+                                    }
                                     const std::vector<float> wc = fuel::readEngineFloats(*f, 0xa26880, 32);  // WaterConstant_Z defaults
                                     if (wc.size() == 32) {
                                         std::array<simd_float4, 8> c;
@@ -1777,6 +1817,9 @@ int main(int argc, const char** argv) {
                         const double tp0 = CACurrentMediaTime();
                         drive->update(1.0f / 60, in);
                         const double tp1 = CACurrentMediaTime();
+                        {  // physics cost per frame (all vehicles, props, queries), for --ai-check
+                            gPhysStats.add((tp1 - tp0) * 1000.0, drive->physics().lastVehicleMs(), drive->physics().lastVehicleCpuMs(), drive->vehicleCount());
+                        }
                         if (opt.film > 0) {
                             chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius(), opt.haveYaw ? opt.yawDeg * float(M_PI) / 180.0f : 0.0f);
                             dust.update(1.0f / 60, *drive, drive->position());
@@ -1867,6 +1910,7 @@ int main(int argc, const char** argv) {
                         if (race->racers.size() > 1) std::printf("order after %.1f s of racing:\n%s", std::max(0.0, race->clock), race->standings(*drive).c_str());
                         if (opt.aiCheck) {
                             printAiCheck(*race, *drive);
+                            gPhysStats.print();
                             return aiCheckVerdict(*race) ? 0 : 1;
                         }
                     }

@@ -5,6 +5,10 @@
 //   fueldrive DATA_DIR VEHICLE_DPC VARIANT --surfaces
 //     the same throttle-then-brake test on tarmac, grass and sand: top speed,
 //     0-80 km/h time, braking distance from 80 km/h and the surfaces under the wheels
+//   fueldrive DATA_DIR VEHICLE_DPC VARIANT --behaviour [SURFACE_TYPE]
+//     on FUEL's terrain, on a flat stretch, with one surface type under the wheels (default 11 =
+//     asphalt): 0-100 km/h time, top speed, braking distance from 100 (or the top speed), turning
+//     circle at 30 km/h, and a jump (2 m drop at 60 km/h): landing peak, bounces, settle time
 
 #include "core/dpc.hpp"
 #include "core/ground.hpp"
@@ -17,7 +21,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 
@@ -29,7 +35,8 @@ int main(int argc, char** argv) {
     try {
         const std::string data = argv[1];
         fuel::DpcFile world(data + "/CommonComponent/WORLD/USA1.DPC");
-        const fuel::Heightfield terrain = fuel::loadWorldHeightfield(world);
+        const bool behaviour = argc > 4 && std::string(argv[4]) == "--behaviour";
+        const fuel::Heightfield terrain = fuel::loadLevelledHeightfield(world);
         fuel::DpcFile vehicleDpc(data + "/" + argv[2]);
         std::ifstream f(data + "/CommonComponent/Param/VehiclesParam.tsc");
         std::stringstream text;
@@ -43,6 +50,138 @@ int main(int argc, char** argv) {
                     setup.frontDriven && setup.rearDriven ? "4WD" : setup.frontDriven ? "FWD" : "RWD", setup.idleRpm, setup.maxRpm,
                     setup.peakTorque, setup.gears.size(), setup.finalDrive, setup.topSpeedKmh);
 
+        if (behaviour) {
+            const int type = argc > 5 ? std::atoi(argv[5]) : 11;
+            // The straightest, flattest 800 m of tarmac road within 6 km of the Yellowstone hub (roads are carved
+            // smooth into the ground; off-road FUEL's detail fractals make the ride bumpy).
+            const fuel::RoadNetwork roads = fuel::loadRoads(world);
+            double bx = -51358, bz = -30043, best = 1e9;
+            float byaw = 0;
+            for (const auto& line : roads.lines) {
+                if (!fuel::isTarmacRoad(line.type)) continue;
+                for (size_t k = 0; k + 1 < line.points.size(); ++k) {
+                    const auto& p = line.points[k];
+                    if (std::hypot(p[0] + 51358, p[1] + 30043) > 6000) continue;
+                    const float yaw = std::atan2(line.points[k + 1][0] - p[0], line.points[k + 1][1] - p[1]);
+                    // Follow the polyline 800 m: total heading change and height range.
+                    double along = 0, turn = 0, lo = 1e9, hi = -1e9;
+                    float prevYaw = yaw;
+                    for (size_t j = k; j + 1 < line.points.size() && along < 800; ++j) {
+                        const auto &a0 = line.points[j], &a1 = line.points[j + 1];
+                        const float y = std::atan2(a1[0] - a0[0], a1[1] - a0[1]);
+                        float dy = y - prevYaw;
+                        while (dy > M_PI) dy -= 2 * M_PI;
+                        while (dy < -M_PI) dy += 2 * M_PI;
+                        turn += std::fabs(dy);
+                        prevYaw = y;
+                        along += std::hypot(a1[0] - a0[0], a1[1] - a0[1]);
+                        const double h = terrain.smoothHeightAt(a1[0], a1[1]);
+                        lo = std::min(lo, h), hi = std::max(hi, h);
+                    }
+                    if (along < 800) continue;
+                    const double sc = turn * 20 + (hi - lo);
+                    if (sc < best) best = sc, bx = p[0], bz = p[1], byaw = yaw;
+                }
+            }
+            std::printf("test road at (%.0f, %.0f) heading %.0f deg, score (20 x turn rad + height range m) %.2f, surface %s\n", bx, bz, byaw * 180 / M_PI, best,
+                        fuel::surfaceName(type));
+            auto make = [&] {
+                auto w = std::make_unique<fuel::DriveWorld>(terrain);
+                w->setSurfaceQuery([type](double, double) { return type; });
+                w->spawn(setup, bx, bz, byaw);
+                for (int i = 0; i < 90; ++i) w->update(1.0f / 60, {});
+                return w;
+            };
+            constexpr float dt = 1.0f / 60;
+            // 0-100 and top speed.
+            auto sim = make();
+            double t = 0, t100 = -1, t60 = -1;
+            float top = 0;
+            for (int i = 0; i < 45 * 60; ++i) {
+                sim->update(dt, {1, 0, 0, false});
+                t += dt;
+                const float v = sim->state().speedKmh;
+                top = std::max(top, v);
+                if (t60 < 0 && v >= 60) t60 = t;
+                if (t100 < 0 && v >= 100) t100 = t;
+            }
+            // Braking from 100 (or 90 % of the top speed).
+            sim = make();
+            const float from = std::min(100.0f, top * 0.9f);
+            for (int i = 0; i < 40 * 60 && sim->state().speedKmh < from; ++i) sim->update(dt, {1, 0, 0, false});
+            const auto p0 = sim->state().chassis.position;
+            double brake = -1, tb = 0;
+            for (int i = 0; i < 20 * 60; ++i) {
+                sim->update(dt, {0, 1, 0, false});
+                tb += dt;
+                const auto s = sim->state();
+                if (s.speedKmh < 1.0f) {
+                    brake = std::hypot(s.chassis.position[0] - p0[0], s.chassis.position[2] - p0[2]);
+                    break;
+                }
+            }
+            // Turning circle at 30 km/h: full right lock, throttle holding 30 km/h; radius from the path's
+            // heading change over distance in the last 4 s.
+            sim = make();
+            auto heading = [](const fuel::VehicleState& s) {
+                const auto& q = s.chassis.rotation;
+                return std::atan2(2 * (q[0] * q[2] + q[3] * q[1]), 1 - 2 * (q[0] * q[0] + q[1] * q[1]));
+            };
+            for (int i = 0; i < 12 * 60 && sim->state().speedKmh < 30; ++i) sim->update(dt, {1, 0, 0, false});
+            double dist = 0, turned = 0, prevH = heading(sim->state());
+            auto prevP = sim->state().chassis.position;
+            float vsum = 0;
+            int n = 0;
+            for (int i = 0; i < 8 * 60; ++i) {
+                const float v = sim->state().speedKmh;
+                sim->update(dt, {std::clamp((30 - v) * 0.15f + 0.3f, 0.0f, 1.0f), v > 33 ? 0.3f : 0.0f, 1, false});
+                const auto s = sim->state();
+                if (i >= 4 * 60) {
+                    double dh = heading(s) - prevH;
+                    while (dh > M_PI) dh -= 2 * M_PI;
+                    while (dh < -M_PI) dh += 2 * M_PI;
+                    turned += dh;
+                    dist += std::hypot(s.chassis.position[0] - prevP[0], s.chassis.position[2] - prevP[2]);
+                    vsum += s.speedKmh, ++n;
+                }
+                prevH = heading(s);
+                prevP = s.chassis.position;
+            }
+            const double radius = std::fabs(turned) > 1e-3 ? dist / std::fabs(turned) : -1;
+            // Jump: 2 m drop at 60 km/h.
+            sim = make();
+            for (int i = 0; i < 20 * 60 && sim->state().speedKmh < 60; ++i) sim->update(dt, {1, 0, 0, false});
+            {
+                const auto q = sim->state().chassis.rotation;
+                const float fx = 2 * (q[0] * q[2] + q[3] * q[1]), fz = 1 - 2 * (q[0] * q[0] + q[1] * q[1]);
+                const float v = sim->state().speedKmh / 3.6f;
+                const float l = std::hypot(fx, fz);
+                sim->nudge(0, 2.0, {fx / l * v, 0, fz / l * v});
+            }
+            double air = 0, settle = -1, maxTilt = 0;
+            int bounces = 0, prevOn = 0;
+            bool landed = false;
+            for (int i = 0; i < 6 * 60; ++i) {
+                sim->update(dt, {0.5f, 0, 0, false});
+                const auto s = sim->state();
+                const auto& q = s.chassis.rotation;
+                const double upY = 1 - 2 * (q[0] * q[0] + q[2] * q[2]);
+                if (!landed) {
+                    air += dt;
+                    if (s.wheelsOnGround > 0) landed = true;
+                } else {
+                    maxTilt = std::max(maxTilt, std::acos(std::clamp(upY, -1.0, 1.0)) * 180 / M_PI);
+                    if (prevOn > 0 && s.wheelsOnGround == 0) ++bounces;
+                    if (settle < 0 && i > 30 && s.wheelsOnGround == int(s.wheels.size())) settle = (i + 1) * dt - air;
+                }
+                prevOn = s.wheelsOnGround;
+            }
+            std::printf("%-14s 0-60 %5.2f s  0-100 %5.2f s  top %6.1f km/h  brake %3.0f-0 %5.1f m (%.2f s)  turn circle @%.0f km/h %5.1f m  "
+                        "jump: air %.2f s, max tilt %.0f deg, %d bounce(s), all wheels down after %.2f s\n",
+                        setup.name.c_str(), t60, t100, top, from, brake, tb, n ? vsum / n : 0.0f, radius > 0 ? 2 * radius : -1, air, maxTilt, bounces,
+                        settle);
+            return 0;
+        }
         if (argc > 4 && std::string(argv[4]) == "--surfaces") {
             const fuel::GroundMaps ground = fuel::buildGroundMaps(world, terrain, 2334);
             const fuel::RoadNetwork roads = fuel::loadRoads(world);
@@ -177,6 +316,15 @@ int main(int argc, char** argv) {
             std::printf("  %-9s t=%5.1fs  %6.1f km/h  gear %d  %5.0f rpm  wheels on ground %d  height above terrain %.2f m  up.y %.2f\n", phase,
                         t, s.speedKmh, s.gear, s.rpm, s.wheelsOnGround, s.chassis.position[1] - ground,
                         1 - 2 * (s.chassis.rotation[0] * s.chassis.rotation[0] + s.chassis.rotation[2] * s.chassis.rotation[2]));
+            if (const fuel::fv::FuelVehicle* m = sim.model(0); m && std::getenv("FUEL_TRACE")) {
+                std::printf("      loads");
+                for (int w = 0; w < m->wheelCount(); ++w) std::printf(" %.3f", m->wheelLoad(w));
+                std::printf("  slip");
+                for (int w = 0; w < m->wheelCount(); ++w) std::printf(" %.2f", m->wheelUtil(w) > 1e4f ? -1.0f : m->wheelUtil(w));
+                std::printf("  rims");
+                for (int w = 0; w < m->wheelCount(); ++w) std::printf(" %.1f", m->body().S.auxVel[1 + w]);
+                std::printf("  steer accel %.3f  airtime %.2f\n", m->steer().accel, m->airtime());
+            }
         };
         double t = 0;
         auto run = [&](const char* phase, double seconds, fuel::DriveInput in) {
