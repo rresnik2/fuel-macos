@@ -63,6 +63,7 @@
 #include "core/assembly.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -468,6 +469,7 @@ static std::array<float, 4> groundPointColour(const fuel::GroundMaps& g, double 
     return {c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, 1.0f};
 }
 static fuel::SurfaceMap gSurfaces;
+static std::atomic<const fuel::GroundGenerator*> gGroundGen{nullptr};  // for the tyres' class fractions (p32)
 
 // Per-frame physics cost of the headless runs (--ai-check prints it).
 static struct PhysStats {
@@ -1823,6 +1825,16 @@ int main(int argc, const char** argv) {
                 DustSystem::setDataDir(opt.dataDir);  // FUEL's wheel effects: pp001.tsc + FUEL.exe tables, ground colour
                 DustSystem::groundColour = [](double x, double z) { return groundPointColour(gGround, x, z); };
                 fuel::DriveWorld::setDefaultSurfaceQuery([](double x, double z) { return gSurfaces.at(x, z); });
+                if (!std::getenv("FUEL_ONEHOT_CLASSES"))  // p32: FUEL's blended class fractions (0x6b76a0)
+                    fuel::DriveWorld::setDefaultClassQuery([](double x, double z, float* frac, float& depth) {
+                        const fuel::GroundGenerator* g = gGroundGen.load();
+                        if (!g) {  // no ground generator (no world loaded): bare earth
+                            frac[3] = 1;
+                            depth = 0;
+                            return;
+                        }
+                        g->classFractions(x, std::nan(""), z, frac, depth);
+                    });
                 if (opt.haveAt && !opt.world && !opt.drive)
                     renderer.placement = matrix_from_translation(opt.atX, terrain->heightAt(opt.atX, opt.atZ), opt.atZ);
             } catch (const std::exception& e) {
@@ -1969,6 +1981,7 @@ int main(int argc, const char** argv) {
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
                             std::printf("vegetation: %zu tree and %zu bush species\n", vegetation->trees.size(), vegetation->bushes.size());
                             ground = std::make_unique<fuel::GroundGenerator>(*f, *terrain, roads.get());  // p14
+                            gGroundGen.store(ground.get());
                             // p22: FUEL's road segments (roads painted into the ground, decal path), shared
                             // with the ground, which carves the roads with them (loadLevelledHeightfield).
                             if (terrain->roads)
