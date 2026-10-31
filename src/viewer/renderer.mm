@@ -123,7 +123,7 @@ float pcf3x3(depth2d_array<float> map, float3 tc, uint slice, float4 ts) {
 
 // ProjShadowPS + ComputeShadow + ShadowAttenuation: 1 lit, 0 shadowed; fades to lit from 957.5 to 1600 m.
 float fuelShadow(depth2d_array<float> map, float3 world, constant FrameUniforms& f) {
-    if (f.shadowSize.x <= 0.0) return 1.0;
+    if (f.shadowSize.x <= 0.0 || (uint(f.fog.x) & 1u)) return 1.0;
     const float3 pv = (f.view * float4(world, 1.0)).xyz;
     const float vz = pv.z;
     const float4 d = f.shadowSplit;
@@ -185,6 +185,7 @@ Scatter fuelScatterFinish(constant FrameUniforms& f, float lookY, float density,
 
 // scatteringbase: what the camera sees of the air between it and the world point p.
 Scatter fuelScattering(constant FrameUniforms& f, float3 p) {
+    if (uint(f.fog.x) & 2u) return Scatter{float3(1.0), float3(0.0)};
     float3 look = f.eye.xyz - p;
     const float len = length(look);
     look /= max(len, 1e-6);
@@ -2303,6 +2304,7 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb, FrameUniforms& fu, con
             return std::fabs(lx - bx.cx) <= bx.hx + rad && std::fabs(ly - bx.cy) <= bx.hy + rad && lh >= bx.minH - rad &&
                    lh <= bx.minH + ss.zExtent + rad;
         };
+        const float texelHalf = float(std::max(bx.hx, bx.hy) / W);
         // Casters grouped by mesh: one instanced draw each.
         std::unordered_map<const GpuMesh*, std::vector<simd_float4x4>> groups;
         auto consider = [&](const Instance& inst) {
@@ -2310,7 +2312,9 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb, FrameUniforms& fu, con
             const simd_float3 c = (gm.boundsMin + gm.boundsMax) * 0.5f;
             const simd_float4 w = simd_mul(inst.world, simd_make_float4(c, 1));
             const float sc = std::max(simd_length(inst.world.columns[0].xyz), std::max(simd_length(inst.world.columns[1].xyz), simd_length(inst.world.columns[2].xyz)));
-            const float rad = simd_length(gm.boundsMax - gm.boundsMin) * 0.5f * sc + 2.0f;
+            const float size = simd_length(gm.boundsMax - gm.boundsMin) * 0.5f * sc, rad = size + 2.0f;
+            // Port: casters smaller than one shadow texel of the slice are skipped (their shadow would not show).
+            if (size < texelHalf * 2.0f) return;
             if (visible(w.x, w.y, w.z, rad)) groups[&gm].push_back(inst.world);
         };
         for (const Instance& inst : instances_) consider(inst);
@@ -2477,7 +2481,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fillAtmosphere(fu, eye, fu.viewProj, 0, aspect, zn);
     const bool ownEncoder = enc == nil;
     if (ownEncoder) {
-        encodeShadows(frameCb_, fu, terrainChunks);
+        // FUEL_PROFILE=1: frames cycle full / no shadow lookups / no vertex scattering / no shadow slices.
+        static const bool profile = std::getenv("FUEL_PROFILE") != nullptr;
+        const uint32_t pm = profile ? frame_ % 4 : 0;
+        fu.fog.x = pm == 1 ? 1.0f : pm == 2 ? 2.0f : 0.0f;
+        if (pm != 3) encodeShadows(frameCb_, fu, terrainChunks);
         enc = [frameCb_ renderCommandEncoderWithDescriptor:frameRp_];
     }
     lastFrame_ = std::make_shared<FrameUniforms>(fu);
@@ -2682,6 +2690,16 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
     ++frame_;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
         if (b.GPUEndTime > b.GPUStartTime) gpuMs_ = (b.GPUEndTime - b.GPUStartTime) * 1000.0;
+        static const bool profile = std::getenv("FUEL_PROFILE") != nullptr;
+        if (profile) {
+            static double sum[4] = {0, 0, 0, 0};
+            static int n[4] = {0, 0, 0, 0}, total = 0;
+            const int k = (total++) % 4;  // frames complete in order
+            sum[k] += (b.GPUEndTime - b.GPUStartTime) * 1000.0, ++n[k];
+            if (total % 40 == 0)
+                std::printf("profile: full %.2f, no shadow lookups %.2f, no vertex scattering %.2f, no shadow slices %.2f ms\n",
+                            sum[0] / std::max(1, n[0]), sum[1] / std::max(1, n[1]), sum[2] / std::max(1, n[2]), sum[3] / std::max(1, n[3]));
+        }
     }];
 }
 

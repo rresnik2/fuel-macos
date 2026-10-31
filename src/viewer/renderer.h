@@ -186,7 +186,7 @@ public:
     void setFoliage(std::unordered_set<uint32_t> meshIds) { foliage_ = std::move(meshIds); }
     void setGrass(const std::vector<GrassTuft>& tufts);    // replaces the list
     // Fine ground colour around the player (levels 0, 1, 2: 1, 2, 4 m texels), kGroundTile
-    // texels per side, sRGB RGBA8 like the colour map (alpha = far-band forest weight); the
+    // texels per side, gamma-space RGBA8 like the colour map (alpha = the ground's sky occlusion); the
     // terrain blends it over the 60 m map. `originX/Z` = world position of texel (0, 0)'s corner.
     static constexpr uint32_t kGroundTile = 256;
     // Also per texel the four surface types (type | weight byte << 8) and the road decal
