@@ -1041,7 +1041,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     else if ([ch isEqualToString:@"o"]) _renderer->postEffects = !_renderer->postEffects;
     else if ([ch isEqualToString:@"d"]) _renderer->dirt = _renderer->dirt >= 1.0f ? 0.0f : _renderer->dirt + 0.5f;
     else if ([ch isEqualToString:@"g"]) { _renderer->showGround = !_renderer->showGround; _renderer->showTerrain = !_renderer->showTerrain; }
-    else if ([ch isEqualToString:@"q"]) [NSApp terminate:nil];
+    else if ([ch isEqualToString:@"q"] && !gOverlay) [NSApp terminate:nil];  // --in-game: quit through the menu
     else if (!_look.name.empty() && ([ch isEqualToString:@"l"] || [ch isEqualToString:@"p"])) {
         if ([ch isEqualToString:@"l"]) _look.livery = (_look.livery + 1) % 10;
         else { _look.custom = false; _look.color = (_look.color + 1) % int(std::max<size_t>(1, _look.palette.size())); }

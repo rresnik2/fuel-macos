@@ -212,6 +212,7 @@ std::vector<const VehicleInfo*> Menu::vehicleChoices() const {
         if (upper(v.name) == family) byName = true;
     std::vector<const VehicleInfo*> out;
     for (const VehicleInfo& v : vehicles_) {
+        if (v.family == "UNKNOWN") continue;  // test and traffic vehicles (VEH_TEST_*, TRAFFIC_TRUCK)
         bool ok = family.empty();
         if (byName) ok = upper(v.name) == family;
         else if (!family.empty()) {

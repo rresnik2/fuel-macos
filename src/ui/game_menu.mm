@@ -62,12 +62,11 @@ std::string vehicleDpc(const std::string& dataDir, const Menu& menu, const std::
     std::string cls;
     for (const VehicleInfo& v : menu.vehicles())
         if (v.name == vehicle) cls = v.family;
-    for (const std::string& name : {cls, std::string("BONUS1"), std::string("VEH")}) {
-        if (name.empty()) continue;
-        const std::string rel = "CommonComponent/DATAS/" + name + ".DPC";
-        // The class's own archive when it has one (QUAD, BIKE, BUGGY, MUSCLE, SUV, TRUCK).
-        if (fs::exists(fs::path(dataDir) / rel)) return rel;
-    }
+    // The class archives (QUAD, BIKE, BUGGY, MUSCLE, SUV, TRUCK); bonus vehicles (BONUS_*,
+    // FLOTTE_*) are in BONUS1.DPC (checked with fuelscene).
+    if (vehicle.rfind("BONUS_", 0) == 0 || vehicle.rfind("FLOTTE_", 0) == 0) cls = "BONUS1";
+    const std::string rel = "CommonComponent/DATAS/" + cls + ".DPC";
+    if (!cls.empty() && fs::exists(fs::path(dataDir) / rel)) return rel;
     return "CommonComponent/DATAS/QUAD.DPC";
 }
 
