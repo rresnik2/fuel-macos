@@ -1,5 +1,6 @@
 #include "races.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 
@@ -34,6 +35,34 @@ float num(const std::vector<std::string>& t, size_t i) { return i < t.size() ? s
 
 }  // namespace
 
+int Race::gameMode() const {
+    auto timeTrial = [&] {
+        if (checkpoints.empty()) return GmTimeTrial;
+        return checkBonus == 0 && checkpointBonus.empty() ? GmTimeLimitCheckpoints : GmTimeBonus;
+    };
+    switch (scenario) {
+    case 1: case 7: return GmAtoB;
+    case 2: return GmCheckpoint;
+    case 3: return GmKnockOut;
+    case 4: case 5: return timeTrial();
+    case 6: case 8: return GmCircuit;
+    case 9:
+        switch (mode) {
+        case AtoB: return GmAtoB;
+        case Checkpoint: return GmCheckpoint;
+        case KnockOut: return GmKnockOut;
+        case TimeTrial: return timeTrial();
+        case Circuit: return GmCircuit;
+        case Baja: return GmBaja;
+        case Raid: return GmRaid;
+        default: return GmInvalid;
+        }
+    case 11: return GmHelicopter;
+    case 13: return GmCatchAI;
+    default: return GmInvalid;
+    }
+}
+
 std::vector<Race> parseMissions(const std::string& text) {
     std::vector<Race> out;
     std::istringstream in(text);
@@ -50,6 +79,18 @@ std::vector<Race> parseMissions(const std::string& text) {
         } else if (!inside) {
             continue;
         } else if (k == "EMD_End") {
+            // As FUEL's EMD_End (0x5520c0): a looped race whose finish is not on the start gets the finish
+            // as its last checkpoint and finishes on the start; a solo race without timer or bonus gets 1200 s.
+            const auto& s = r.start;
+            const auto& f = r.finish;
+            if (r.laps > 0 && !r.checkpoints.empty() &&
+                (std::fabs(s[0] - f[0]) > 1e-6f || std::fabs(s[1] - f[1]) > 1e-6f || std::fabs(s[2] - f[2]) > 1e-6f)) {
+                r.checkpoints.push_back(f);
+                r.checkpointFlags.push_back(r.checkpointFlags.empty() ? 1 : r.checkpointFlags.back());
+                r.finish = s;
+                r.finishYaw = r.startYaw;
+            }
+            if (r.timeLimit == 0 && r.checkBonus == 0 && r.aiCount == 0) r.timeLimit = 1200.0f;
             out.push_back(r);
             inside = false;
         } else if (k == "EMD_SetName" && t.size() > 1) {
@@ -70,6 +111,22 @@ std::vector<Race> parseMissions(const std::string& text) {
             r.finishYaw = num(t, 2);
         } else if (k == "EMD_SetCheckpoint") {
             r.checkpoints.push_back({num(t, 1), num(t, 2), num(t, 3)});
+            // 0x5512c0: the 8th value when present, else 2 in baja scenarios (7, 8) and 1 elsewhere.
+            r.checkpointFlags.push_back(t.size() > 8 ? int(num(t, 8)) : (r.scenario == 7 || r.scenario == 8) ? 2 : 1);
+        } else if (k == "EMD_SetRaceScenario") {
+            r.scenario = int(num(t, 1));
+        } else if (k == "EMD_SetNbIA") {
+            r.aiCount = int(num(t, 1));
+        } else if (k == "EMD_SetTimerCheckBonus") {
+            r.checkBonus = num(t, 1);
+        } else if (k == "EMD_SetCheckpointTimerBonus") {
+            r.checkpointBonus.push_back(num(t, 1));
+        } else if (k == "EMD_ForceStartPosition") {
+            r.aiGrid.push_back({num(t, 1), num(t, 2)});
+        } else if (k == "EMD_HideStartEnd") {
+            r.showStartEnd = false;
+        } else if (k == "EMD_SetAIElasticParam") {
+            for (int i = 0; i < 3; ++i) r.elastic[i] = num(t, size_t(i + 1));
         }
     }
     return out;
