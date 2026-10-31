@@ -1451,6 +1451,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
+        std::unique_ptr<fuel::RoadSampler> roadSampler;  // p22: declared before `ground`, which points at it
         std::unique_ptr<fuel::GroundGenerator> ground;  // p14: grass and the trees' ground tests
         std::unique_ptr<WorldStreamer> streamer;  // after what its worker reads, so it is destroyed (and waits) first
         std::unique_ptr<Garage> garage;
@@ -1550,6 +1551,20 @@ int main(int argc, const char** argv) {
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
                             std::printf("vegetation: %zu tree and %zu bush species\n", vegetation->trees.size(), vegetation->bushes.size());
                             ground = std::make_unique<fuel::GroundGenerator>(*f, *terrain, roads.get());  // p14
+                            // p22: FUEL's road segments (roads painted into the ground, decal path).
+                            try {
+                                fuel::RoadTypeTable types = fuel::loadRoadTypes(*f);
+                                if (types.valid) {
+                                    const fuel::Heightfield* hf = terrain.get();
+                                    roadSampler = std::make_unique<fuel::RoadSampler>(
+                                        *f, std::move(types), [hf](double x, double z) { return double(hf->smoothHeightAt(x, z)); });
+                                    ground->setRoadSampler(roadSampler.get());
+                                } else {
+                                    std::fprintf(stderr, "fuelview: road table not rebuilt from FUEL.exe; roads use the port's widths\n");
+                                }
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "fuelview: roads: %s\n", e.what());
+                            }
                             streamer->setGround(ground.get());
                             renderer.setGrassAtlas(ground->grassAtlas());
                         } catch (const std::exception& e) {

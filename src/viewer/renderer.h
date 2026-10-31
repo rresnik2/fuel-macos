@@ -117,17 +117,6 @@ public:
     // Race beacons: xyz = ground position, w = kind (0 next checkpoint,
     // 1 the one after, 2 finish). Drawn as tall glowing columns.
     void setMarkers(const std::vector<simd_float4>& markers) { markers_ = markers; }
-    // Road ribbons draped over the terrain: vertices (xyz, w = opacity; uv
-    // across/along) and batches of triangles sharing a Bitmap_Z (0 = dirt colour).
-    struct RoadVertex {
-        simd_float4 position;
-        simd_float4 uv;
-    };
-    struct RoadBatch {
-        uint32_t texture, firstIndex, indexCount;
-        bool dirt;  // tint the texture with the dirt colour
-    };
-    void setRoads(const std::vector<RoadVertex>& vertices, const std::vector<uint32_t>& indices, const std::vector<RoadBatch>& batches);
     // Points the camera at `centre` instead of the scene's centre.
     void setFocus(simd_float3 centre) { center_ = centre; }
     // Other vehicles (race opponents), drawn with the scene: each its own parts (vehicle
@@ -174,11 +163,22 @@ public:
     // Tree and bush meshes: their blended materials are drawn as cut-outs (alpha to coverage).
     void setFoliage(std::unordered_set<uint32_t> meshIds) { foliage_ = std::move(meshIds); }
     void setGrass(const std::vector<GrassTuft>& tufts);    // replaces the list
-    // Fine ground colour around the player (level 0: 1 m, level 1: 4 m texels), kGroundTile
+    // Fine ground colour around the player (levels 0, 1, 2: 1, 2, 4 m texels), kGroundTile
     // texels per side, sRGB RGBA8 like the colour map (alpha = far-band forest weight); the
     // terrain blends it over the 60 m map. `originX/Z` = world position of texel (0, 0)'s corner.
     static constexpr uint32_t kGroundTile = 256;
-    void setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba);
+    // Also per texel the four surface types (type | weight byte << 8) and the road decal
+    // (u across, v along, weight, decal slot or -1): the inputs of ground.phl's vertices.
+    void setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba,
+                       const std::vector<uint16_t>& types, const std::vector<float>& decal);
+    static constexpr int kGroundTileLevels = 3;
+    // Road decal textures by slot: the GenWorld texture enums the road table uses (T[+0xa8]):
+    // 0x2a..0x2e Road01..05 -> 0..4, 0x34 Dirt01 -> 5; -1 for none.
+    static constexpr int kDecalSlots = 6;
+    static int decalSlot(uint16_t textureEnum) {
+        if (textureEnum >= 0x2a && textureEnum <= 0x2e) return int(textureEnum) - 0x2a;
+        return textureEnum == 0x34 ? 5 : -1;
+    }
     float grassRadius = 60.0f;                             // tufts shrink away towards it
 
     // Renders a frame into `target` (kOutputColorFormat, single-sample, any size):
@@ -257,6 +257,7 @@ private:
     std::unique_ptr<GpuMesh> buildMesh(uint32_t meshId, std::string* error);
     float shadowHalfSize() const { return std::max(radius_ * 1.05f, shadowRadius); }
     id<MTLTexture> texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind);
+    id<MTLTexture> uploadBitmap(const DpcFile& file, const DpcFile::Entry& entry, bool srgb, uint8_t* alphaKind);
     struct TextureStats {
         simd_float3 mean = {0.5f, 0.5f, 0.5f};  // of the DXT colour endpoints, 0..1
         bool greyDetail = false;  // pure grey around 0.5: takes the ground colour
@@ -277,14 +278,13 @@ private:
     id<MTLTexture> white_, shadowMap_;
     id<MTLRenderPipelineState> groundPipeline_, terrainPipeline_, skyPipeline_, markerPipeline_;
     std::vector<simd_float4> markers_;
-    id<MTLRenderPipelineState> roadPipeline_;
-    id<MTLBuffer> roadVertices_, roadIndices_;
-    std::vector<std::pair<id<MTLTexture>, RoadBatch>> roadBatches_;
     id<MTLDepthStencilState> depthAlways_;
     id<MTLTexture> heightTex_, groundColour_, groundSurface_, groundDetail_;
-    id<MTLTexture> groundFine_;  // 2-slice array (setGroundTile)
+    id<MTLTexture> groundFine_;  // 3-slice arrays (setGroundTile): colour, surface types, road decal
+    id<MTLTexture> groundTypes_, groundDecal_;
+    id<MTLTexture> decalTex_[kDecalSlots] = {};
     id<MTLCommandQueue> blitQueue_;  // mipmaps for the fine tiles
-    simd_float4 groundFineRect_[2] = {};  // origin x, z, extent, 1 when loaded
+    simd_float4 groundFineRect_[kGroundTileLevels] = {};  // origin x, z, extent, 1 when loaded
     simd_float4 groundFar_ = {0, 0, 0, 0};  // p16: far-band forest colour, w = decoded colour map
     id<MTLBuffer> terrainIndices_;
     uint32_t terrainIndexCount_ = 0;

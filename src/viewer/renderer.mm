@@ -48,7 +48,7 @@ struct FrameUniforms {
     float4 camUp;
     float4 groundFar;     // rgb: far-band forest colour (palette 57, linear); w = 1 when the colour map is
                           // FUEL's decoded point colour (alpha = forest weight), 0 for the old heuristic map
-    float4 groundFine[2]; // fine colour tiles around the player: origin x, z, extent, w = 1 when loaded
+    float4 groundFine[3]; // fine ground tiles around the player (1, 2, 4 m): origin x, z, extent, w = 1 when loaded
 };
 
 struct MaterialUniforms {
@@ -325,17 +325,6 @@ float valueNoise(float2 p) {
 // Size of the leaf chunk of FUEL's camera-centred quadtree holding xz: 12288 m
 // roots on a 12288 m lattice, split into four while the camera is within 2.0625 x
 // the chunk size of its centre, down to 24 m (FUN_007dfdc0; drive.mm has the same).
-// A detail texture without visible tiling: two lookups at offsets chosen by a slow
-// noise index k (0..1), blended where k crosses between them (port addition; the
-// engine's per-vertex surface types vary the ground more than the port's map can).
-float4 detailVaried(texture2d_array<float> tex, sampler s, float2 uv, uint layer, float k, float2 gx, float2 gy) {
-    const float l = k * 8.0, i = floor(l), fr = l - i;
-    const float2 oa = sin(float2(3.0, 7.0) * i), ob = sin(float2(3.0, 7.0) * (i + 1.0));
-    const float4 a = tex.sample(s, uv + oa, layer, gradient2d(gx, gy));
-    const float4 b = tex.sample(s, uv + ob, layer, gradient2d(gx, gy));
-    return mix(a, b, smoothstep(0.2, 0.8, fr - 0.1 * (a.b - b.b)));
-}
-
 float groundChunk(float2 xz, float2 eye) {
     float size = 12288.0;
     float2 o = round(xz / size) * size;
@@ -374,12 +363,12 @@ vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[
     return o;
 }
 
-// The 60 m colour map refined by the fine tiles around the player (4 m, then 1 m texels),
+// The 60 m colour map refined by the fine tiles around the player (4 m, 2 m, then 1 m texels),
 // each fading out over the outer eighth of its square. FUEL colours its terrain per
 // vertex: 1 m apart in the 24 m chunks near the camera, coarser further out.
 float4 groundColourAt(float2 xz, float4 gc, texture2d_array<float> fine, constant FrameUniforms& f) {
     constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
-    for (int l = 1; l >= 0; --l) {
+    for (int l = 2; l >= 0; --l) {
         const float4 t = f.groundFine[l];
         if (t.w <= 0.0) continue;
         const float2 u = (xz - t.xy) / t.z;
@@ -390,10 +379,167 @@ float4 groundColourAt(float2 xz, float4 gc, texture2d_array<float> fine, constan
     return gc;
 }
 
+// ---- ground.phl / ground.vhl and the ground vertices of Paysage_BuildVertices (FUEL.exe
+// 0x7f9b50), decoded in ~/re-work/fuel/notes/p22-ground-roads-water.md (G1, G2, R4). The CPU
+// tiles (setGroundTile) hold FUEL's per-vertex inputs on its vertex lattice; the shader
+// rebuilds each lattice triangle the way the engine builds its draw sets.
+struct GroundVert {
+    ushort4 tw;  // surface type | weight byte << 8
+    float4 dc;   // decal u, v, weight, slot (-1 none)
+};
+
+bool groundVertex(texture2d_array<ushort> types, texture2d_array<float> decal, float4 rect, uint slice, float sp, float2 wp,
+                  thread GroundVert& v) {
+    if (rect.w <= 0.0) return false;
+    const int2 it = int2(floor((wp - rect.xy) / sp - 0.5 + 0.5));
+    if (any(it < 0) || any(it >= int2(256))) return false;
+    v.tw = types.read(uint2(it), slice);
+    v.dc = decal.read(uint2(it), slice);
+    return true;
+}
+
+uint typeWeight(ushort4 tw, uint k) {
+    for (int c = 0; c < 4; ++c)
+        if (uint(tw[c] & 0xff) == k) return uint(tw[c] >> 8);
+    return 0;
+}
+
+// The lattice triangle holding xz (lattice spacing L): FUEL splits each quad along the
+// (x+1, z)-(x, z+1) diagonal; vertices in the order the decal material is picked.
+void groundTriangle(float2 xz, float L, thread float2* p, thread float3& bary) {
+    const float2 g = xz / L, i0 = floor(g), fr = g - i0;
+    if (fr.x + fr.y <= 1.0) {
+        p[0] = i0, p[1] = i0 + float2(0, 1), p[2] = i0 + float2(1, 0);
+        bary = float3(1.0 - fr.x - fr.y, fr.y, fr.x);
+    } else {
+        p[0] = i0 + float2(1, 0), p[1] = i0 + float2(0, 1), p[2] = i0 + float2(1, 1);
+        bary = float3(1.0 - fr.y, 1.0 - fr.x, fr.x + fr.y - 1.0);
+    }
+    for (int i = 0; i < 3; ++i) p[i] *= L;
+}
+
+// One band of ground.phl: bump normal + grey detail (n.xyz, n.w) and the decal (rgb, blend).
+struct GroundBand {
+    float4 n;
+    float4 decal;
+    bool ok;
+};
+
+GroundBand groundBand(float C, float2 xz, float2 warp, float steep, float sandy, texture2d_array<ushort> types,
+                      texture2d_array<float> decalTex, texture2d_array<float> detail, sampler rep, constant FrameUniforms& f,
+                      texture2d<float> d0, texture2d<float> d1, texture2d<float> d2, texture2d<float> d3, texture2d<float> d4,
+                      texture2d<float> d5) {
+    GroundBand out;
+    out.ok = true;
+    out.decal = float4(0.0);
+    // Lattice and tile slice of the chunk's vertices: C/24 apart (1, 2, 4, 8 m).
+    const float L = C / 24.0;
+    const uint slice = C <= 24.5 ? 0u : (C <= 48.5 ? 1u : 2u);
+    const float sp = slice == 0u ? 1.0 : (slice == 1u ? 2.0 : 4.0);
+    float2 p[3];
+    float3 bary;
+    groundTriangle(xz, L, p, bary);
+    GroundVert v[3];
+    bool have = C <= 192.5;
+    for (int i = 0; i < 3 && have; ++i) have = groundVertex(types, decalTex, f.groundFine[slice], slice, sp, p[i], v[i]);
+    if (C <= 48.5) {
+        if (!have) {
+            out.ok = false;
+            return out;
+        }
+        // Draw set of the triangle (0x7f9b50 near loop): per type the largest vertex weight; the
+        // three largest (ties keep the lower type) if above the threshold, sorted by type.
+        const uint thr = C <= 30.0 ? 32u : 64u;
+        uint m0 = 0, m1 = 0, m2 = 0, k0 = 0, k1 = 0, k2 = 0, last = 0;
+        bool first = true;
+        for (int it = 0; it < 12; ++it) {
+            uint next = 0x100;
+            for (int q = 0; q < 12; ++q) {
+                const uint k = uint(v[q / 4].tw[q % 4] & 0xff);
+                if (k != 0xff && (first || k > last) && k < next) next = k;
+            }
+            if (next == 0x100) break;
+            first = false;
+            last = next;
+            const uint m = max(typeWeight(v[0].tw, next), max(typeWeight(v[1].tw, next), typeWeight(v[2].tw, next)));
+            if (m2 < m) {
+                if (m1 < m) {
+                    m2 = m1, k2 = k1, m1 = m, k1 = next;
+                    if (m0 < m) m1 = m0, k1 = k0, m0 = m, k0 = next;
+                } else {
+                    m2 = m, k2 = next;
+                }
+            }
+        }
+        if (m2 > thr) {
+            if (k1 < k0) { const uint t = k0; k0 = k1; k1 = t; }
+            if (k2 < k1) { const uint t = k1; k1 = k2; k2 = t; }
+            if (k1 < k0) { const uint t = k0; k0 = k1; k1 = t; }
+        } else {
+            k2 = 0xff;
+            if (m1 > thr) {
+                if (k1 < k0) { const uint t = k0; k0 = k1; k1 = t; }
+            } else {
+                k1 = 0xff;
+            }
+        }
+        // Per-vertex lerp weights (0x7f8be0), interpolated like color0.w / color1.w.
+        float3 b1 = 0.0, b2 = 0.0;
+        for (int i = 0; i < 3; ++i) {
+            const float w0 = float(typeWeight(v[i].tw, k0)) / 255.0;
+            const float a = k1 != 0xff ? float(typeWeight(v[i].tw, k1)) / 255.0 : 0.0;
+            const float b = k2 != 0xff ? float(typeWeight(v[i].tw, k2)) / 255.0 : 0.0;
+            const float sum = w0 + a;
+            b1[i] = a > 0.0 ? floor((sum > 0.0 ? a / sum : 0.0) * 255.0) / 255.0 : 0.0;
+            b2[i] = b > 0.0 ? floor(saturate(max(b, 1.0 - sum)) * 255.0) / 255.0 : 0.0;
+        }
+        const float B1 = dot(b1, bary), B2 = dot(b2, bary);
+        const float2 uv = warp * 0.2;  // W+0x4832c = 0.2 repeats per metre
+        float4 t = detail.sample(rep, uv, k0);
+        if (k1 != 0xff) t = mix(t, detail.sample(rep, uv, k1), B1);
+        if (k2 != 0xff) t = mix(t, detail.sample(rep, uv, k2), B2);
+        out.n = t;
+    } else {
+        // Chunks of 96 m and more use fixed sets (0x7f7ea0 / 0x7f8850): steepness w1 and the
+        // sand / snow / cracked share w2. Inferred: the *NL textures (types 17-21).
+        const float scale = C < 383.0 ? 0.015 : 0.0015, extra = C < 383.0 ? 0.75 : 0.0;
+        const float2 uvF = warp * scale;
+        const float4 t0 = detail.sample(rep, uvF, 21), t1 = detail.sample(rep, uvF, 20);
+        const float4 t2 = detail.sample(rep, uvF, extra > 0.0 ? 19 : 18);
+        out.n = mix(mix(t0, t1, steep), t2, saturate(saturate(sandy + extra) - steep));
+    }
+    // Decal (ground.phl !bNoDecal): material of the first vertex that has one; uv and
+    // weight interpolated across the triangle. Chunks up to 192 m carry decals.
+    if (have) {
+        int slot = -1;
+        for (int i = 0; i < 3; ++i)
+            if (slot < 0 && v[i].dc.w >= 0.0) slot = int(v[i].dc.w + 0.5);
+        const float w = dot(float3(v[0].dc.z, v[1].dc.z, v[2].dc.z), bary);
+        if (slot >= 0 && w > 0.0) {
+            const float2 duv = v[0].dc.xy * bary.x + v[1].dc.xy * bary.y + v[2].dc.xy * bary.z;
+            float4 td;
+            switch (slot) {
+                case 0: td = d0.sample(rep, duv); break;
+                case 1: td = d1.sample(rep, duv); break;
+                case 2: td = d2.sample(rep, duv); break;
+                case 3: td = d3.sample(rep, duv); break;
+                case 4: td = d4.sample(rep, duv); break;
+                default: td = d5.sample(rep, duv); break;
+            }
+            out.decal = float4(td.rgb, td.a * w);
+        }
+    }
+    return out;
+}
+
 fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
                           texture2d<float> hm [[texture(0)]], texture2d<float> groundColour [[texture(1)]],
                           texture2d<uint> groundSurface [[texture(2)]], texture2d_array<float> detail [[texture(3)]],
-                          texture2d_array<float> groundFine [[texture(4)]], depth2d<float> shadowMap [[texture(7)]]) {
+                          texture2d_array<float> groundFine [[texture(4)]], texture2d_array<ushort> groundTypes [[texture(5)]],
+                          texture2d_array<float> groundDecal [[texture(6)]], depth2d<float> shadowMap [[texture(7)]],
+                          texture2d<float> decal0 [[texture(8)]], texture2d<float> decal1 [[texture(9)]],
+                          texture2d<float> decal2 [[texture(10)]], texture2d<float> decal3 [[texture(11)]],
+                          texture2d<float> decal4 [[texture(12)]], texture2d<float> decal5 [[texture(13)]]) {
     float e = f.terrain.z;
     float2 xz = in.world.xz;
     float hl = terrainHeight(hm, xz - float2(e, 0), f), hr = terrainHeight(hm, xz + float2(e, 0), f);
@@ -403,69 +549,64 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
     float n = valueNoise(xz * 0.004) * 0.6 + valueNoise(xz * 0.03) * 0.3 + valueNoise(xz * 0.25) * 0.1;
     float3 c;
     if (f.fog.y > 0.0) {
-        // FUEL's ground (ground.phl + the GenWorld patch builder, decoded from FUEL.exe):
-        // albedo = vertex colour x the bump maps' grey detail (B) x 2; the normal is the
-        // lerp of three bump maps lerp(lerp(T0, T1, w1), T2, w2). Which three, and at
-        // what scale, depends on the size C of the terrain chunk under the point
-        // (the decor quadtree, see groundChunk): C <= 48 m the point's surface types
-        // at 0.2 repeats/m, C 96..192 m a fixed set at 0.015/m, C >= 384 m at 0.0015/m.
-        // The bump uv is the world position warped by two sines (FUN_007f9b50).
         constexpr sampler lin(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
         float2 uv = (xz + 70000.0) / 140000.0;
         const float4 gc = groundColourAt(xz, groundColour.sample(lin, uv), groundFine, f);
         // Decoded map (p16): the point colour ctx+0x70 as is; the heuristic map gets the old grade.
         c = f.groundFar.w > 0.0 ? gc.rgb : groundGrade(gc.rgb);
+        // Bump uv: the world position warped by two sines (0x7f9b50).
         const float2 warp = float2(xz.x + 5.0 * sin(0.02 * xz.y) + 2.0 * sin(0.2 * xz.y),
                                    xz.y + 5.0 * sin(0.02 * xz.x) + 2.0 * sin(0.2 * xz.x));
-        // Surface types of the four nearest map samples: the near textures, and the
-        // sand / snow / cracked share that drives the third far layer (FUN_007e4950).
+        // Sand / snow / cracked share of the 60 m surface map (FUN_007e4950 input of the far sets).
         float size = float(groundSurface.get_width());
         float2 t = uv * size - 0.5;
         float2 i0 = floor(t), a = t - i0;
-        // Bands by distance from the camera, blended smoothly. FUEL picks them per terrain chunk
-        // (the decor quadtree, groundChunk): own surface types at 0.2 repeats/m in chunks up to
-        // 48 m (~110-230 m out), fixed sets at 0.015/m in 96-192 m chunks, 0.0015/m beyond. Per
-        // chunk, squares of ground swapped texture as chunks split and merged around the camera,
-        // so the port fades over distance ranges inside those bands instead (port choice).
-        const float dist = length(f.eye.xz - xz);
-        const float wNear = 1.0 - smoothstep(110.0, 150.0, dist), wFar = smoothstep(600.0, 900.0, dist);
-        const float k = valueNoise(xz * 0.03);
-        const float2 uvN = warp * 0.2, gxN = dfdx(uvN), gyN = dfdy(uvN);
-        float4 nearDetail = 0.0;
         float sandy = 0.0;
+        uint nearest = 0;
+        float wbest = -1.0;
         for (int q = 0; q < 4; ++q) {
             uint2 cell = uint2(clamp(i0 + float2(q & 1, q >> 1), 0.0, size - 1.0));
             float w = ((q & 1) ? a.x : 1.0 - a.x) * ((q >> 1) ? a.y : 1.0 - a.y);
             const uint layer = groundSurface.read(cell).r;
-            if (wNear > 0.0 && w > 0.0) nearDetail += w * detailVaried(detail, rep, uvN, layer, k, gxN, gyN);
+            if (w > wbest) wbest = w, nearest = layer;
             sandy += w * float((layer >= 6 && layer <= 9) || layer == 24 || layer >= 36);
         }
-        // Steepness weight of the far sets: a = clamp(2 n.y - 1), s = 2a - 1,
-        // w1 = 1 - ((2 - |s|) s / 2 + 0.5) (FUN_007f7ea0 / FUN_007f8850).
+        // Steepness weight of the far sets: a = clamp(2 n.y - 1), s = 2a - 1, w1 = 1 - S2(s).
         const float sa = 2.0 * saturate(2.0 * N.y - 1.0) - 1.0;
         const float steep = 1.0 - ((2.0 - abs(sa)) * sa * 0.5 + 0.5);
-        // Inferred: the fixed far sets are the large-scale *NL textures (types 17-21).
-        auto farSet = [&](float scale, float extra) {
-            const float2 uvF = warp * scale, gx = dfdx(uvF), gy = dfdy(uvF);
-            float4 t0 = detailVaried(detail, rep, uvF, 21, k, gx, gy), t1 = detailVaried(detail, rep, uvF, 20, k, gx, gy);
-            float4 t2 = detailVaried(detail, rep, uvF, extra > 0.0 ? 19 : 18, k, gx, gy);
-            return mix(mix(t0, t1, steep), t2, saturate(saturate(sandy + extra) - steep));
-        };
-        float4 d = nearDetail;
-        if (wNear < 1.0) {
-            float4 mid = wFar < 1.0 ? farSet(0.015, 0.75) : float4(0.0);
-            if (wFar > 0.0) mid = mix(mid, farSet(0.0015, 0.0), wFar);
-            d = mix(mid, nearDetail, wNear);
+        // The chunk under the point and FUEL's geomorph tween toward its parent chunk
+        // (ground.vhl: (d - 2.375 C) * 2 / C, distance in xz); the port blends the parent's
+        // textures with the same weight (the engine switches them per chunk).
+        const float dist = length(f.eye.xz - xz);
+        const float C = groundChunk(xz, f.eye.xz);
+        const float tw = saturate((dist - 2.375 * C) * 2.0 / C);
+        GroundBand b = groundBand(C, xz, warp, steep, sandy, groundTypes, groundDecal, detail, rep, f, decal0, decal1, decal2, decal3,
+                                  decal4, decal5);
+        if (!b.ok) {  // no tile yet: the 60 m surface map's nearest type
+            b.n = detail.sample(rep, warp * 0.2, nearest);
+            b.ok = true;
         }
-        // Vertex colour by band (FUN_007f9b50): chunks >= 600 m (the 768 m leaves, from about
+        if (tw > 0.0) {
+            GroundBand pb = groundBand(2.0 * C, xz, warp, steep, sandy, groundTypes, groundDecal, detail, rep, f, decal0, decal1, decal2,
+                                       decal3, decal4, decal5);
+            b.n = mix(b.n, pb.n, tw);
+            b.decal = mix(b.decal, pb.decal, tw);
+        }
+        // Vertex colour by band (0x7f9b50): chunks >= 600 m (the 768 m leaves, from about
         // 1.6 km) use ctx+0x90, the colour with the forest floor (palette 57) by weight k (map
-        // alpha); nearer ones ctx+0x70/0x80 (equal on land). Faded by distance like the bands.
+        // alpha); nearer ones ctx+0x70/0x80 (equal on land). Faded by distance.
         if (f.groundFar.w > 0.0) c = mix(c, f.groundFar.rgb, gc.a * smoothstep(1400.0, 1800.0, dist));
-        // ground.phl: colour x detail.B x 2, in gamma space for the decoded map (see vsGrass).
-        if (f.groundFar.w > 0.0) c = pow(pow(c, 1.0 / 2.2) * d.b * 2.0, 2.2);
-        else c *= d.b * 2.0;
-        float3 nt = normalize(float3(d.r, d.g, d.a) * 2.0 - 1.0);
+        // ground.phl: albedo = lerp(vcol * tN.w * 2, tDiffuse.rgb, tDiffuse.a * decal weight), in gamma
+        // space (DX9 without sRGB reads, see vsGrass).
+        if (f.groundFar.w > 0.0) {
+            float3 g = pow(c, 1.0 / 2.2) * b.n.b * 2.0;
+            g = mix(g, pow(b.decal.rgb, 1.0 / 2.2), saturate(b.decal.a));
+            c = pow(g, 2.2);
+        } else {
+            c = mix(c * b.n.b * 2.0, b.decal.rgb, saturate(b.decal.a));
+        }
+        float3 nt = normalize(float3(b.n.r, b.n.g, b.n.a) * 2.0 - 1.0);
         // ground.vhl tangent frame: x = cross(z, N), y = N, z = cross(x, N).
         float3 T = normalize(cross(float3(0, 0, 1), N)), B = normalize(cross(T, N));
         N = normalize(T * nt.x + N * nt.y + B * nt.z);
@@ -504,48 +645,6 @@ fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer
     return float4(c, 1.0);
 }
 
-struct RoadVertex {
-    float4 position;  // w = opacity
-    float4 uv;        // x across (0..1), y along
-};
-
-struct RoadOut {
-    float4 position [[position]];
-    float3 world;
-    float2 uv;
-    float opacity;
-    float4 sunPos;
-};
-
-vertex RoadOut vsRoad(uint vid [[vertex_id]], const device RoadVertex* v [[buffer(0)]], constant FrameUniforms& f [[buffer(1)]]) {
-    RoadOut o;
-    float3 w = v[vid].position.xyz;
-    o.position = f.viewProj * float4(w, 1.0);
-    o.world = w;
-    o.uv = v[vid].uv.xy;
-    o.opacity = v[vid].position.w;
-    o.sunPos = f.sunViewProj * float4(w, 1.0);
-    return o;
-}
-
-fragment float4 fsRoad(RoadOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], texture2d<float> tex [[texture(0)]],
-                       texture2d<float> hm [[texture(4)]], depth2d<float> shadowMap [[texture(7)]],
-                       constant uint& textured [[buffer(2)]], constant float4& tint [[buffer(3)]]) {
-    constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(8));
-    // Dirt road textures are grey detail maps over the dirt colour; tarmac is a colour map (tint 1).
-    float3 albedo = (textured != 0 ? tex.sample(rep, float2(in.uv.x, in.uv.y)).rgb : float3(0.5)) * tint.rgb;
-    // Soft edges so the ribbon melts into the ground.
-    float edge = smoothstep(0.0, 0.18, in.uv.x) * smoothstep(1.0, 0.82, in.uv.x);
-    float shadow = shadowFactor(shadowMap, in.sunPos);
-    float3 V = normalize(f.eye.xyz - in.world);
-    // The ground's normal, so a road on a slope away from the low sun is as dark as the slope.
-    float e = f.terrain.z;
-    float2 xz = in.world.xz;
-    float3 N = normalize(float3(terrainHeight(hm, xz - float2(e, 0), f) - terrainHeight(hm, xz + float2(e, 0), f), 2.0 * e,
-                                terrainHeight(hm, xz - float2(0, e), f) - terrainHeight(hm, xz + float2(0, e), f)));
-    float3 rgb = lighting(albedo, N, V, 1.0, shadow, 0.1, 0.8, float2(0), false, f);
-    return float4(haze(rgb, in.world, f), in.opacity * edge);
-}
 
 struct MarkerOut {
     float4 position [[position]];
@@ -862,7 +961,7 @@ struct FrameUniforms {
     simd_float4 camRight;
     simd_float4 camUp;
     simd_float4 groundFar;
-    simd_float4 groundFine[2];
+    simd_float4 groundFine[3];
 };
 
 namespace {
@@ -1040,20 +1139,6 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     terrainPipeline_ = makeSimple(@"vsTerrain", @"fsTerrain");
     {
         MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-        d.vertexFunction = [shaders_ newFunctionWithName:@"vsRoad"];
-        d.fragmentFunction = [shaders_ newFunctionWithName:@"fsRoad"];
-        d.rasterSampleCount = sampleCount_;
-        d.colorAttachments[0].pixelFormat = kRenderColorFormat;
-        d.colorAttachments[0].blendingEnabled = YES;
-        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        d.depthAttachmentPixelFormat = kRenderDepthFormat;
-        NSError* e = nil;
-        roadPipeline_ = [device newRenderPipelineStateWithDescriptor:d error:&e];
-        if (roadPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
-    }
-    {
-        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
         d.vertexFunction = [shaders_ newFunctionWithName:@"vsMarker"];
         d.fragmentFunction = [shaders_ newFunctionWithName:@"fsMarker"];
         d.rasterSampleCount = sampleCount_;
@@ -1122,9 +1207,26 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
                                                                                      height:kGroundTile
                                                                                   mipmapped:YES];
         fd.textureType = MTLTextureType2DArray;
-        fd.arrayLength = 2;
+        fd.arrayLength = kGroundTileLevels;
         groundFine_ = [device_ newTextureWithDescriptor:fd];
-        groundFineRect_[0] = groundFineRect_[1] = simd_make_float4(0, 0, 1, 0);
+        for (auto& r : groundFineRect_) r = simd_make_float4(0, 0, 1, 0);
+        MTLTextureDescriptor* ud = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Uint
+                                                                                      width:kGroundTile
+                                                                                     height:kGroundTile
+                                                                                  mipmapped:NO];
+        ud.textureType = MTLTextureType2DArray;
+        ud.arrayLength = kGroundTileLevels;
+        groundTypes_ = [device_ newTextureWithDescriptor:ud];
+        ud.pixelFormat = MTLPixelFormatRGBA32Float;
+        groundDecal_ = [device_ newTextureWithDescriptor:ud];
+        // Road decal textures (sDiffuse of ground.phl's decal path), by slot.
+        const uint16_t enums[kDecalSlots] = {0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x34};
+        for (int k = 0; k < kDecalSlots; ++k) {
+            const uint32_t bm = genWorldEnumTexture(world, enums[k]);
+            const DpcFile::Entry* e = bm != 0 ? world.find(bm) : nullptr;
+            uint8_t alpha = 0;
+            decalTex_[k] = e != nullptr ? uploadBitmap(world, *e, true, &alpha) : nil;
+        }
     }
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:maps.size height:maps.size mipmapped:NO];
     groundSurface_ = [device_ newTextureWithDescriptor:td];
@@ -1187,18 +1289,6 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
     [cb waitUntilCompleted];
 }
 
-void MeshRenderer::setRoads(const std::vector<RoadVertex>& vertices, const std::vector<uint32_t>& indices,
-                            const std::vector<RoadBatch>& batches) {
-    roadBatches_.clear();
-    roadVertices_ = vertices.empty() ? nil : [device_ newBufferWithBytes:vertices.data() length:vertices.size() * sizeof(RoadVertex)
-                                                                 options:MTLResourceStorageModeShared];
-    roadIndices_ = indices.empty() ? nil : [device_ newBufferWithBytes:indices.data() length:indices.size() * 4
-                                                               options:MTLResourceStorageModeShared];
-    for (const RoadBatch& b : batches) {
-        uint8_t alphaKind = 0;
-        roadBatches_.push_back({texture(b.texture, true, &alphaKind), b});
-    }
-}
 
 void MeshRenderer::setTerrain(const Heightfield& hf) {
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Unorm
@@ -1296,20 +1386,12 @@ const MeshRenderer::TextureStats& MeshRenderer::textureStats(uint32_t bitmapId) 
     return textureStats_[bitmapId] = st;
 }
 
-id<MTLTexture> MeshRenderer::texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind) {
-    *alphaKind = 0;
-    if (bitmapId == 0) return nil;
-    const uint64_t key = (uint64_t(bitmapId) << 1) | (srgb ? 1u : 0u);
-    if (auto it = textures_.find(key); it != textures_.end()) {
-        *alphaKind = textureAlpha_[bitmapId];
-        return it->second;
-    }
+id<MTLTexture> MeshRenderer::uploadBitmap(const DpcFile& file, const DpcFile::Entry& entry, bool srgb, uint8_t* alphaKind) {
     id<MTLTexture> result = nil;
     uint8_t alpha = 0;
-    if (auto hit = library_.find(bitmapId, cls::Bitmap)) {
         try {
-            const BitmapInfo bm = parseBitmapLink(hit.file->link(*hit.entry));
-            const auto body = hit.file->body(*hit.entry);
+            const BitmapInfo bm = parseBitmapLink(file.link(entry));
+            const auto body = file.body(entry);
             if (body && checkBitmap(bm, uint32_t(body->size())).empty() && bm.type == BitmapInfo::Tex2D) {
                 MTLPixelFormat pf = srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
                 if (bm.format == PixelFormat::DXT1) pf = srgb ? MTLPixelFormatBC1_RGBA_sRGB : MTLPixelFormatBC1_RGBA;
@@ -1349,7 +1431,21 @@ id<MTLTexture> MeshRenderer::texture(uint32_t bitmapId, bool srgb, uint8_t* alph
         } catch (const std::exception&) {
             // Textures that do not decode are treated as missing.
         }
+        *alphaKind = alpha;
+    return result;
+}
+
+id<MTLTexture> MeshRenderer::texture(uint32_t bitmapId, bool srgb, uint8_t* alphaKind) {
+    *alphaKind = 0;
+    if (bitmapId == 0) return nil;
+    const uint64_t key = (uint64_t(bitmapId) << 1) | (srgb ? 1u : 0u);
+    if (auto it = textures_.find(key); it != textures_.end()) {
+        *alphaKind = textureAlpha_[bitmapId];
+        return it->second;
     }
+    id<MTLTexture> result = nil;
+    uint8_t alpha = 0;
+    if (auto hit = library_.find(bitmapId, cls::Bitmap)) result = uploadBitmap(*hit.file, *hit.entry, srgb, &alpha);
     textures_[key] = result;
     textureAlpha_[bitmapId] = alpha;
     *alphaKind = alpha;
@@ -1761,8 +1857,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     fu.terrain = terrainInfo_;
     fu.terrainGrid = simd_make_float4(center_.x, center_.z, std::max(70000.0f, dist * 6.0f), float(kTerrainGridSize));
     fu.fog = simd_make_float4(terrain ? 1.0f / 3600.0f : 0.0f, groundColour_ != nil ? 1.0f : 0.0f, zn, zf / (zn - zf));
-    fu.groundFine[0] = groundFineRect_[0];
-    fu.groundFine[1] = groundFineRect_[1];
+    for (int l = 0; l < kGroundTileLevels; ++l) fu.groundFine[l] = groundFineRect_[l];
     fu.groundFar = groundFar_;
     fu.sunDir = simd_make_float4(sunDir_, 4.2f);
     fu.paint = simd_make_float4(srgbToLinear(paint_.color.x), srgbToLinear(paint_.color.y), srgbToLinear(paint_.color.z), 1);
@@ -1852,35 +1947,17 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             [enc setFragmentTexture:groundSurface_ atIndex:2];
             [enc setFragmentTexture:groundDetail_ atIndex:3];
             [enc setFragmentTexture:groundFine_ atIndex:4];
+            [enc setFragmentTexture:groundTypes_ atIndex:5];
+            [enc setFragmentTexture:groundDecal_ atIndex:6];
+            for (int k = 0; k < kDecalSlots; ++k) [enc setFragmentTexture:decalTex_[k] != nil ? decalTex_[k] : white_ atIndex:NSUInteger(8 + k)];
         }
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:terrainIndexCount_
                          indexType:MTLIndexTypeUInt32
                        indexBuffer:terrainIndices_
                  indexBufferOffset:0];
-        if (roadVertices_ != nil && roadIndices_ != nil && !std::getenv("FUEL_NO_ROADS")) {  // FUEL_NO_ROADS=1: hide the road ribbons (diagnostics)
-            [enc setRenderPipelineState:roadPipeline_];
-            [enc setDepthStencilState:depthNoWrite_];
-            [enc setDepthBias:-8.0f slopeScale:-24.0f clamp:0.0f];
-            [enc setVertexBuffer:roadVertices_ offset:0 atIndex:0];
-            [enc setFragmentTexture:shadowMap_ atIndex:7];
-            [enc setFragmentTexture:heightTex_ atIndex:4];
-            for (const auto& [tex, b] : roadBatches_) {
-                const uint32_t textured = tex != nil ? 1u : 0u;
-                [enc setFragmentBytes:&textured length:sizeof textured atIndex:2];
-                const simd_float4 tint = b.dirt ? simd_make_float4(0.33f, 0.24f, 0.16f, 1) : simd_make_float4(1, 1, 1, 1);
-                [enc setFragmentBytes:&tint length:sizeof tint atIndex:3];
-                [enc setFragmentTexture:tex != nil ? tex : white_ atIndex:0];
-                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                indexCount:b.indexCount
-                                 indexType:MTLIndexTypeUInt32
-                               indexBuffer:roadIndices_
-                         indexBufferOffset:size_t(b.firstIndex) * 4];
-            }
-            [enc setDepthBias:0 slopeScale:0 clamp:0];
-        }
     }
-    // Terrain and roads first, so vehicles and objects cover the road ribbons.
+    // Terrain first (roads are painted into it, ground.phl decal path).
     drawPass(0);
     drawPass(1);
     if (terrain) encodeGrass(enc);
@@ -2045,8 +2122,24 @@ void MeshRenderer::createGrassPipeline() {
 }
 
 
-void MeshRenderer::setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba) {
-    if (groundFine_ == nil || level < 0 || level > 1 || rgba.size() != size_t(kGroundTile) * kGroundTile * 4) return;
+void MeshRenderer::setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba,
+                                 const std::vector<uint16_t>& types, const std::vector<float>& decal) {
+    const size_t texels = size_t(kGroundTile) * kGroundTile;
+    if (groundFine_ == nil || level < 0 || level >= kGroundTileLevels || rgba.size() != texels * 4 || types.size() != texels * 4 ||
+        decal.size() != texels * 4)
+        return;
+    [groundTypes_ replaceRegion:MTLRegionMake2D(0, 0, kGroundTile, kGroundTile)
+                    mipmapLevel:0
+                          slice:NSUInteger(level)
+                      withBytes:types.data()
+                    bytesPerRow:kGroundTile * 8
+                  bytesPerImage:0];
+    [groundDecal_ replaceRegion:MTLRegionMake2D(0, 0, kGroundTile, kGroundTile)
+                    mipmapLevel:0
+                          slice:NSUInteger(level)
+                      withBytes:decal.data()
+                    bytesPerRow:kGroundTile * 16
+                  bytesPerImage:0];
     [groundFine_ replaceRegion:MTLRegionMake2D(0, 0, kGroundTile, kGroundTile)
                    mipmapLevel:0
                          slice:NSUInteger(level)

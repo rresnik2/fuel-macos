@@ -137,7 +137,7 @@ public:
     void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain);
     // Surface types for ground clutter (grass tufts, stones); must be thread-safe.
     void setSurfaces(fuel::SurfaceQuery q) { surfaces_ = std::move(q); }
-    // Road ribbons within kRoadRadius (needs the terrain from setVegetation).
+    // The road network (plant filters near roads). Roads are drawn by the terrain (decals).
     void setRoads(const fuel::RoadNetwork* roads) { roads_ = roads; }
     // Call every frame; refreshes after the player has moved a little.
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
@@ -182,20 +182,11 @@ private:
     fuel::SurfaceQuery surfaces_;
     static constexpr float kClutterRadius = 150.0f;
     const fuel::RoadNetwork* roads_ = nullptr;
-    static constexpr float kRoadRadius = 1200.0f;
-    struct RoadMesh {
-        std::vector<fuel::MeshRenderer::RoadVertex> vertices;
-        std::vector<uint32_t> indices;
-        std::vector<fuel::MeshRenderer::RoadBatch> batches;
-    };
-    RoadMesh buildRoads(simd_float3 player) const;  // thread-safe
-    // Plants and road ribbons are rebuilt on a worker thread (they took ~6 ms
+    // Plants are rebuilt on a worker thread (they took ~6 ms
     // per update on the main thread); the renderer gets them when ready.
     struct Background {
         std::vector<fuel::MeshInstance> plants;
         std::vector<std::array<double, 16>> trunks;  // solid cylinders for nearby trees (row-vector matrices)
-        RoadMesh roads;
-        bool haveRoads = false;
     };
     Background buildBackground(simd_float3 player) const;
     void applyBackground(Background&& bg, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
@@ -250,12 +241,16 @@ private:
         double originX = 0, originZ = 0;
         float extent = 0;
         std::vector<uint8_t> rgba;
+        std::vector<uint16_t> types;  // 4 per texel: surface type | weight byte << 8 (bit 21, 0xff = none)
+        std::vector<float> decal;     // 4 per texel: road decal u (across), v (along), weight, slot (-1 none)
     };
-    static constexpr float kTileSpacing[2] = {1.0f, 4.0f}, kTileStep[2] = {48.0f, 192.0f};  // rebuilt after this much travel
+    // Texels sit on FUEL's vertex lattice of the 24, 48 and 96 m chunks (1, 2 and 4 m).
+    static constexpr int kTileLevels = 3;
+    static constexpr float kTileSpacing[kTileLevels] = {1.0f, 2.0f, 4.0f}, kTileStep[kTileLevels] = {48.0f, 96.0f, 192.0f};  // rebuilt after this much travel
     GroundTile buildGroundTile(int level, simd_float3 player) const;
     void updateGroundTiles(simd_float3 player, fuel::MeshRenderer& renderer, bool force);
     std::future<GroundTile> tileJob_;
-    simd_float2 tileAt_[2] = {{1e30f, 1e30f}, {1e30f, 1e30f}};
+    simd_float2 tileAt_[kTileLevels] = {{1e30f, 1e30f}, {1e30f, 1e30f}, {1e30f, 1e30f}};
     GrassCache grassCache_;  // handed to the worker and back, never shared
     std::future<GrassJob> grassJob_;
     simd_float3 grassAt_ = {1e30f, 0, 1e30f};
