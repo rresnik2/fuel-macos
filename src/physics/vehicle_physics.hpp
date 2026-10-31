@@ -140,6 +140,14 @@ public:
     // > 0 a sphere of that radius is swept instead of a ray (objects the sphere already
     // touches at `from` are ignored).
     float rayFraction(const std::array<double, 3>& from, const std::array<double, 3>& to, float radius = 0) const;
+    // Static objects overlapping a sphere (the camera's push-out query 0x63a0b0): contact point on the object
+    // (world), unit normal out of the object, and the object's size (world bounding-box volume, m^3).
+    struct SphereContact {
+        std::array<double, 3> p{};
+        std::array<float, 3> n{};
+        float volume = 0;
+    };
+    void overlapStatics(const std::array<double, 3>& centre, float radius, std::vector<SphereContact>& out) const;
 
     // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
     // surface counts as dirt. The default applies to worlds created afterwards.

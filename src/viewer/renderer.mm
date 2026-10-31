@@ -1755,6 +1755,23 @@ bool MeshRenderer::addBakedMesh(uint32_t key, const BakedMesh& mesh, std::string
     return true;
 }
 
+void MeshRenderer::updateBakedVertices(uint32_t key, const std::vector<uint8_t>& vertices) {
+    auto it = bakedMeshes_.find(key);
+    if (it == bakedMeshes_.end() || vertices.empty() || it->second->vbs.empty()) return;
+    GpuMesh& gm = *it->second;
+    if (gm.vbs[0].length != vertices.size()) return;
+    // A fresh buffer each frame: the command buffers still in flight keep the previous one alive.
+    gm.vbs[0] = [device_ newBufferWithBytes:vertices.data() length:vertices.size() options:MTLResourceStorageModeShared];
+    simd_float3 lo = simd_make_float3(1e30f, 1e30f, 1e30f), hi = -lo;
+    for (size_t o = 0; o + BakedMesh::kStride <= vertices.size(); o += BakedMesh::kStride) {
+        float p[3];
+        std::memcpy(p, &vertices[o], 12);
+        const simd_float3 v = simd_make_float3(p[0], p[1], p[2]);
+        lo = simd_min(lo, v), hi = simd_max(hi, v);
+    }
+    gm.boundsMin = lo, gm.boundsMax = hi;
+}
+
 bool MeshRenderer::setMesh(uint32_t meshId, std::string* error) {
     return setScene({MeshInstance{meshId, matrix_identity_float4x4}}, error);
 }
@@ -1915,10 +1932,11 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb) {
 
 void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam) {
     if (instances_.empty()) return;
-    const float dist = cam.distance * radius_;
+    float dist = cam.distance * radius_;
     simd_float3 eye = center_ + dist * simd_make_float3(std::cos(cam.pitch) * std::sin(cam.yaw), std::sin(cam.pitch),
                                                         std::cos(cam.pitch) * std::cos(cam.yaw));
-    if (showTerrain && !terrainData_.raw.empty()) {
+    if (cam.explicitPose) eye = cam.eye, dist = simd_distance(eye, center_);
+    if (showTerrain && !terrainData_.raw.empty() && !cam.explicitPose) {
         // Keep the camera above the (smoothed, as drawn) ground, and lift it until
         // no hill between it and the target hides the target.
         const float clear = std::max(1.5f, radius_ * 0.3f);
@@ -1930,20 +1948,33 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             if (need > 0) eye.y += need / (1.0f - t);  // raise the eye so the line clears this point
         }
     }
-    if (cameraClearance) {
+    if (cameraClearance && !cam.explicitPose) {
         const float t = cameraClearance(center_, eye);
         if (t < 1.0f) eye = center_ + (eye - center_) * std::max(0.15f, t - 0.4f / std::max(dist, 0.5f));
     }
     FrameUniforms fu;
     const bool terrain = showTerrain && heightTex_ != nil;
-    const float zn = terrain ? std::max(0.05f, dist * 0.02f) : radius_ * 0.02f;
+    float zn = terrain ? std::max(0.05f, dist * 0.02f) : radius_ * 0.02f;
     const float zf = terrain ? std::max(120000.0f, dist * 4.0f) : radius_ * 40.0f;
-    const simd_float3 target = center_ + simd_make_float3(0, cam.aim, 0);
-    fu.viewProj = simd_mul(perspectiveRH(cam.fovY, aspect, zn, zf), lookAtRH(eye, target, simd_make_float3(0, 1, 0)));
+    simd_float3 target = center_ + simd_make_float3(0, cam.aim, 0);
+    simd_float3 upVec = simd_make_float3(0, 1, 0);
+    float fovY = cam.fovY;
+    if (cam.explicitPose) {
+        target = cam.target;
+        zn = std::max(cam.zNear, 0.06f);  // Camera_Z near >= 0.06 (0x4156e0)
+        // FUEL's camera up follows its roll about the view axis (ctx+0x8c, Camera_Z +0x81c): the camera banks with
+        // the vehicle when roll = -(vehicle bank).
+        const simd_float3 f = simd_normalize(target - eye);
+        const simd_float3 r0 = simd_normalize(simd_cross(f, upVec));
+        const simd_float3 u0 = simd_cross(r0, f);
+        upVec = u0 * std::cos(cam.roll) + r0 * std::sin(-cam.roll);
+    }
+    if (cam.fovH43 > 0) fovY = 2.0f * std::atan(std::tan(cam.fovH43 * 0.5f) * 0.75f);  // horizontal FOV of a 4:3 frame
+    fu.viewProj = simd_mul(perspectiveRH(fovY, aspect, zn, zf), lookAtRH(eye, target, upVec));
     fu.invViewProj = simd_inverse(fu.viewProj);
     {
         const simd_float3 fwd = simd_normalize(target - eye);
-        const simd_float3 right = simd_normalize(simd_cross(fwd, simd_make_float3(0, 1, 0)));
+        const simd_float3 right = simd_normalize(simd_cross(fwd, upVec));
         fu.camRight = simd_make_float4(right, 0);
         fu.camUp = simd_make_float4(simd_cross(right, fwd), 0);
     }

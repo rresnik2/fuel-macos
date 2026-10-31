@@ -808,6 +808,37 @@ float DriveWorld::rayFraction(const std::array<double, 3>& from, const std::arra
     return blocked ? hit.mFraction : 1.0f;
 }
 
+void DriveWorld::overlapStatics(const std::array<double, 3>& centre, float radius, std::vector<SphereContact>& out) const {
+    RefConst<Shape> shape = new SphereShape(radius);
+    CollideShapeSettings settings;
+    settings.mActiveEdgeMode = EActiveEdgeMode::CollideOnlyWithActive;
+    class Limited : public CollideShapeCollector {
+    public:
+        std::vector<CollideShapeResult> hits;
+        void AddHit(const CollideShapeResult& r) override {
+            hits.push_back(r);
+            if (hits.size() >= 16) ForceEarlyOut();
+        }
+    } hits;
+    impl_->physics.GetNarrowPhaseQuery().CollideShape(shape, Vec3::sReplicate(1.0f), RMat44::sTranslation(RVec3(centre[0], centre[1], centre[2])),
+                                                      settings, RVec3::sZero(), hits, SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)),
+                                                      SpecifiedObjectLayerFilter(kStatic), NotTerrain());
+    const BodyLockInterfaceLocking& locks = impl_->physics.GetBodyLockInterface();
+    for (const CollideShapeResult& h : hits.hits) {
+        SphereContact c;
+        const Vec3 axis = h.mPenetrationAxis.NormalizedOr(Vec3::sAxisY());
+        c.n = {-axis.GetX(), -axis.GetY(), -axis.GetZ()};
+        c.p = {double(h.mContactPointOn2.GetX()), double(h.mContactPointOn2.GetY()), double(h.mContactPointOn2.GetZ())};
+        BodyLockRead lock(locks, h.mBodyID2);
+        if (lock.Succeeded()) {
+            const AABox b = lock.GetBody().GetWorldSpaceBounds();
+            const Vec3 e = b.GetExtent() * 2.0f;
+            c.volume = e.GetX() * e.GetY() * e.GetZ();
+        }
+        out.push_back(c);
+    }
+}
+
 void DriveWorld::setSurfaceQuery(SurfaceQuery query) { impl_->surfaceQuery = std::move(query); }
 void DriveWorld::setDefaultSurfaceQuery(SurfaceQuery query) { defaultSurfaceQuery() = std::move(query); }
 
