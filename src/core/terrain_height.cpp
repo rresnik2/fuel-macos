@@ -668,7 +668,8 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
             at(2.0 * (double(k) - 2 * K), px, pz);
             raw[k] = detailOnly(px, pz, nullptr);
         }
-        // Ends blend to the ground at the node (0x6f81f0 with junction heights = the node's ground).
+        // Ends blend to the ground at the node (0x6f81f0 with junction heights = the node's
+        // ground), applied to the raw samples before the smoothing, as the engine does.
         double ex, ez;
         at(0, ex, ez);
         const double hs = detailOnly(ex, ez, nullptr);
@@ -676,6 +677,12 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
         const double he = detailOnly(ex, ez, nullptr);
         const double ls = std::min(double(T.flat) + std::min(double(T.flat), 1.0) * M, 0.33 * L);
         const double Rl = std::max(std::min(std::max(M, 50.0), L - 2 * ls), 0.001);
+        for (size_t k = 0; k < raw.size(); ++k) {
+            const double sk = 2.0 * (double(k) - 2 * K);
+            const double r1 = S2(2 * clamp01(1 - (sk - ls) / Rl) - 1), r2 = S2(2 * clamp01(1 - ((L - sk) - ls) / Rl) - 1);
+            double h = r1 * hs + (1 - r1) * raw[k];
+            raw[k] = (1 - r2) * h + r2 * he;
+        }
         // Smoothing kernel (2 - u) u, u = (K + 1 - |K - j|)/(K + 1) (0x6f85c0).
         std::vector<double> wk(size_t(2 * K + 1));
         double wsum = 0;
@@ -693,9 +700,6 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
                 h += wk[size_t(j)] * raw[size_t(std::clamp(src + K, 0, int(raw.size()) - 1))];
             }
             h /= wsum;
-            const double r1 = S2(2 * clamp01(1 - (sk - ls) / Rl) - 1), r2 = S2(2 * clamp01(1 - ((L - sk) - ls) / Rl) - 1);
-            h = r1 * hs + (1 - r1) * h;
-            h = (1 - r2) * h + r2 * he;
             if (T.waveAmp != 0 && T.waveLen != 0) {
                 const double a = 6.28 * sk / double(T.waveLen);
                 h += 0.33 * 0.5 * double(T.waveAmp) * (std::sin(a) + std::sin(0.390933 * a) + std::sin(1.839735 * a));
