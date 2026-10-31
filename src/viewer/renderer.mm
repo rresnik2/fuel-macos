@@ -1905,12 +1905,8 @@ MeshRenderer::GpuMaterial MeshRenderer::makeMaterial(uint32_t materialId, uint32
             gm.alpha = AlphaMode::Blend;
         else if (alphaKind == 1 || (m.flags & 0x180000))
             gm.alpha = AlphaMode::Test;
-        // Some leaf textures are very dark and go black once tinted by the
-        // ground colour; lift dark green cut-outs to a common brightness.
-        if (gm.alpha != AlphaMode::Opaque && ts.mean.y > ts.mean.x && ts.mean.y > ts.mean.z && ts.mean.y < 0.22f) {
-            const float gain = std::min(2.5f, 0.24f / std::max(ts.mean.y, 0.02f));
-            gm.diffuse = simd_make_float4(gm.diffuse.xyz * gain, gm.diffuse.w);
-        }
+        // (P28: the port's old lift of dark green cut-outs is gone: in FUEL's gamma-space lighting the leaf
+        // textures are read as stored and lit by the strong sky light, as in the game.)
         gm.lit = (m.flags & 0x3000) == 0;
         gm.skip = m.skipDraw();
         gm.samplerIndex = (m.clampU() ? 1u : 0u) | (m.clampV() ? 2u : 0u);
