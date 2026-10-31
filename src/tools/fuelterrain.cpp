@@ -153,9 +153,9 @@ int main(int argc, char** argv) {
                 }
                 for (size_t k = 0; k < t->size(); ++k) {
                     const fuel::RoadTypeParams& q = (*t)[k];
-                    std::printf("type %2zu: T0 %g T24 %g T28 %g T34 %g T4c %g T50 %g T54 %g T5c %g T74 %g T78 %g T7c %g T80 %g Tbc %g Tc4 %g Tcc %g M %g Mmin %g\n", k,
+                    std::printf("type %2zu: T0 %g T24 %g T28 %g T34 %g T4c %g T50 %g T54 %g T5c %g T74 %g T78 %g T7c %g T80 %g Tbc %g Tc4 %g Tcc %g M %g Mmin %g Tb4 %g\n", k,
                                 q.reach, q.crown, q.verge, q.noise, q.fade, q.ditch, q.ditchDepth, q.stretch, q.bumpAmp, q.bumpLen, q.waveAmp,
-                                q.waveLen, q.band, q.core, q.flat, q.smooth, q.smoothMin);
+                                q.waveLen, q.band, q.core, q.flat, q.smooth, q.smoothMin, q.aiSpeedBlend);
                 }
             } else if (a == "--events") {
                 // Race starts and checkpoints (authored on FUEL's ground) against the ground.

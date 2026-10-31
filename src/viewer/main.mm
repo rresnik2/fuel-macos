@@ -47,6 +47,8 @@
 #include "core/race_rules.hpp"
 #include "core/races.hpp"
 #include "physics/race_ai.hpp"
+#include "core/road_types.hpp"
+#include "core/roads.hpp"
 #include "physics/camcheck.hpp"
 #include "core/rider_anim.hpp"
 #include "core/vehicle_params.hpp"
@@ -136,6 +138,7 @@ struct Options {
     std::string menuShot, menuShotOut, menuPage;  // --menu-shot PAGE OUT.png, --menu-page PAGE
     bool menuCheck = false; // --menu-check
     bool camCheck = false;  // --camcheck: FUEL's camera and rider functions against emulated test vectors
+    bool aiVectors = false;  // --aicheck-vectors: the AI functions against emulated FUEL.exe vectors (P29)
     int camView = 0;        // --cam-view N: the player's camera view for --film (5 near chase, 1 first person, 4 far chase)
     float dropAt = -1, dropHeight = 0;  // --drop T,H: lift the player H metres at T seconds (a jump landing for --film)
     bool settings = false;  // --settings: size, fullscreen, post effects, grass, volume (and data) from the settings file; --game implies it
@@ -256,6 +259,7 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--menu-page") o.menuPage = next();
         else if (a == "--menu-check") o.menuCheck = true;
         else if (a == "--camcheck") o.camCheck = true;
+        else if (a == "--aicheck-vectors") o.aiVectors = true;
         else if (a == "--cam-view") o.camView = std::stoi(next());
         else if (a == "--drop") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.dropAt, &o.dropHeight) != 2) die("bad --drop (use T,H)"); }
         else if (a == "--film") o.film = std::stof(next());
@@ -569,6 +573,9 @@ struct RaceSession {
     fuel::RaceLine line;                      // start, then the route (what the AI follows)
     fuel::RaceLine aiLine;                    // hunted racers: their grid, then the event's path
     const fuel::Heightfield* terrain = nullptr;  // puts gates far off the ground onto it
+    const fuel::RoadNetwork* roads = nullptr;      // the AI's road / off-road speed blend
+    std::optional<std::array<fuel::RoadTypeParams, 21>> roadTypes;
+    std::optional<fuel::AiTables> aiTables;        // from the player's FUEL.exe
     double clock = 0;  // seconds since the start (negative during the countdown)
 
     // Everyone in the race: [0] is the player, the others match the session's vehicles 1...
@@ -576,7 +583,7 @@ struct RaceSession {
     struct Racer {
         std::string name;        // variant label
         size_t entry = 0;        // in the garage
-        fuel::RaceDriver ai;     // opponents (and the player's autopilot)
+        fuel::RaceDriver ai;     // opponents (and the player's autopilot): FUEL's ghost racer
     };
     std::vector<Racer> racers = std::vector<Racer>(1);
     bool reported = false;          // finishing order printed
@@ -602,10 +609,27 @@ struct RaceSession {
         route = rules.route;
         line.build(r.start, route);
         aiLine.build(rules.aiPath.empty() ? r.start : rules.aiPath[0], rules.aiTargets);
+        if (roads && roadTypes) {
+            // FUEL's road blocks (0x627590): the AI follows the roads where a stretch's ends lie near them.
+            const auto flat = [&types = *roadTypes](int t) { return t == 14 || t < 0 || t >= 21 ? -1.0f : types[size_t(t)].flat; };
+            line.routeOnRoads(*roads, flat);
+            aiLine.routeOnRoads(*roads, flat);
+            int onRoad = 0;
+            for (size_t k = 0; k + 1 < line.path.size(); ++k) onRoad += line.pathHalf[k] < 30.0f;
+            std::printf("AI path: %zu points, %.0f m (gates %.0f m), %d road segments\n", line.path.size(), line.pathLength(), line.length(), onRoad);
+        }
+        playerS = 0;
         clock = rules.clock;
         state = rules.state;
         reported = false;
-        for (Racer& racer : racers) racer.ai.restart();
+        // FUEL's AI races against the event's target time for the level (race manager +0x3e8, set by the
+        // race start 0x62e7a1; the port does not know the player's level: FUEL_AI_LEVEL, default 1).
+        const char* lv = std::getenv("FUEL_AI_LEVEL");
+        const int level = std::clamp(lv ? std::atoi(lv) : 1, 0, 2);
+        for (Racer& racer : racers) {
+            racer.ai.setTarget(event().times[size_t(level)], level);
+            racer.ai.restart();
+        }
         // Face the first target: the scripts' start rotation is only roughly a heading.
         float yaw = r.startYaw;
         const std::vector<std::array<float, 3>>& first = route.empty() ? rules.aiTargets : route;
@@ -648,61 +672,117 @@ struct RaceSession {
             for (int i = 1; i < d.vehicleCount(); ++i) d.setInput(i, {0, 0, 0, true});
             return;
         }
-        // Opponents: the AI driver, rubber-banded on the player (up to 12% slower when far
-        // ahead, 8% faster when far behind; FUEL's EMD_SetAIElasticParam gives 200 m).
-        const float player = line.progress(std::min(rules.racers[0].next, route.size()), d.position(0).x, d.position(0).z);
+        // Opponents: FUEL's ghost racers (race_ai, P29). The ranks of 0x5cb6f0: nearness to the player.
+        const simd_float3 p0 = d.position(0);
+        std::vector<std::pair<float, int>> near;
         for (int i = 1; i < d.vehicleCount() && size_t(i) < racers.size(); ++i) {
+            const simd_float3 p = d.position(i);
+            near.push_back({std::hypot(p.x - p0.x, p.z - p0.z), i});
+        }
+        std::sort(near.begin(), near.end());
+        for (size_t r = 0; r < near.size(); ++r) {
+            const int i = near[r].second;
             Racer& racer = racers[size_t(i)];
             const fuel::RaceRules::Racer& rr = rules.racers[size_t(i)];
             if (rr.finished >= 0 || rr.out || rr.next >= rules.lineFor(size_t(i)).size()) {
+                d.physics().setGuide(i, false);
                 d.setInput(i, {0, 0, 0, true});
                 continue;
             }
-            const simd_float3 at = d.position(i);
-            const float ahead = rules.usesRoute(size_t(i)) ? line.progress(rr.next, at.x, at.z) - player : 0.0f;
-            const float rubber = ahead > 200 ? 1.0f - 0.12f * std::min(1.0f, (ahead - 200) / 400) :
-                                 ahead < -200 ? 1.0f + 0.08f * std::min(1.0f, (-ahead - 200) / 400) : 1.0f;
-            d.setInput(i, drive(racer, d, i, dt, rubber));
+            drive(racer, d, i, dt, int(r));
             // FUEL_AI_TRACE=N: follow opponent N twice a second (and print every reset).
             static const char* trace = std::getenv("FUEL_AI_TRACE");
             if (trace && std::atoi(trace) == i && int(clock * 60) % 30 == 0) {
                 const fuel::VehicleState st = d.state(i);
+                const simd_float3 at = d.position(i);
                 const auto& t = rules.lineFor(size_t(i))[rr.next];
-                std::printf("    t=%5.1f #%d (%.0f, %.0f, %.0f) next %zu dist %.0f  %5.1f km/h hdg %4.0f  up %.2f wheels %d resets %d\n", clock, i, at.x, at.y, at.z, rr.next,
-                            std::hypot(at.x - t[0], at.z - t[2]), st.speedKmh, d.heading(i) * 57.3, 1 - 2 * (st.chassis.rotation[0] * st.chassis.rotation[0] + st.chassis.rotation[2] * st.chassis.rotation[2]), st.wheelsOnGround, racer.ai.resets());
+                std::printf("    t=%5.1f #%d (%.0f, %.0f, %.0f) next %zu dist %.0f  %5.1f km/h ghost %5.1f km/h s %.0f %s  resets %d/%d\n", clock, i, at.x, at.y, at.z, rr.next,
+                            std::hypot(at.x - t[0], at.z - t[2]), st.speedKmh, racer.ai.ghostSpeed() * 3.6f, racer.ai.progress(),
+                            racer.ai.physical() ? "sim" : "kin", racer.ai.resets(), d.physics().respawns(i));
             }
         }
     }
-    // Test driver for the player: the opponents' AI at full skill, no rubber-banding.
+    // Test driver for the player: the opponents' AI (always simulated), no rubber band.
     fuel::DriveInput autopilot(DriveSession& d) {
-        if (state != Running || rules.racers[0].finished >= 0 || rules.racers[0].next >= route.size()) return {};
-        return drive(racers[0], d, 0, 1.0f / 60, 1.0f);
-    }
-    fuel::DriveInput drive(Racer& racer, DriveSession& d, int i, float dt, float rubber) {
-        const fuel::VehicleState st = d.state(i);
-        const auto& q = st.chassis.rotation;
-        fuel::RaceDriver::Sense s;
-        s.x = st.chassis.position[0];
-        s.z = st.chassis.position[2];
-        s.heading = d.heading(i);
-        s.speedKmh = st.speedKmh;
-        s.upY = 1 - 2 * (q[0] * q[0] + q[2] * q[2]);  // y of the rotated up axis
-        s.topSpeedKmh = d.setup(i).topSpeedKmh;
-        fuel::DriveWorld& world = d.physics();
-        s.clearance = [&world, x = s.x, z = s.z](float yaw, float length, bool slopes) { return world.clearance(x, z, yaw, length, slopes ? 0.55f : 0.0f, 0.5f); };
-        const size_t next = rules.racers[size_t(i)].next;
-        const fuel::DriveInput in = racer.ai.drive(lineFor(size_t(i)), next, s, dt, rubber);
-        if (racer.ai.wantsReset()) {
-            // Back on the line, a few metres to the side for each racer so they do not land on each other.
-            const auto p = racer.ai.resetPoint();
-            if (std::getenv("FUEL_AI_TRACE"))
-                std::printf("    reset #%d at t=%.1f from (%.0f, %.0f) next %zu speed %.1f up %.2f\n", i, clock, s.x, s.z, next, s.speedKmh, s.upY);
-            const float yaw = racer.ai.resetHeading(), side = float(i % 3 - 1) * 4.0f;
-            d.teleport(p[0] + std::cos(yaw) * side, p[2] - std::sin(yaw) * side, yaw, i);
-            racer.ai.didReset();
+        if (state != Running || rules.racers[0].finished >= 0 || rules.racers[0].next >= route.size()) {
+            d.physics().setGuide(0, false);
             return {};
         }
-        return in;
+        drive(racers[0], d, 0, 1.0f / 60, -1);
+        return autoInput;
+    }
+    fuel::DriveInput autoInput;  // the autopilot's last input
+    float playerS = 0;           // the player's distance along the AI path
+    static fuel::AiVehicle aiVehicle(const fuel::VehicleSetup& setup) {
+        fuel::AiVehicle v;
+        auto P = [&](int n, float dflt) { return size_t(n) < setup.params.size() && setup.params[size_t(n)] > 0 ? setup.params[size_t(n)] : dflt; };
+        v.roadKmh = P(619, setup.topSpeedKmh), v.offKmh = P(620, setup.topSpeedKmh);
+        v.road0to100 = P(623, 3.0f), v.off0to100 = P(624, 3.2f);
+        v.maxSlopeDeg = std::min(P(626, 90.0f), 90.0f);
+        float r = 1.0f;
+        for (const auto& w : setup.wheels) r = std::max(r, std::hypot(w.hub[0], w.hub[2]) + w.radius * 0.5f);
+        v.radius = r;
+        return v;
+    }
+    // One step of racer i's ghost and what it does to the vehicle. rank < 0: the player's autopilot.
+    void drive(Racer& racer, DriveSession& d, int i, float dt, int rank) {
+        fuel::DriveWorld& world = d.physics();
+        const fuel::VehicleState st = d.state(i);
+        const fuel::fv::FuelVehicle* m = world.model(i);
+        fuel::RaceDriver::Sense s;
+        s.pos = st.chassis.position;
+        if (m) {
+            const fuel::fv::Vec3 v = m->body().S.v, f = fuel::fv::rotate(m->body().S.q, {0, 0, 1}), u = fuel::fv::rotate(m->body().S.q, {0, 1, 0});
+            s.vel = {v.x, v.y, v.z}, s.fwd = {f.x, f.y, f.z}, s.up = {u.x, u.y, u.z};
+            s.fwdSpeed = m->forwardSpeed();
+        }
+        s.frozen = state == Countdown;
+        s.clock = float(clock);
+        s.forcePhysical = rank < 0;
+        s.rank = std::max(rank, 0);
+        const simd_float3 p0 = d.position(0);
+        s.playerDist = rank < 0 ? 0.0f : float(std::hypot(s.pos[0] - p0.x, s.pos[2] - p0.z));
+        const fuel::RaceLine& ln = lineFor(size_t(i));
+        playerS = line.project(p0.x, p0.z, playerS - 30.0f, playerS + 60.0f);
+        const float playerLeft = line.pathLength() - playerS;
+        s.playerAhead = rank < 0 ? 0.0f : playerLeft - (ln.pathLength() - racer.ai.progress());
+        if (const fuel::fv::FuelVehicle* pm = world.model(0)) s.playerVel = {pm->body().S.v.x, pm->body().S.v.y, pm->body().S.v.z};
+        s.own = aiVehicle(d.setup(i));
+        s.player = aiVehicle(d.setup(0));
+        for (int j = 0; j < d.vehicleCount() && size_t(j) < racers.size(); ++j) {
+            if (j == i) continue;
+            const fuel::VehicleState o = d.state(j);
+            fuel::RaceDriver::Other other;
+            other.x = o.chassis.position[0], other.z = o.chassis.position[2];
+            if (const fuel::fv::FuelVehicle* om = world.model(j)) other.vx = om->body().S.v.x, other.vz = om->body().S.v.z;
+            other.radius = aiVehicle(d.setup(j)).radius;
+            s.others.push_back(other);
+        }
+        if (terrain)
+            s.ground = [t = terrain](double x, double z, float n[3]) {
+                const float h = t->smoothHeightAt(float(x), float(z));
+                const float hx = t->smoothHeightAt(float(x) + 1, float(z)) - t->smoothHeightAt(float(x) - 1, float(z));
+                const float hz = t->smoothHeightAt(float(x), float(z) + 1) - t->smoothHeightAt(float(x), float(z) - 1);
+                const float l = std::sqrt(hx * hx * 0.25f + 1 + hz * hz * 0.25f);
+                n[0] = -hx * 0.5f / l, n[1] = 1 / l, n[2] = -hz * 0.5f / l;
+                return h;
+            };
+        if (roads && roadTypes)
+            s.offroad = [r = roads, &types = *roadTypes](double x, double z) {
+                const int t = fuel::roadTypeAt(*r, x, z);
+                return t >= 0 && t < 21 ? types[size_t(t)].aiSpeedBlend : 1.0f;
+            };
+        s.statics = [&world](double x0, double z0, double x1, double z1, std::vector<std::array<double, 6>>& out) { world.staticBounds(x0, z0, x1, z1, out); };
+        s.tables = aiTables ? &*aiTables : nullptr;
+        const fuel::RaceDriver::Command c = racer.ai.step(ln, s, dt);
+        if (c.reset && std::getenv("FUEL_AI_TRACE"))
+            std::printf("    reset #%d at t=%.1f from (%.0f, %.0f) speed %.1f\n", i, clock, s.pos[0], s.pos[2], st.speedKmh);
+        if (c.place) world.holdPose(i, c.pos, c.rot, c.reset ? std::array<float, 3>{} : c.vel);
+        if (c.physical && !c.reset && !s.frozen) world.setGuide(i, true, c.pos, c.vel, c.rot);
+        else if (!c.place) world.setGuide(i, false);
+        const fuel::DriveInput in = c.physical ? c.input : fuel::DriveInput{};
+        if (i == 0) autoInput = in;
+        else d.setInput(i, in);
     }
     size_t next() const { return rules.racers[0].next; }  // the player's target (the HUD and markers follow it)
     bool finished(size_t i) const { return rules.racers[i].finished >= 0; }
@@ -832,6 +912,28 @@ int eventOpponents(const fuel::Event& e, int requested) {
     return std::clamp(requested >= 0 ? requested : e.race.aiCount, 0, 11);
 }
 
+// FUEL's AI classes (IA_RaceSetup 0x620e30): 1..3 racers of class 0 and 1..3 of class 2 (random), the
+// rest class 1, handed out from the last racer back (class 2 first), each with its share k / count of
+// its class; knock-out races use class 4, catch-AI challenges class 3. Grid row: two abreast (0x6212e0).
+void assignAiClasses(RaceSession& race, std::mt19937& rng) {
+    const int n = int(race.racers.size()) - 1;
+    const int gm = int(race.race().gameMode());
+    const int c0 = 1 + int(rng() % 3), c2 = 1 + int(rng() % 3);
+    int left2 = c2, left1 = n - c2 - c0, left0 = c0;
+    const int c1 = std::max(left1, 1);
+    for (int i = n; i >= 1; --i) {
+        int mode = 0;
+        float frac = 1;
+        if (gm == fuel::Race::GmKnockOut) mode = 4;
+        else if (gm == fuel::Race::GmCatchAI) mode = 3;
+        else if (left2 > 0) mode = 2, frac = float(left2--) / float(c2);
+        else if (left1 > 0) mode = 1, frac = float(left1--) / float(c1);
+        else mode = 0, frac = float(left0--) / float(c0);
+        race.racers[size_t(i)].ai = fuel::RaceDriver(mode, frac, i / 2);
+    }
+    race.racers[0].ai = fuel::RaceDriver(1, 1, 0);
+}
+
 // Puts `count` opponents of the player's class into the drive session and the race,
 // each with a random livery and colour of its own, and hands their parts to the renderer.
 void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int count, fuel::MeshRenderer& renderer, const VehicleLook& prefs) {
@@ -851,8 +953,6 @@ void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int co
         RaceSession::Racer racer;
         racer.name = garage.label(entry);
         racer.entry = entry;
-        const float lanes[3] = {3.5f, -3.5f, 0.0f};  // matching the grid: right, left, centre
-        racer.ai = fuel::RaceDriver(std::uniform_real_distribution<float>(0.85f, 1.0f)(rng), lanes[race.racers.size() % 3]);
         race.racers.push_back(racer);
         // Paint: a random livery the vehicle has (or plain paint) and a random palette colour.
         const AssemblyMode& am = *garage.archives[garage.entries[entry].first];
@@ -868,6 +968,7 @@ void addOpponents(Garage& garage, DriveSession& drive, RaceSession& race, int co
     }
     renderer.setVehicles(parts, paints);
     renderer.shadowRadius = parts.empty() ? 0.0f : 22.0f;  // shadows for the vehicles around the player
+    assignAiClasses(race, rng);
 }
 
 // Moves the opponents' parts to their physics poses.
@@ -883,22 +984,26 @@ void printAiCheck(const RaceSession& race, const DriveSession& drive) {
         const RaceSession::Racer& r = race.racers[i];
         const fuel::RaceRules::Racer& rr = race.rules.racers[i];
         const fuel::VehicleState st = drive.state(int(i));
-        std::printf("  P%d %-16s %s skill %.2f  checkpoints %2zu/%zu  %5.1f km/h  resets %d%s\n", pos[i], r.name.c_str(), i == 0 ? "(auto)" : "      ",
-                    r.ai.skill(), rr.next, race.rules.lineFor(i).size(), st.speedKmh, r.ai.resets(),
+        std::printf("  P%d %-16s %s class %d/%.2f %s  checkpoints %2zu/%zu  %5.1f km/h  resets %d (vehicle %d)%s\n", pos[i], r.name.c_str(),
+                    i == 0 ? "(auto)" : "      ", r.ai.mode(), r.ai.frac(), r.ai.physical() ? "sim" : "kin", rr.next, race.rules.lineFor(i).size(),
+                    st.speedKmh, r.ai.resets(), drive.physics().respawns(int(i)),
                     rr.finished >= 0 ? (" finished " + std::to_string(int(rr.finished)) + " s").c_str() : rr.out ? " out" : "");
     }
 }
 
-// Passes when every opponent got through checkpoints and none needed more than a few resets.
-bool aiCheckVerdict(const RaceSession& race) {
-    int moving = 0, resets = 0;
+// Passes when every opponent got through checkpoints and none needed more than a few resets (the AI's own
+// resets and the vehicles' wreck/overturn respawns together).
+bool aiCheckVerdict(const RaceSession& race, const DriveSession& drive) {
+    int moving = 0, resets = 0, respawns = 0;
     for (size_t i = 1; i < race.racers.size(); ++i) {
         moving += race.rules.racers[i].next >= std::min<size_t>(3, race.rules.lineFor(i).size());
         resets += race.racers[i].ai.resets();
+        respawns += drive.physics().respawns(int(i));
     }
     const int n = int(race.racers.size()) - 1;
-    const bool ok = n > 0 && moving == n && resets <= 2 * n;
-    std::printf("ai check: %d of %d opponents past 3 checkpoints, %d resets in all: %s\n", moving, n, resets, ok ? "ok" : "FAILED");
+    const bool ok = n > 0 && moving == n && resets + respawns <= 2 * n;
+    std::printf("ai check: %d of %d opponents past 3 checkpoints, %d resets in all (%d AI, %d vehicle respawns): %s\n", moving, n, resets + respawns,
+                resets, respawns, ok ? "ok" : "FAILED");
     return ok;
 }
 
@@ -975,6 +1080,100 @@ std::vector<fuel::CamCheckItem> riderCheckItems(const std::string& dataDir) {
     std::snprintf(b, sizeof b, "got (0,%.7g,0) (0,%.7g,0)", s1[1], s2[1]);
     out.push_back({"Rider sway target 0x5d7d40", sOk, b});
     return out;
+}
+
+// --aicheck-vectors: the AI's line, aim, corners and corner speed (race_ai, P29) against FUEL.exe run in
+// Ghidra's emulator on synthetic racer records (notes/p29-work/ai_gen.py: 0x61acb0, 0x61e540 + 0x61dcf0).
+// The guided target forces are in build/fuelphysvec (GF1-GF3).
+int runAiVectors(const std::string& dataDir) {
+    int ok = 0, bad = 0;
+    auto check = [&](const char* id, const char* what, const std::vector<float>& got, const std::vector<float>& want, float tol) {
+        bool m = got.size() == want.size();
+        for (size_t k = 0; m && k < got.size(); ++k) m = std::fabs(got[k] - want[k]) <= tol * std::max(1.0f, std::fabs(want[k]));
+        std::printf("%-4s %-40s %s  got", id, what, m ? "match   " : "MISMATCH");
+        for (float g : got) std::printf(" %.7g", g);
+        if (!m) {
+            std::printf("  want");
+            for (float w : want) std::printf(" %.7g", w);
+        }
+        std::printf("\n");
+        (m ? ok : bad)++;
+    };
+    std::string err;
+    const auto tables = fuel::loadAiTables((fs::path(dataDir) / "XFinalComponent/FUEL.exe").string(), &err);
+    if (!tables) {
+        std::printf("aicheck: %s\n", err.c_str());
+        return 1;
+    }
+    // The table FUEL's 0x61e540 writes (emulated), against the port's reading of the same code.
+    check("T1", "corner speed table 0x61e540", std::vector<float>(tables->cornerSpeed.begin(), tables->cornerSpeed.end()),
+          {/* engine table removed from the published history; read from FUEL.exe at run time */},
+          1e-6f);
+    // Samples every 10 m along a path turning by `turns` (degrees at sample k) as ai_gen.py builds them.
+    auto arc = [](int n, double perSample, const std::map<int, double>& turns, const std::function<std::pair<float, float>(int)>& lat) {
+        std::vector<std::array<double, 2>> pts;
+        double x = 0, z = 0, h = 0;
+        for (int k = 0; k <= n; ++k) {
+            pts.push_back({x, z});
+            x += std::sin(h) * 10.0, z += std::cos(h) * 10.0;
+            h += turns.empty() ? perSample : (turns.count(k) ? turns.at(k) * M_PI / 180.0 : 0.0);
+        }
+        std::vector<fuel::AiSample> S;
+        double cum = 0;
+        for (size_t k = 0; k < pts.size(); ++k) {
+            fuel::AiSample a;
+            double dx, dz, l;
+            if (k + 1 < pts.size()) {
+                dx = pts[k + 1][0] - pts[k][0], dz = pts[k + 1][1] - pts[k][1], l = std::hypot(dx, dz), dx /= l, dz /= l;
+            } else {
+                dx = S.back().dx, dz = S.back().dz, l = double(S.back().seg) + 1.0;
+            }
+            const auto [lo, hi] = lat(int(k));
+            a.x = float(pts[k][0]), a.z = float(pts[k][1]), a.latMin = lo, a.latMax = hi, a.dx = float(dx), a.dz = float(dz), a.seg = float(l), a.cum = float(cum);
+            if (k + 1 < pts.size()) cum += l;
+            S.push_back(a);
+        }
+        return S;
+    };
+    struct LCase {
+        const char* id;
+        std::vector<fuel::AiSample> S;
+        int idx;
+        float p0[2], s0, hist;
+        std::vector<float> aim, corners;
+    };
+    const LCase lc[] = {
+        {"L1", arc(20, 60.0 * M_PI / 180.0 / 20.0, {}, [](int) { return std::make_pair(-30.0f, 30.0f); }), 0, {0, 2}, 3, 25, {1.0689021f, 14.454214f}, {}},
+        {"L3", arc(14, 0, {{4, 35.0}, {5, 35.0}, {6, 35.0}, {9, -25.0}}, [](int) { return std::make_pair(-12.0f, 12.0f); }), 0, {0.5f, 1}, 1, 18,
+         {0.42544538f, 9.999691f},
+         {9.302983f, 47.06678f, 17.499998f, 12.150337f, 12.081834f, 49.92116f, 35.0f, 4.098469f, 15.547596f, 52.10884f, 34.999992f, 8.629087f, 23.698313f,
+          54.94203f, 17.5f, 10.942888f}},
+        {"L2", arc(10, -50.0 * M_PI / 180.0 / 10.0, {}, [](int k) { return k != 6 ? std::make_pair(-8.0f, 8.0f) : std::make_pair(-2.0f, 8.0f); }), 1,
+         {1, 12}, 12, std::hypot(3.0f, 14.0f), {-0.9217987f, 18.896135f}, {}},
+    };
+    for (const LCase& c : lc) {
+        float aim[2] = {0, 0};
+        std::vector<fuel::AiCorner> corners;
+        fuel::aiSmoothLineAndAim(c.S, c.idx, c.s0, c.p0, c.hist, aim, corners);
+        check(c.id, "0x61acb0 aim point (x, z)", {aim[0], aim[1]}, c.aim, 2e-4f);
+        std::vector<float> got;
+        for (const auto& k : corners) got.insert(got.end(), {k.x, k.z, k.angle, k.len});
+        check(c.id, "0x61acb0 corners (x z angle len)", got, c.corners, 5e-4f);
+    }
+    struct CCase {
+        const char* id;
+        std::vector<fuel::AiCorner> recs;
+        double gx, gz;
+        float want;
+    };
+    const CCase cc[] = {
+        {"C1", {{10, 50, 30, 22}}, 0, 32, 38.8888893f},
+        {"C2", {{0, 60, 25, 18}, {5, 75, 20, 16}}, 0, 36, 38.8888893f},
+        {"C3", {{0, 30, 11, 40}}, 0, 0, 61.1111145f},
+    };
+    for (const CCase& c : cc) check(c.id, "0x61dcf0 corner speed", {fuel::aiCornerSpeed(c.recs, *tables, c.gx, c.gz)}, {c.want}, 1e-6f);
+    std::printf("aicheck: %d of %d vectors match\n", ok, ok + bad);
+    return bad == 0 ? 0 : 1;
 }
 
 // --camcheck: FUEL's camera (and rider) functions against the emulated test vectors (p25 §P4, p27).
@@ -1504,6 +1703,7 @@ int main(int argc, const char** argv) {
         if (opt.menuCheck) return fuel::ui::runMenuCheck(opt.dataDir, fuel::loadSettings().language);
         if (opt.renderCheck) return fuel::runRenderCheck(opt.dataDir);
         if (opt.camCheck) return runCamCheck(opt.dataDir);
+        if (opt.aiVectors) return runAiVectors(opt.dataDir);
         if (!opt.menuShot.empty()) {
             fuel::Settings ms = fuel::loadSettings();
             ms.dataDir = opt.dataDir;
@@ -1631,6 +1831,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<DriveSession> drive;
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
+        std::optional<std::array<fuel::RoadTypeParams, 21>> roadTypes;  // the AI's road blend (+0xb4)
         std::unique_ptr<fuel::Lakes> lakes;
         std::unique_ptr<fuel::GroundGenerator> ground;  // p14: grass and the trees' ground tests
         std::unique_ptr<WorldStreamer> streamer;  // after what its worker reads, so it is destroyed (and waits) first
@@ -1727,6 +1928,7 @@ int main(int argc, const char** argv) {
                             streamer->setVegetation(vegetation.get(), terrain.get());
                             streamer->setSurfaces([](double x, double z) { return gSurfaces.at(x, z); });
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
+                            roadTypes = fuel::loadRoadTypes(*f);
                             streamer->setRoads(roads.get());
                             gSurfaces.roads = roads.get();
                             std::printf("roads: %zu drawable lines\n", roads->lines.size());
@@ -1845,6 +2047,13 @@ int main(int argc, const char** argv) {
                 if (!opt.race.empty()) {
                     race = std::make_unique<RaceSession>();
                     race->terrain = terrain.get();
+                    race->roads = roads.get();
+                    race->roadTypes = roadTypes;
+                    {
+                        std::string err;
+                        race->aiTables = fuel::loadAiTables((fs::path(opt.dataDir) / "XFinalComponent/FUEL.exe").string(), &err);
+                        if (!race->aiTables) std::printf("AI: %s (no corner speeds)\n", err.c_str());
+                    }
                     race->races = loadRaces(opt.dataDir);
                     if (race->races.empty()) die("no races found in the mission scripts");
                     auto it = std::find_if(race->races.begin(), race->races.end(), [&](const fuel::Event& e) {
@@ -2077,7 +2286,7 @@ int main(int argc, const char** argv) {
                         if (opt.aiCheck) {
                             printAiCheck(*race, *drive);
                             gPhysStats.print();
-                            return aiCheckVerdict(*race) ? 0 : 1;
+                            return aiCheckVerdict(*race, *drive) ? 0 : 1;
                         }
                     }
                     renderer.setFocus(haveCheckFocus ? checkFocus : drive->position());

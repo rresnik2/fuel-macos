@@ -731,7 +731,30 @@ void FuelVehicle::bodyForces() {
             body_.addForceAt(dir * F, at);
         }
     }
-    // 9. Guided target forces (AI/script, U5): not used; the port's AI drives through the inputs.
+    // 9. Guided target forces (+0x1421, any wheel loaded; AI branch, owner +0x1a49 set; P29, U5 decoded
+    // from the asm 0x522fb1..0x52370f): the position pull acts across the body's up axis (+0x4e4)
+    // beyond 0.02 v of the target, F = e sqrt(|e| - 0.02 v) / |e| * m * 20; the velocity match
+    // F = (v_target - v) across up * m * 5 (both at the CoM); the heading torque about up,
+    // T = u (u . (fwd x fwd_target)) m * 10 / sqrt(|..|), when the sine exceeds 0.2.
+    if ((guide_.pos || guide_.rot) && anyWheelLoaded()) {
+        const Vec3 u = up();
+        if (guide_.pos) {
+            const float thr = speed_ * 0.02f;  // +0x13cc * 0x9dc018
+            Vec3 e = guide_.p - S.x;
+            e = e - u * dot(e, u);
+            const float L = len(e);
+            if (thr < L) body_.addForceAt(e * (std::sqrt(L - thr) / L * m * 20.0f), S.x);  // 20.0 @0x996154
+            Vec3 dv = guide_.v - S.v;
+            dv = dv - u * dot(dv, u);
+            body_.addForceAt(dv * (m * 5.0f), S.x);  // 5.0 @0x9dbf8c
+        }
+        if (guide_.rot) {
+            const Vec3 ft = rotate(guide_.q, {0, 0, 1});  // (0,0,1) @0xa06478
+            const Vec3 t = u * dot(u, cross(fwd(), ft));
+            const float tl = len(t);
+            if (tl > 0.2f) body_.T += t * (std::sqrt(tl) * m / tl * 10.0f);  // 0.2 @0x9dbfa8, 10.0 @0x996494
+        }
+    }
 }
 
 // ---- driveline 0x5211e0 ----------------------------------------------------------------------

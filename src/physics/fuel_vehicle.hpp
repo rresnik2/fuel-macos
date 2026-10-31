@@ -89,6 +89,16 @@ public:
     void resetTo(const Vec3& modelOrigin, float yaw, Environment& env);
     void setInputs(const Inputs& in) { in_ = in; }
     void setAi(bool ai) { player_ = !ai; }
+    // Guided target forces (0x522830 tail, veh+0x1421 on; P29): the AI's ghost. `pos`: CoM target and
+    // target velocity (Pilot_SetTarget 0x5c9c20 -> +0xefc, 0x5c65e0 -> +0xeec); `rot`: heading target
+    // (0x5c6610 -> +0xf0c). Local coordinates.
+    struct Guide {
+        bool pos = false, rot = false;
+        Vec3 p{}, v{};
+        Quat q{0, 0, 0, 1};
+    };
+    void setGuide(const Guide& g) { guide_ = g; }
+    const Guide& guide() const { return guide_; }
 
     // Once per frame, before the substeps (0x526bd0).
     void preStep(float dt, Environment& env);
@@ -255,6 +265,7 @@ private:
     Vec3 groundQueryAt_{1e9f, 0, 1e9f};
 
     Inputs in_;
+    Guide guide_;
     Steer st_;
     // Per-wheel state.
     float dOmega_[6] = {};        // +0x12a4

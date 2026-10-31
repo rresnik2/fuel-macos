@@ -142,6 +142,14 @@ public:
 
     // For checks: lifts vehicle `i` by `dy` metres and sets its velocity (world, m/s).
     void nudge(int i, double dy, const std::array<float, 3>& velocity);
+    // The AI's ghost (P29, race_ai): guided target forces towards a world ground point, velocity and
+    // heading (on), or none (off).
+    void setGuide(int i, bool on, const std::array<double, 3>& ground = {}, const std::array<float, 3>& velocity = {},
+                  const std::array<float, 4>& rotation = {0, 0, 0, 1});
+    // Puts vehicle i with its model origin on `origin` (world), turned by `rotation`, moving at `velocity`
+    // (FUEL places far AI vehicles on their ghost, 0x5c9760).
+    void holdPose(int i, const std::array<double, 3>& origin, const std::array<float, 4>& rotation, const std::array<float, 3>& velocity);
+    int respawns(int i) const;  // resets by the vehicle's own wreck/overturn logic
 
     // Free distance (metres, up to `length`) from (x, z) along heading `yaw` (0 = +z):
     // what a driver sees ahead. A ray `height` metres above the terrain at both ends
@@ -162,6 +170,8 @@ public:
         float volume = 0;
     };
     void overlapStatics(const std::array<double, 3>& centre, float radius, std::vector<SphereContact>& out) const;
+    // World bounds (min x, y, z, max x, y, z) of the static objects (not the terrain) over an x/z rectangle.
+    void staticBounds(double x0, double z0, double x1, double z1, std::vector<std::array<double, 6>>& out) const;
 
     // Surface type (0..39) under a world point, for per-wheel grip. Without a query every
     // surface counts as dirt. The default applies to worlds created afterwards.

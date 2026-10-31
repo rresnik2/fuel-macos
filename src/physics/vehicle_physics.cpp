@@ -256,6 +256,7 @@ struct DriveWorld::Impl {
             float yaw;
         };
         std::deque<Crumb> crumbs;  // respawn breadcrumbs (0x528830, simplified)
+        int respawns = 0;          // resets by the vehicle's own logic (wreck, overturn, fell out)
         float crumbTimer = 0;
     };
     std::vector<std::unique_ptr<Vehicle>> vehicles;
@@ -499,6 +500,7 @@ struct DriveWorld::Impl {
 
     // Respawn (0x529410 -> 0x5288d0(10 m) + 0x5273b0): the newest breadcrumb farther than 10 m, else in place.
     void respawn(Vehicle& v) {
+        ++v.respawns;
         const fv::Vec3 o = v.model->modelOrigin();
         const double x = double(o.x) + ox, z = double(o.z) + oz;
         for (auto it = v.crumbs.rbegin(); it != v.crumbs.rend(); ++it)
@@ -669,6 +671,45 @@ void DriveWorld::update(float dt, const DriveInput& input) {
     update(dt);
 }
 
+void DriveWorld::setGuide(int i, bool on, const std::array<double, 3>& ground, const std::array<float, 3>& velocity,
+                          const std::array<float, 4>& rotation) {
+    if (Impl::Vehicle* v = impl_->at(i)) {
+        fv::FuelVehicle::Guide g;
+        if (on) {
+            fv::FuelVehicle& m = *v->model;
+            // The CoM target: the ghost's ground point raised by the CoM's current height over the model origin.
+            const fv::Vec3 lift = m.body().S.x - m.modelOrigin();
+            g.pos = g.rot = true;
+            g.p = impl_->local(ground[0], ground[1], ground[2]) + lift;
+            g.v = {velocity[0], velocity[1], velocity[2]};
+            g.q = {rotation[0], rotation[1], rotation[2], rotation[3]};
+        }
+        v->model->setGuide(g);
+    }
+}
+
+void DriveWorld::holdPose(int i, const std::array<double, 3>& origin, const std::array<float, 4>& rotation, const std::array<float, 3>& velocity) {
+    if (Impl::Vehicle* v = impl_->at(i)) {
+        fv::FuelVehicle& m = *v->model;
+        m.setGuide({});
+        const fv::Quat q = fv::qnormalize({rotation[0], rotation[1], rotation[2], rotation[3]});
+        const fv::Vec3 x = impl_->local(origin[0], origin[1], origin[2]) + fv::rotate(q, m.comLocal());
+        fv::RigidBody& b = m.body();
+        for (fv::BodyState* st : {&b.S, &b.P, &b.N}) {
+            st->x = x;
+            st->q = q;
+            st->v = {velocity[0], velocity[1], velocity[2]};
+            st->w = {0, 0, 0};
+        }
+        v->crumbs.clear();
+    }
+}
+
+int DriveWorld::respawns(int i) const {
+    const Impl::Vehicle* v = impl_->at(i);
+    return v ? v->respawns : 0;
+}
+
 void DriveWorld::nudge(int i, double dy, const std::array<float, 3>& velocity) {
     if (Impl::Vehicle* v = impl_->at(i)) {
         fv::RigidBody& b = v->model->body();
@@ -806,6 +847,21 @@ float DriveWorld::rayFraction(const std::array<double, 3>& from, const std::arra
     const bool blocked = impl_->physics.GetNarrowPhaseQuery().CastRay(RRayCast(a, Vec3(b - a)), hit, SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)),
                                                                       SpecifiedObjectLayerFilter(kStatic), NotTerrain());
     return blocked ? hit.mFraction : 1.0f;
+}
+
+void DriveWorld::staticBounds(double x0, double z0, double x1, double z1, std::vector<std::array<double, 6>>& out) const {
+    out.clear();
+    AllHitCollisionCollector<CollideShapeBodyCollector> hits;
+    const AABox box(Vec3(float(std::min(x0, x1)), -1.0e5f, float(std::min(z0, z1))), Vec3(float(std::max(x0, x1)), 1.0e5f, float(std::max(z0, z1))));
+    impl_->physics.GetBroadPhaseQuery().CollideAABox(box, hits, SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)), SpecifiedObjectLayerFilter(kStatic));
+    const BodyLockInterfaceLocking& locks = impl_->physics.GetBodyLockInterface();
+    for (const BodyID& id : hits.mHits) {
+        BodyLockRead lock(locks, id);
+        if (!lock.Succeeded() || lock.GetBody().GetShape()->GetSubType() == EShapeSubType::HeightField) continue;
+        const AABox b = lock.GetBody().GetWorldSpaceBounds();
+        out.push_back({double(b.mMin.GetX()), double(b.mMin.GetY()), double(b.mMin.GetZ()), double(b.mMax.GetX()), double(b.mMax.GetY()), double(b.mMax.GetZ())});
+        if (out.size() >= 512) break;
+    }
 }
 
 void DriveWorld::overlapStatics(const std::array<double, 3>& centre, float radius, std::vector<SphereContact>& out) const {

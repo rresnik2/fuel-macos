@@ -39,7 +39,10 @@ struct RoadNetwork {
 // roads, DIRT_FLAT = 13 on dirt roads and trails) when the point is within half the road's
 // drawn width of its centre line, else -1. Tarmac wins where roads overlap.
 int roadSurfaceAt(const RoadNetwork& net, double x, double z);
-bool isTarmacRoad(int roadType);  // types 10, 11, 12, 15, 18, 19
+bool isTarmacRoad(int roadType);
+// GwRoad type of the road under (x, z) (within half its drawn width of the centre line), -1 off any road.
+// The AI's road lookup (0x6d1d70 in IA speed model 0x617000) is not decoded; this is the port's stand-in.
+int roadTypeAt(const RoadNetwork& net, double x, double z);  // types 10, 11, 12, 15, 18, 19
 
 RoadNetwork loadRoads(const DpcFile& world);
 

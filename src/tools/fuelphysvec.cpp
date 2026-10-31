@@ -72,7 +72,9 @@ struct FuelVehicleTest {
     }
     static void driveline(FuelVehicle& v) { v.driveline(); }
     // notes/p24-work/body_gen.py: orientation yaw about y, velocity, spin, airtime, steer channel B, slide accel, gear.
-    static void bodyForces(FuelVehicle& v, float yaw, Vec3 vel, Vec3 w, float airtime, float chB, float acc, int gear, const float loads[4]) {
+    static void bodyForces(FuelVehicle& v, float yaw, Vec3 vel, Vec3 w, float airtime, float chB, float acc, int gear, const float loads[4],
+                           const FuelVehicle::Guide& guide = {}) {
+        v.guide_ = guide;
         BodyState& S = v.body_.S;
         S.q = axisAngle({0, 1, 0}, yaw);
         S.x = {};
@@ -456,6 +458,44 @@ void bodyForceVectors() {
     }
 }
 
+// GF1-GF3: the guided target forces of the AI (0x522830 tail, P29 decode of U5), the body forces of the BF
+// setup plus the AI branch (+0x1421, owner +0x1a49, targets +0xefc / +0xeec / +0xf0c), emulated in P29
+// (notes/p29-work/gf_gen.py).
+void guidedForceVectors() {
+    const std::vector<std::pair<int, float>> p = {{87, 50}, {88, 40}, {93, 0.0001f}, {94, 0.002f}, {95, 1.0f}, {96, 1.2f}, {97, 1.0f},
+                                                  {98, 0.75f}, {99, 20}, {100, 0.05f}, {101, 2.0f}, {102, 1.5f}, {103, 2.5f}, {104, 2.0f},
+                                                  {266, 1.0f}, {267, 1.5f}, {268, 0.8f}, {269, 1.2f}, {287, 0.01f}, {288, -17}, {289, -15},
+                                                  {291, 0.2f}, {292, 0.25f}, {577, 2}, {579, 1.5f}, {580, 0.8f}, {581, 1.6f}, {46, 1}, {47, 1}};
+    struct Case {
+        const char* id;
+        float yaw;
+        Vec3 v, w;
+        float loads[4];
+        Vec3 tp, tv;
+        float tyaw;
+        Vec3 F, T;
+    };
+    const Case cases[] = {
+        {"GF1", 0.0f, {0.5f, 0.2f, 12}, {0.1f, 0.3f, -0.05f}, {0.12f, 0.15f, 0.1f, 0.15f}, {3, 0.5f, 2}, {1, 0, 15}, 0.6f,
+         {9908.033f, -5790.113f, 10599.861f}, {-42.53254f, 2212.5828f, 21.26627f}},
+        {"GF2", 0.5f, {3, 0.2f, 11}, {0.1f, -0.4f, 0.2f}, {0.12f, 0.15f, 0.1f, 0.15f}, {-4, 0, -1}, {2, 0, 8}, -0.4f,
+         {-12989.29f, -5735.6084f, -7376.905f}, {-41.658546f, -2576.1238f, -30.662144f}},
+        {"GF3", 0.0f, {0, 0, 20}, {0, 0, 0}, {0.12f, 0.15f, 0.1f, 0.15f}, {0.3f, 0, 0}, {0, 0, 20}, 0.1f,
+         {0.0f, -6270.0f, -15.68f}, {-23.999996f, 0.0f, 11.999998f}},
+    };
+    for (const Case& cs : cases) {
+        FuelVehicle v = synthetic(p);
+        FuelVehicle::Guide g;
+        g.pos = g.rot = true;
+        g.p = cs.tp, g.v = cs.tv;
+        g.q = axisAngle({0, 1, 0}, cs.tyaw);
+        FuelVehicleTest::bodyForces(v, cs.yaw, cs.v, cs.w, 0, 0, 0, 1, cs.loads, g);
+        const RigidBody& b = v.body();
+        check(cs.id, "0x522830 AI guide force", {b.F.x, b.F.y, b.F.z}, {cs.F.x, cs.F.y, cs.F.z}, 2e-4f);
+        check(cs.id, "0x522830 AI guide torque", {b.T.x, b.T.y, b.T.z}, {cs.T.x, cs.T.y, cs.T.z}, 2e-4f);
+    }
+}
+
 void derivedVectors() {
     // Gravity (0x530cb0): F = (0, m Pg, 0). Anti-roll example (QUAD): d = 0.02 -> F = m 0.1 min(50 0.02, 9.81) = 0.1 m.
     FuelVehicle v = synthetic({{287, 0.01f}, {288, -17}, {289, -15}, {87, 50}, {88, 50}});
@@ -479,6 +519,7 @@ int main() {
     airVector();
     drivelineVectors();
     bodyForceVectors();
+    guidedForceVectors();
     derivedVectors();
     std::printf("%d match, %d mismatch\n", passes, failures);
     return failures ? 1 : 0;
