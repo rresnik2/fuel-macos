@@ -925,7 +925,7 @@ VehicleState DriveWorld::state(int i) const {
         st.wheelSkid.push_back(wheelSkid);
     }
     st.speedKmh = m.forwardSpeed() * 3.6f;
-    st.rpm = m.rpm();
+    st.rpm = m.displayRpm();  // the smoothed rpm FUEL exports for the sound (+0x1280)
     st.gear = m.gear();
     st.skid = touching ? skid / float(touching) : 0.0f;
     st.wheelSurface = v->wheelSurface;
