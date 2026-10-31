@@ -75,6 +75,15 @@ std::string vehicleDpc(const std::string& dataDir, const Menu& menu, const std::
     argv.push_back(const_cast<char*>(self.c_str()));
     for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
     argv.push_back(nullptr);
+    // The session's command, for replaying a menu choice by hand.
+    std::string line = "fuelview: exec";
+    for (const std::string& a : args) line += " '" + a + "'";
+    std::fprintf(stderr, "%s\n", line.c_str());
+    if (const char* home = std::getenv("HOME"))
+        if (FILE* f = std::fopen((std::string(home) + "/Library/Application Support/FUEL Port/sessions.log").c_str(), "a")) {
+            std::fprintf(f, "%s\n", line.c_str());
+            std::fclose(f);
+        }
     std::fflush(stdout);
     std::fflush(stderr);
     execv(self.c_str(), argv.data());

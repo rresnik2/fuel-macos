@@ -1444,6 +1444,35 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app { return YES; }
 @end
 
+// A plain dark window with "Loading…", drawn once before the main thread starts loading.
+NSWindow* showLoadingWindow() {
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    const NSRect frame = NSMakeRect(0, 0, 640, 360);
+    NSWindow* w = [[NSWindow alloc] initWithContentRect:frame styleMask:NSWindowStyleMaskTitled
+                                                backing:NSBackingStoreBuffered defer:NO];
+    w.title = @"FUEL";
+    w.releasedWhenClosed = NO;
+    w.backgroundColor = [NSColor colorWithCalibratedRed:0.05 green:0.045 blue:0.04 alpha:1];
+    NSTextField* label = [NSTextField labelWithString:@"Loading…"];
+    label.font = [NSFont boldSystemFontOfSize:28];
+    label.textColor = [NSColor colorWithCalibratedWhite:0.85 alpha:1];
+    [label sizeToFit];
+    [label setFrameOrigin:NSMakePoint((frame.size.width - label.frame.size.width) / 2, (frame.size.height - label.frame.size.height) / 2)];
+    [w.contentView addSubview:label];
+    [w center];
+    [w makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    [w displayIfNeeded];
+    // Let the window server show it before the loading blocks the main thread.
+    for (int i = 0; i < 5; ++i) {
+        NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]
+                                           inMode:NSDefaultRunLoopMode dequeue:YES];
+        if (e) [NSApp sendEvent:e];
+    }
+    return w;
+}
+
 int main(int argc, const char** argv) {
     @autoreleasepool {
         Options opt = parseArgs(argc, argv);
@@ -1459,6 +1488,11 @@ int main(int argc, const char** argv) {
             gs.dataDir = opt.dataDir;
             return fuel::ui::runGameMenu(argv[0], opt.dataDir, gs, opt.menuPage);
         }
+        // --in-game: the menu's window is gone after the exec, and loading the world takes a while,
+        // so a loading window stands in until the game's own window opens.
+        NSWindow* loadingWindow = nil;
+        if (opt.inGame && opt.shot.empty() && !opt.aiCheck && !opt.eventCheck && !opt.hubCheck && !opt.propCheck && !opt.audioCheck)
+            loadingWindow = showLoadingWindow();
         if (!opt.hub.empty() || opt.hubCheck || (opt.drive && opt.shot.empty())) {  // hubs: --hub, --hub-check and the T key
             try {
                 gHubs = fuel::loadHubs(opt.dataDir);
@@ -2070,6 +2104,7 @@ int main(int argc, const char** argv) {
         }
         [window center];
         [window makeKeyAndOrderFront:nil];
+        [loadingWindow close];
         [window makeFirstResponder:view];
         [view showMesh:start];
         [NSApp activateIgnoringOtherApps:YES];
