@@ -240,6 +240,9 @@ struct DriveAudio::Impl {
             return;
         }
         started = true;
+        // AVAudioPlayerNode -play throws ("player did not see an IO cycle") when the engine has no
+        // working output (device busy, e.g. another copy of the game): play silently instead of crashing.
+        @try {
         for (int c : kUsedClasses)
             for (const Voice* v : {&tyres[size_t(c)].rollSlow, &tyres[size_t(c)].rollFast, &tyres[size_t(c)].skid})
                 if (v->valid()) [v->player play];
@@ -252,10 +255,15 @@ struct DriveAudio::Impl {
         for (AVAudioPlayerNode* p : impactPlayers) [p play];
         for (OneShots* set : {&backfire, &absorber})
             for (AVAudioPlayerNode* p : set->players) [p play];
+        } @catch (NSException* e) {
+            std::fprintf(stderr, "fuelview: audio: %s; continuing without sound\n", e.reason.UTF8String);
+            started = false;
+            [engine stop];
+        }
     }
 
     static void fire(OneShots& set, size_t index, float volume) {
-        if (set.buffers.empty()) return;
+        if (set.buffers.empty() || set.players.empty()) return;
         AVAudioPlayerNode* p = set.players[set.next++ % set.players.size()];
         p.volume = std::clamp(volume, 0.0f, 1.0f);
         [p scheduleBuffer:set.buffers[std::min(index, set.buffers.size() - 1)] atTime:nil options:AVAudioPlayerNodeBufferInterrupts completionHandler:nil];
