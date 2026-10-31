@@ -209,8 +209,8 @@ TextTable loadText(const std::string& dataDir, const std::string& language) {
     int tsc = 1;
     TscReader reader(loc.string());
     reader.run("LangDef.tsc", {}, [&](const TscLine& l) {
-        // AddLangDefine NAME TT_NUM TSC_ID WAV_ID MPEG_ID CONSOLE_LANG
-        if (upper(l.args[0]) == "ADDLANGDEFINE" && l.args.size() > 3 && upper(l.args[1]) == want) tsc = std::atoi(l.args[3].c_str());
+        // AddLangDefine TT_NUM TSC_ID WAV_ID MPEG_ID CONSOLE_LANG (the language name is last)
+        if (upper(l.args[0]) == "ADDLANGDEFINE" && l.args.size() > 5 && upper(l.args.back()) == want) tsc = std::atoi(l.args[2].c_str());
     });
     char name[32];
     std::snprintf(name, sizeof name, "trtext\\tt%02d.pc", tsc);

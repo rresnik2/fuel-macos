@@ -96,6 +96,30 @@ int runMenuCheck(const std::string& dataDir, const std::string& language) {
             }
             problems.push_back("font " + assets.font(f).name + " lacks glyphs:" + list);
         }
+    // The other text tables: every string the pages use must draw in its font.
+    for (const char* lang : {"en", "fr", "de", "es", "it", "en-uk"}) {
+        const TextTable t = loadText(dataDir, lang);
+        size_t refs = 0, missing = 0;
+        std::set<uint32_t> lacks;
+        for (const Page& p : ms.pages)
+            for (const Item& it : p.items) {
+                std::vector<uint32_t> ids;
+                if (it.isText() && it.tt) ids.push_back(it.tt);
+                for (const ListEntry& e : it.entries) ids.push_back(e.tt);
+                for (uint32_t id : ids) {
+                    ++refs;
+                    const std::string* s = t.get(id);
+                    if (!s) {
+                        ++missing;
+                        continue;
+                    }
+                    for (uint32_t c : utf8Codes(*s))
+                        if (c >= 0x20 && c != '^' && !assets.font(it.font).glyph(c)) lacks.insert(c);
+                }
+            }
+        std::printf("menu check: %-5s %s: %zu text refs, %zu not in the table, %zu characters without a glyph\n", lang, t.file.c_str(), refs, missing, lacks.size());
+        if (!lacks.empty()) problems.push_back(std::string(lang) + ": characters without a glyph");
+    }
     for (const std::string& p : problems) std::printf("menu check: %s\n", p.c_str());
     std::printf("menu check: %zu pages, %zu items, %zu text refs (%zu strings in %s), %zu image refs (%zu names in no DPC), fonts %s %zu glyphs / %s %zu glyphs\n",
                 ms.pages.size(), items, texts, text.strings.size(), text.file.c_str(), images, absentImages, assets.font(0).name.c_str(),
