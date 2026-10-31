@@ -149,6 +149,7 @@ public:
         Vec3 dir0{0, 0, 1}, dir2{0, 0, 1};         // +0x1000, +0x1018
     };
     Steer& steer() { return st_; }
+    const Steer& steer() const { return st_; }
     // Exposed so the vector check can drive single functions (0x52e830, 0x524710, 0x521f80, 0x52bb60).
     void steerChannels(float dt);   // 0x52e830 (channels part)
     void steerAngle(float dt);      // 0x524710

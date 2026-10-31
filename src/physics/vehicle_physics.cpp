@@ -12,7 +12,6 @@
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayerInterfaceTable.h>
 #include <Jolt/Physics/Collision/BroadPhase/ObjectVsBroadPhaseLayerFilterTable.h>
 #include <Jolt/Physics/Collision/CastResult.h>
-#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
@@ -24,17 +23,18 @@
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
-#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/PhysicsSystem.h>
-#include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
-#include <Jolt/Physics/Vehicle/VehicleConstraint.h>
-#include <Jolt/Physics/Vehicle/MotorcycleController.h>
-#include <Jolt/Physics/Vehicle/WheeledVehicleController.h>
+#include <Jolt/Physics/Collision/CollideShape.h>
 // clang-format on
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <cmath>
 #include <future>
 #include <mutex>
@@ -76,51 +76,49 @@ SurfaceQuery& defaultSurfaceQuery() {
     return q;
 }
 
-// Notes how each vehicle's chassis body touches the world (terrain, objects and other
-// vehicles): the fastest sliding speed along a contact and the fastest normal speed of a
-// new contact. Wheels do not count (they are ray casts, not contacts).
-class ChassisContacts : public ContactListener {
-public:
-    void track(BodyID car) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        values_[car.GetIndexAndSequenceNumber()] = {0, 0};
-    }
-    void untrack(BodyID car) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        values_.erase(car.GetIndexAndSequenceNumber());
-    }
-    void reset() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [id, v] : values_) v = {0, 0};
-    }
-    void read(BodyID car, float& scrape, float& impact) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = values_.find(car.GetIndexAndSequenceNumber());
-        scrape = it == values_.end() ? 0.0f : it->second.first;
-        impact = it == values_.end() ? 0.0f : it->second.second;
-    }
-    void OnContactAdded(const Body& a, const Body& b, const ContactManifold& m, ContactSettings&) override { note(a, b, m, true); }
-    void OnContactPersisted(const Body& a, const Body& b, const ContactManifold& m, ContactSettings&) override { note(a, b, m, false); }
+DriveWorld::WaterDepthQuery& defaultWaterQuery() {
+    static DriveWorld::WaterDepthQuery q;
+    return q;
+}
 
-private:
-    void note(const Body& a, const Body& b, const ContactManifold& m, bool added) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto ia = values_.find(a.GetID().GetIndexAndSequenceNumber());
-        auto ib = values_.find(b.GetID().GetIndexAndSequenceNumber());
-        if (ia == values_.end() && ib == values_.end()) return;
-        const RVec3 p = m.GetWorldSpaceContactPointOn1(0);
-        const Vec3 v = a.GetPointVelocity(p) - b.GetPointVelocity(p);
-        const float vn = v.Dot(m.mWorldSpaceNormal);
-        const float vt = (v - m.mWorldSpaceNormal * vn).Length();
-        for (auto it : {ia, ib}) {
-            if (it == values_.end()) continue;
-            it->second.first = std::max(it->second.first, vt);
-            if (added) it->second.second = std::max(it->second.second, std::fabs(vn));
+// Ground tables (pp001.tsc PP 4000-4398) by file, read once.
+std::shared_ptr<const fv::GroundTables> groundTablesNear(const std::string& dpcPath) {
+    static std::mutex mu;
+    static std::map<std::string, std::shared_ptr<const fv::GroundTables>> cache;
+    namespace fs = std::filesystem;
+    fs::path dir = fs::path(dpcPath).parent_path();
+    for (int up = 0; up < 6 && !dir.empty(); ++up, dir = dir.parent_path()) {
+        const fs::path f = dir / "CommonComponent" / "Param" / "pp001.tsc";
+        if (!fs::exists(f)) continue;
+        std::lock_guard<std::mutex> lock(mu);
+        auto& t = cache[f.string()];
+        if (!t) {
+            std::ifstream in(f);
+            std::stringstream text;
+            text << in.rdbuf();
+            t = std::make_shared<fv::GroundTables>(fv::parseGroundTables(text.str()));
         }
+        return t;
     }
-    mutable std::mutex mutex_;
-    std::unordered_map<uint32_t, std::pair<float, float>> values_;  // body -> (scrape, impact)
-};
+    return nullptr;
+}
+
+// FUEL's 18 ground classes from the port's surface types (approximation until the ground generator's class
+// fractions, 0x6b76a0, are ported: notes p24 "Ground classes"). Class 0 = tarmac road, 1 = dirt road,
+// 3 = bare earth, 5 = rock, 7 = grass, 8 = mud, 9 = sand, 17 = snow.
+int physicsGroundClass(int surfaceType) {
+    if (surfaceType == 13) return 1;  // DIRT_FLAT: the port's dirt-road surface
+    switch (gripCategory(surfaceType)) {
+    case GripCategory::Tarmac: return 0;
+    case GripCategory::Dirt: return 3;
+    case GripCategory::Grass: return 7;
+    case GripCategory::Sand: return 9;
+    case GripCategory::Snow: return 17;
+    case GripCategory::Mud: return 8;
+    case GripCategory::Rock: return 5;
+    default: return 3;
+    }
+}
 
 }  // namespace
 
@@ -193,10 +191,10 @@ VehicleSetup makeVehicleSetup(const DpcFile& dpc, const std::string& variant, co
     s.reverseGear = -std::fabs(param(vp::ReverseGear));
     s.finalDrive = param(vp::FinalDrive);
     s.topSpeedKmh = param(vp::TopSpeedKmh);
-    // FUEL's torque scale (P327) is in unknown units; size the engine for an
-    // arcade 1.3 g launch in first gear instead (0.9 g felt sluggish).
-    const float r = s.wheels.back().radius;
-    s.peakTorque = 1.3f * kGravity * s.mass * r / (s.finalDrive * s.gears[0]);
+    s.peakTorque = param(vp::TorqueScale);  // FUEL's torque scale (engine accel units, see notes p23 8.1)
+    s.params = p;
+    s.proxy = proxy;
+    s.ground = groundTablesNear(dpc.path());
     return s;
 }
 
@@ -211,15 +209,13 @@ struct DriveWorld::Impl {
     std::unique_ptr<ObjectVsBroadPhaseLayerFilterTable> objectVsBroadPhase;
     PhysicsSystem physics;
 
-    // Terrain patches: heightfield bodies ~2 km across. Vehicles near each other share
-    // one; a vehicle that strays kPatchReach from every patch centre gets its own, and
-    // patches no vehicle is near are dropped. They overlap where they meet (same heights).
+    // Terrain patches for the props (Jolt heightfield bodies ~383 m across that follow the vehicles; the
+    // vehicles themselves touch FUEL's terrain triangles, fv::TerrainTriangles).
     struct Patch {
         BodyID body;
         double x = 0, z = 0;  // centre
     };
     std::vector<Patch> patches;
-    // Patches resampled on a worker thread ahead of need (a rebuild took ~12 ms).
     struct PendingPatch {
         std::future<RefConst<Shape>> shape;
         double x0 = 0, z0 = 0;
@@ -229,7 +225,6 @@ struct DriveWorld::Impl {
     std::unordered_map<uint32_t, RefConst<Shape>> staticShapes;
     std::map<std::pair<uint32_t, std::array<double, 16>>, BodyID> staticBodies;
 
-    // Dynamic props: shapes by key (with their mass), bodies by prop id.
     struct PropShape {
         RefConst<Shape> shape;
         float mass = 5;
@@ -244,32 +239,40 @@ struct DriveWorld::Impl {
     };
     std::unordered_map<uint32_t, Prop> props;
 
-    // One simulated vehicle (index 0 is the player). Heap-allocated: the tyre callback keeps a pointer.
+    // One vehicle (index 0 is the player): FUEL's model plus a kinematic Jolt body of its proxy that
+    // pushes the props.
     struct Vehicle {
         VehicleSetup setup;
-        BodyID car;
-        Ref<VehicleConstraint> constraint;
-        Ref<VehicleCollisionTester> tester;
+        std::unique_ptr<fv::FuelVehicle> model;
         DriveInput input;
-        float upsideDownTime = 0;
-        int lastWheelsOnGround = 4;
-        // Surfaces: type under each wheel, its smoothed grip scale (read by the tyre callback)
-        // and the suspension length last step (for the compression speed).
+        BodyID kin;
+        std::vector<int> wheelMap;  // setup wheel -> FUEL wheel
         std::vector<int> wheelSurface;
-        std::vector<float> wheelGrip, wheelCompression, prevSuspension;
+        std::vector<float> wheelCompression, prevLoad;
+        struct Crumb {
+            double x, z;
+            float yaw;
+        };
+        std::deque<Crumb> crumbs;  // respawn breadcrumbs (0x528830, simplified)
+        float crumbTimer = 0;
     };
     std::vector<std::unique_ptr<Vehicle>> vehicles;
     float accumulator = 0;
     SurfaceQuery surfaceQuery = defaultSurfaceQuery();
-    ChassisContacts contacts;
+    DriveWorld::WaterDepthQuery waterQuery = defaultWaterQuery();
 
-    explicit Impl(const Heightfield& hf) : terrain(hf) {
-        layerPairs.EnableCollision(kMoving, kStatic);
-        layerPairs.EnableCollision(kMoving, kMoving);
+    // FUEL's model runs in local coordinates around an origin (multiple of 1024 m, so the 4 m terrain cells
+    // stay aligned) that follows the player: floats keep millimetre precision anywhere in the 140 km world.
+    double ox = 0, oz = 0;
+    bool originSet = false;
+    fv::TerrainTriangles tris;
+    fv::Environment env;
+    float stepMs = 0, vehicleMs = 0;
+
+    explicit Impl(const Heightfield& hf) : terrain(hf), tris([&hf](double x, double z) { return hf.smoothHeightAt(x, z); }) {
+        layerPairs.EnableCollision(kMoving, kProp);
         layerPairs.EnableCollision(kProp, kStatic);
-        layerPairs.EnableCollision(kProp, kMoving);
         layerPairs.EnableCollision(kProp, kProp);
-        layerPairs.EnableCollision(kWheel, kStatic);
         broadPhaseLayers.MapObjectToBroadPhaseLayer(kStatic, BroadPhaseLayer(0));
         broadPhaseLayers.MapObjectToBroadPhaseLayer(kMoving, BroadPhaseLayer(1));
         broadPhaseLayers.MapObjectToBroadPhaseLayer(kProp, BroadPhaseLayer(1));
@@ -277,20 +280,52 @@ struct DriveWorld::Impl {
         objectVsBroadPhase = std::make_unique<ObjectVsBroadPhaseLayerFilterTable>(broadPhaseLayers, 2, layerPairs, 4);
         physics.Init(8192, 0, 8192, 8192, broadPhaseLayers, *objectVsBroadPhase, layerPairs);
         physics.SetGravity(Vec3(0, -kGravity, 0));
-        physics.SetContactListener(&contacts);
+        env.terrain = &tris;
+        env.sphereStatics = [this](const fv::Vec3& c, float r, std::vector<fv::StaticHit>& out) { collideStatics(new SphereShape(r), c, fv::Quat{}, out); };
+        env.boxStatics = [this](const fv::Vec3& c, const fv::Quat& q, const fv::Vec3& half, std::vector<fv::StaticHit>& out) {
+            collideStatics(new BoxShape(Vec3(std::max(half.x, 0.06f), std::max(half.y, 0.06f), std::max(half.z, 0.06f)), 0.05f), c, q, out);
+        };
+        env.waterDepthAt = [this](double x, double z) { return waterQuery ? waterQuery(x, z) : 0.0f; };
+        env.groundClasses = [this](double x, double z, float frac[fv::kGroundClasses], float& sink) {
+            const int t = surfaceQuery ? surfaceQuery(x, z) : -1;
+            frac[physicsGroundClass(t)] = 1;
+            sink = 0;
+        };
     }
 
     BodyInterface& bodies() { return physics.GetBodyInterface(); }
 
-    // A heightfield body covering ~2 km around (x, z), resampled from the
-    // world map with the same B-spline the renderer uses.
+    // ---- static objects for FUEL's contacts (0x723400 / 0x723b80 / 0x724120 query the scene's boxes,
+    // spheres and mesh triangles; the port asks Jolt for the placed objects' shapes) ----
+    void collideStatics(Shape* shapeRaw, const fv::Vec3& c, const fv::Quat& q, std::vector<fv::StaticHit>& out) {
+        RefConst<Shape> shape = shapeRaw;
+        const RMat44 at = RMat44::sRotationTranslation(Quat(q.x, q.y, q.z, q.w), RVec3(double(c.x) + ox, double(c.y), double(c.z) + oz));
+        CollideShapeSettings settings;
+        settings.mActiveEdgeMode = EActiveEdgeMode::CollideOnlyWithActive;
+        AllHitCollisionCollector<CollideShapeCollector> hits;
+        physics.GetNarrowPhaseQuery().CollideShape(shape, Vec3::sReplicate(1.0f), at, settings, RVec3::sZero(), hits,
+                                                   SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)), SpecifiedObjectLayerFilter(kStatic),
+                                                   NotTerrainFilter());
+        for (const CollideShapeResult& h : hits.mHits) {
+            if (!(h.mPenetrationDepth > 0)) continue;
+            const Vec3 axis = h.mPenetrationAxis.NormalizedOr(Vec3::sAxisY());
+            fv::StaticHit s;
+            s.n = {-axis.GetX(), -axis.GetY(), -axis.GetZ()};  // pushes the query shape out
+            s.depth = h.mPenetrationDepth;
+            s.p = {float(double(h.mContactPointOn2.GetX()) - ox), float(h.mContactPointOn2.GetY()), float(double(h.mContactPointOn2.GetZ()) - oz)};
+            out.push_back(s);
+        }
+    }
+    class NotTerrainFilter : public BodyFilter {
+    public:
+        bool ShouldCollideLocked(const Body& body) const override { return body.GetShape()->GetSubType() != EShapeSubType::HeightField; }
+    };
+
+    // ---- terrain patches (props only) ----
     static constexpr double kPatchHalf = 0.5 * kPatchSpacing * (kPatchSamples - 1);
     static double patchOrigin(double v) { return std::round((v - kPatchHalf) / kPatchSpacing) * kPatchSpacing; }
-
-    // The heightfield shape of the patch with corner (x0, z0); thread-safe.
     static RefConst<Shape> makePatchShape(const Heightfield& terrain, double x0, double z0) {
         std::vector<float> samples(size_t(kPatchSamples) * kPatchSamples);
-        // Rows on four threads (the procedural ground costs ~10 us a point).
         constexpr uint32_t kThreads = 4;
         std::vector<std::future<void>> jobs;
         for (uint32_t t = 0; t < kThreads; ++t)
@@ -305,32 +340,22 @@ struct DriveWorld::Impl {
         if (result.HasError()) throw std::runtime_error(std::string("terrain patch: ") + result.GetError().c_str());
         return result.Get();
     }
-
     void addPatchBody(RefConst<Shape> shape, double x0, double z0) {
         BodyCreationSettings bs(shape, RVec3(x0, 0, z0), Quat::sIdentity(), EMotionType::Static, kStatic);
         bs.mFriction = 0.9f;
         patches.push_back({bodies().CreateAndAddBody(bs, EActivation::DontActivate), x0 + kPatchHalf, z0 + kPatchHalf});
     }
-
-    void buildTerrainPatch(double x, double z) {
-        const double x0 = patchOrigin(x), z0 = patchOrigin(z);
-        addPatchBody(makePatchShape(terrain, x0, z0), x0, z0);
-    }
-
     bool onPatch(double x, double z, double reach) const {
         for (const Patch& p : patches)
             if (std::hypot(x - p.x, z - p.z) <= reach) return true;
         return false;
     }
-
     bool patchPending(double x, double z, double reach) const {
         for (const PendingPatch& p : pendingPatches)
             if (std::hypot(x - (p.x0 + kPatchHalf), z - (p.z0 + kPatchHalf)) <= reach) return true;
         return false;
     }
-
-    // Every vehicle within kPatchReach of a patch centre; patches far from all vehicles go.
-    // A vehicle heading out of its patch gets the next one prepared in the background.
+    // Patches are needed only where props are awake near a vehicle: built in the background ahead of need.
     void updatePatches() {
         for (auto it = pendingPatches.begin(); it != pendingPatches.end();) {
             if (it->shape.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
@@ -340,23 +365,14 @@ struct DriveWorld::Impl {
             addPatchBody(it->shape.get(), it->x0, it->z0);
             it = pendingPatches.erase(it);
         }
+        if (props.empty()) return;
         constexpr double kPrefetch = kPatchReach * 0.6;
         for (const auto& v : vehicles) {
-            if (v->car.IsInvalid()) continue;
-            const RVec3 pos = bodies().GetPosition(v->car);
-            const double x = pos.GetX(), z = pos.GetZ();
-            if (!onPatch(x, z, kPatchReach)) {
-                // Out of reach and nothing usable ready: wait for a pending one nearby, else build now.
-                bool waited = false;
-                for (auto it = pendingPatches.begin(); it != pendingPatches.end(); ++it)
-                    if (std::hypot(x - (it->x0 + kPatchHalf), z - (it->z0 + kPatchHalf)) <= kPatchReach) {
-                        addPatchBody(it->shape.get(), it->x0, it->z0);
-                        pendingPatches.erase(it);
-                        waited = true;
-                        break;
-                    }
-                if (!waited) buildTerrainPatch(x, z);
-            } else if (!onPatch(x, z, kPrefetch) && !patchPending(x, z, kPrefetch)) {
+            const fv::Vec3 o = v->model->modelOrigin();
+            const double x = double(o.x) + ox, z = double(o.z) + oz;
+            // Never block the frame: a missing patch is built in the background (asleep props wait; one that
+            // falls meanwhile is lifted back by changedProps).
+            if (!onPatch(x, z, kPrefetch) && !patchPending(x, z, kPatchReach * 0.5)) {
                 const double x0 = patchOrigin(x), z0 = patchOrigin(z);
                 pendingPatches.push_back({std::async(std::launch::async, [&t = terrain, x0, z0] { return makePatchShape(t, x0, z0); }), x0, z0});
             }
@@ -364,9 +380,8 @@ struct DriveWorld::Impl {
         for (auto it = patches.begin(); it != patches.end();) {
             bool used = false;
             for (const auto& v : vehicles) {
-                if (v->car.IsInvalid()) continue;
-                const RVec3 pos = bodies().GetPosition(v->car);
-                used = used || std::hypot(double(pos.GetX()) - it->x, double(pos.GetZ()) - it->z) <= kPatchKeep;
+                const fv::Vec3 o = v->model->modelOrigin();
+                used = used || std::hypot(double(o.x) + ox - it->x, double(o.z) + oz - it->z) <= kPatchKeep;
             }
             if (used) {
                 ++it;
@@ -378,267 +393,168 @@ struct DriveWorld::Impl {
         }
     }
 
-    void createVehicle(Vehicle& v, RVec3 position, Quat rotation) {
-        const VehicleSetup& s = v.setup;
+    // ---- local origin ----
+    void setOrigin(double x, double z) {
+        const double nx = std::round(x / 1024.0) * 1024.0, nz = std::round(z / 1024.0) * 1024.0;
+        if (originSet && nx == ox && nz == oz) return;
+        const fv::Vec3 shift{float(ox - nx), 0, float(oz - nz)};
+        for (auto& v : vehicles) {
+            fv::RigidBody& b = v->model->body();
+            for (fv::BodyState* s : {&b.S, &b.P, &b.N}) s->x += shift;
+        }
+        ox = nx, oz = nz;
+        originSet = true;
+        tris.setOrigin(ox, oz);
+        env.originX = ox, env.originZ = oz;
+    }
+    fv::Vec3 local(double x, double y, double z) const { return {float(x - ox), float(y), float(z - oz)}; }
+
+    // ---- vehicles ----
+    static std::vector<int> wheelMap(const VehicleSetup& s) {
+        std::vector<int> m;
+        for (const auto& w : s.wheels) {
+            if (s.bike)
+                m.push_back(w.front ? 0 : 1);
+            else
+                m.push_back(w.front ? (w.hub[0] > 0 ? 0 : 2) : (w.hub[0] > 0 ? 1 : 3));
+        }
+        return m;
+    }
+
+    void createModel(Vehicle& v) {
+        fv::ProxyShapes proxy;
+        for (const ProxySphere& sp : v.setup.proxy.spheres) proxy.spheres.push_back({{sp.centre[0], sp.centre[1], sp.centre[2]}, sp.radius, sp.name});
+        for (const ProxyBox& b : v.setup.proxy.boxes)
+            proxy.boxes.push_back({{b.centre[0], b.centre[1], b.centre[2]}, {b.halfExtents[0], b.halfExtents[1], b.halfExtents[2]}});
+        const bool player = &v == vehicles.front().get() || vehicles.empty();
+        v.model = std::make_unique<fv::FuelVehicle>(v.setup.params, proxy, v.setup.ground.get(), player);
+        v.wheelMap = wheelMap(v.setup);
+        v.wheelSurface.assign(v.setup.wheels.size(), -1);
+        v.wheelCompression.assign(v.setup.wheels.size(), 0.0f);
+        v.prevLoad.assign(v.setup.wheels.size(), 0.0f);
+        // Kinematic Jolt body: the proxy boxes and wheel spheres, in model space (body origin = model origin).
+        destroyKinematic(v);
         StaticCompoundShapeSettings compound;
-        float boxTop = 0;
-        for (const VehicleSetup::Box& b : s.chassis) {
-            const Vec3 half = Vec3::sMax(toVec3(b.halfExtents), Vec3::sReplicate(0.06f));
-            compound.AddShape(toVec3(b.centre), Quat::sIdentity(), new BoxShape(half, 0.05f));
-            boxTop = std::max(boxTop, b.centre[1]);
+        for (const VehicleSetup::Box& b : v.setup.chassis)
+            compound.AddShape(toVec3(b.centre), Quat::sIdentity(), new BoxShape(Vec3::sMax(toVec3(b.halfExtents), Vec3::sReplicate(0.06f)), 0.05f));
+        for (const auto& w : v.setup.wheels) compound.AddShape(toVec3(w.hub), Quat::sIdentity(), new SphereShape(w.radius));
+        auto shape = compound.Create();
+        if (!shape.HasError()) {
+            BodyCreationSettings bs(shape.Get(), RVec3::sZero(), Quat::sIdentity(), EMotionType::Kinematic, kMoving);
+            bs.mAllowSleeping = false;
+            v.kin = bodies().CreateAndAddBody(bs, EActivation::Activate);
         }
-        // Arcade stability: put the centre of mass down near the axles.
-        const float hubY = s.wheels[0].hub[1];
-        auto compoundShape = compound.Create().Get();
-        const float comY = compoundShape->GetCenterOfMass().GetY();
-        auto shape = OffsetCenterOfMassShapeSettings(Vec3(0, (hubY + 0.1f) - comY, 0), compoundShape).Create().Get();
-
-        BodyCreationSettings bs(shape, position, rotation, EMotionType::Dynamic, kMoving);
-        bs.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
-        bs.mMassPropertiesOverride.mMass = s.mass;
-        bs.mAllowSleeping = false;
-        bs.mAngularDamping = 0.3f;
-        bs.mMotionQuality = EMotionQuality::LinearCast;  // no tunnelling into objects at speed
-        v.car = bodies().CreateAndAddBody(bs, EActivation::Activate);
-
-        VehicleConstraintSettings vs;
-        vs.mUp = Vec3::sAxisY();
-        vs.mForward = Vec3::sAxisZ();
-        vs.mMaxPitchRollAngle = JPH_PI;  // FUEL lets vehicles roll over
-        const bool heavy = s.mass > 2500;
-        for (const VehicleSetup::Wheel& w : s.wheels) {
-            auto* ws = new WheelSettingsWV;
-            const float travel = std::clamp(w.radius * 0.9f, 0.18f, 0.9f);
-            // The suspension hangs from above the hub so the wheel rests near
-            // its authored position.
-            // Bikes: a raked front fork (25 degrees of caster) steering about its own axis.
-            const Vec3 dir = s.bike && w.front ? Vec3(0, -1, std::tan(0.44f)).Normalized() : Vec3(0, -1, 0);
-            ws->mPosition = toVec3(w.hub) - dir * (0.6f * travel);
-            ws->mSuspensionDirection = dir;
-            ws->mSteeringAxis = -dir;
-            ws->mSuspensionMinLength = 0.02f;
-            ws->mSuspensionMaxLength = travel;
-            ws->mSuspensionSpring.mFrequency = heavy ? 1.1f : 1.6f;
-            ws->mSuspensionSpring.mDamping = 0.55f;
-            ws->mRadius = w.radius;
-            ws->mWidth = w.width;
-            // Jolt's default inertia suits a 20 kg car wheel; size it for this one (solid disc).
-            const float wheelMass = std::clamp(s.mass * 0.02f, 8.0f, 200.0f);
-            ws->mInertia = 0.5f * wheelMass * w.radius * w.radius;
-            ws->mMaxSteerAngle = w.front ? (s.bike ? 0.45f : 0.6f) : 0.0f;
-            const float brake = s.mass * kGravity * w.radius * 0.6f;
-            ws->mMaxBrakeTorque = brake;
-            ws->mMaxHandBrakeTorque = w.front ? 0.0f : brake * 2.0f;
-            // Off-road tyres: forgiving peak, gentle fall-off when sliding.
-            ws->mLongitudinalFriction.Clear();
-            ws->mLongitudinalFriction.AddPoint(0.0f, 0.0f);
-            ws->mLongitudinalFriction.AddPoint(0.08f, 1.25f);
-            ws->mLongitudinalFriction.AddPoint(0.3f, 1.05f);
-            ws->mLongitudinalFriction.AddPoint(1.0f, 0.9f);
-            ws->mLateralFriction.Clear();
-            ws->mLateralFriction.AddPoint(0.0f, 0.0f);
-            ws->mLateralFriction.AddPoint(4.0f, 1.2f);
-            ws->mLateralFriction.AddPoint(20.0f, 1.0f);
-            ws->mLateralFriction.AddPoint(90.0f, 0.85f);
-            vs.mWheels.push_back(ws);
-        }
-        if (!s.bike) vs.mAntiRollBars.resize(2);
-        if (!s.bike) {
-            vs.mAntiRollBars[0].mLeftWheel = 0;
-            vs.mAntiRollBars[0].mRightWheel = 1;
-            vs.mAntiRollBars[1].mLeftWheel = 2;
-            vs.mAntiRollBars[1].mRightWheel = 3;
-        }
-        for (auto& bar : vs.mAntiRollBars) bar.mStiffness = s.mass * 0.7f;  // Jolt's reference: ~1000 N/m for a 1500 kg car
-
-        // Bikes use Jolt's motorcycle controller, which leans the bike into turns.
-        auto* cs = s.bike ? new MotorcycleControllerSettings : new WheeledVehicleControllerSettings;
-        cs->mEngine.mMaxTorque = s.peakTorque;
-        cs->mEngine.mMinRPM = s.idleRpm;
-        cs->mEngine.mMaxRPM = s.maxRpm;
-        // Jolt's defaults suit a car engine; scale friction and inertia to this one.
-        cs->mEngine.mAngularDamping = s.peakTorque * 0.0004f;
-        cs->mEngine.mInertia = std::max(0.02f, s.peakTorque * 0.002f);
-        cs->mEngine.mNormalizedTorque.Clear();
-        for (int i = 0; i < 11; ++i)  // FUEL cuts torque to 0 at the limiter; keep some so Jolt can hold redline
-            // and a floor so the mid-range pulls (the raw curves sag and the auto box lands there).
-            cs->mEngine.mNormalizedTorque.AddPoint(i * 0.1f, std::max(s.torqueCurve[size_t(i)], i == 10 ? 0.5f : i >= 2 ? 0.7f : 0.4f));
-        cs->mTransmission.mMode = ETransmissionMode::Auto;
-        // Jolt's car defaults take ~0.8 s per shift with no drive; arcade shifts are near instant.
-        cs->mTransmission.mSwitchTime = 0.12f;
-        cs->mTransmission.mClutchReleaseTime = 0.08f;
-        cs->mTransmission.mSwitchLatency = 0.3f;
-        cs->mTransmission.mClutchStrength = std::max(10.0f, s.peakTorque * 0.2f);  // grip in proportion to the engine
-        cs->mTransmission.mGearRatios.clear();
-        for (float g : s.gears) cs->mTransmission.mGearRatios.push_back(g);
-        cs->mTransmission.mReverseGearRatios = {s.reverseGear};
-        cs->mTransmission.mShiftUpRPM = s.maxRpm * 0.85f;
-        cs->mTransmission.mShiftDownRPM = s.idleRpm + (s.maxRpm - s.idleRpm) * 0.3f;
-        auto addDiff = [&](uint32_t left, uint32_t right, float share) {
-            VehicleDifferentialSettings d;
-            d.mLeftWheel = int(left);
-            d.mRightWheel = int(right);
-            d.mDifferentialRatio = s.finalDrive;
-            d.mEngineTorqueRatio = share;
-            cs->mDifferentials.push_back(d);
-        };
-        if (s.bike) {
-            addDiff(uint32_t(-1), 1, 1.0f);  // rear wheel only (no left wheel)
-        } else {
-            const float share = s.frontDriven && s.rearDriven ? 0.5f : 1.0f;
-            if (s.frontDriven) addDiff(0, 1, share);
-            if (s.rearDriven) addDiff(2, 3, share);
-        }
-        vs.mController = cs;
-
-        v.constraint = new VehicleConstraint(*physics.GetBodyLockInterface().TryGetBody(v.car), vs);
-        v.tester = new VehicleCollisionTesterCastCylinder(kWheel, s.bike ? 1.0f : 0.1f);  // bikes: rounded tyres
-        v.constraint->SetVehicleCollisionTester(v.tester);
-        // Per-wheel tyre grip: the surface under each wheel scales both friction impulses.
-        v.wheelSurface.assign(s.wheels.size(), -1);
-        v.wheelGrip.assign(s.wheels.size(), 1.0f);
-        v.wheelCompression.assign(s.wheels.size(), 0.0f);
-        v.prevSuspension.assign(s.wheels.size(), -1.0f);
-        contacts.track(v.car);
-        Vehicle* vp = &v;
-        static_cast<WheeledVehicleController*>(v.constraint->GetController())
-            ->SetTireMaxImpulseCallback([vp](uint wheel, float& longitudinal, float& lateral, float suspensionImpulse, float longitudinalFriction,
-                                             float lateralFriction, float, float, float) {
-                const float grip = wheel < vp->wheelGrip.size() ? vp->wheelGrip[wheel] : 1.0f;
-                longitudinal = longitudinalFriction * suspensionImpulse * grip;
-                lateral = lateralFriction * suspensionImpulse * grip;
-            });
-        physics.AddConstraint(v.constraint);
-        physics.AddStepListener(v.constraint);
+    }
+    void destroyKinematic(Vehicle& v) {
+        if (v.kin.IsInvalid()) return;
+        bodies().RemoveBody(v.kin);
+        bodies().DestroyBody(v.kin);
+        v.kin = BodyID();
     }
 
-    void destroyVehicle(Vehicle& v) {
-        if (v.car.IsInvalid()) return;
-        physics.RemoveStepListener(v.constraint);
-        physics.RemoveConstraint(v.constraint);
-        v.constraint = nullptr;
-        contacts.untrack(v.car);
-        bodies().RemoveBody(v.car);
-        bodies().DestroyBody(v.car);
-        v.car = BodyID();
+    // World pose of the model origin (FUEL's body is at the centre of mass).
+    void modelPose(const Vehicle& v, RVec3& pos, Quat& rot) const {
+        const fv::Vec3 o = v.model->modelOrigin();
+        const fv::Quat q = v.model->body().S.q;
+        pos = RVec3(double(o.x) + ox, double(o.y), double(o.z) + oz);
+        rot = Quat(q.x, q.y, q.z, q.w).Normalized();
     }
 
-    // Places a vehicle on its wheels at (x, z) with the given heading.
     void place(Vehicle& v, double x, double z, float yaw) {
-        if (!onPatch(x, z, kPatchReach)) buildTerrainPatch(x, z);
-        const double ground = terrain.smoothHeightAt(x, z);
-        destroyVehicle(v);
-        createVehicle(v, RVec3(x, ground + 0.4, z), Quat::sRotation(Vec3::sAxisY(), yaw));
-        v.upsideDownTime = 0;
-        v.lastWheelsOnGround = int(v.setup.wheels.size());
+        if (&v == vehicles.front().get() || !originSet) setOrigin(x, z);
+        v.model->resetTo(local(x, 0, z), yaw, env);
+        v.crumbs.clear();
+        v.crumbTimer = 0;
+        if (!v.kin.IsInvalid()) {
+            RVec3 p;
+            Quat q;
+            modelPose(v, p, q);
+            bodies().SetPositionAndRotation(v.kin, p, q, EActivation::Activate);
+        }
     }
 
-    static int wheelsOnGround(const Vehicle& v) {
-        int n = 0;
-        for (const Wheel* w : v.constraint->GetWheels()) n += w->HasContact() ? 1 : 0;
-        return n;
+    float yawOf(const Vehicle& v) const {
+        const fv::Vec3 f = fv::rotate(v.model->body().S.q, {0, 0, 1});
+        return std::atan2(f.x, f.z);
     }
 
-    // Looks up the surface under each wheel's contact point; the tyre grip follows it
-    // (smoothed over a few steps) and soft ground adds rolling resistance.
-    void updateSurfaces(Vehicle& v, const Vec3& vel) {
-        const auto& wheels = v.constraint->GetWheels();
-        float crr = 0;
-        for (size_t i = 0; i < wheels.size() && i < v.wheelSurface.size(); ++i) {
-            const Wheel* w = wheels[i];
-            const float len = w->GetSuspensionLength();
-            v.wheelCompression[i] = v.prevSuspension[i] >= 0 ? (v.prevSuspension[i] - len) / kStep : 0.0f;
-            v.prevSuspension[i] = len;
-            int type = -1;
-            if (w->HasContact()) {
-                const RVec3 c = w->GetContactPosition();
-                type = surfaceQuery ? surfaceQuery(double(c.GetX()), double(c.GetZ())) : -1;
-                crr += rollingResistance(gripCategory(type));
-                v.wheelGrip[i] += (surfaceGrip(type) - v.wheelGrip[i]) * 0.25f;
+    // Respawn (0x529410 -> 0x5288d0(10 m) + 0x5273b0): the newest breadcrumb farther than 10 m, else in place.
+    void respawn(Vehicle& v) {
+        const fv::Vec3 o = v.model->modelOrigin();
+        const double x = double(o.x) + ox, z = double(o.z) + oz;
+        for (auto it = v.crumbs.rbegin(); it != v.crumbs.rend(); ++it)
+            if (std::hypot(it->x - x, it->z - z) > 10.0) {
+                const Vehicle::Crumb c = *it;
+                place(v, c.x, c.z, c.yaw);
+                return;
             }
-            v.wheelSurface[i] = w->HasContact() ? std::max(type, -1) : -1;
-        }
-        const float horizontal = std::sqrt(vel.GetX() * vel.GetX() + vel.GetZ() * vel.GetZ());
-        if (horizontal > 0.3f && !wheels.empty()) {
-            // crr is summed over wheels on the ground: mean over all wheels = share of the weight carried by them
-            const float drag = v.setup.mass * kGravity * crr / float(wheels.size()) * std::min(1.0f, horizontal / 2.0f);
-            bodies().AddForce(v.car, Vec3(-vel.GetX(), 0, -vel.GetZ()) / horizontal * drag);
-        }
+        place(v, x, z, yawOf(v));
     }
 
-    // Driver input and the arcade helpers for one vehicle, before the physics step.
-    void drive(Vehicle& v) {
-        BodyInterface& bi = bodies();
-        const DriveInput& in = v.input;
-        const Quat rot = bi.GetRotation(v.car);
-        const Vec3 vel = bi.GetLinearVelocity(v.car);
-        const Vec3 forward = rot * Vec3::sAxisZ(), up = rot * Vec3::sAxisY(), right = rot * -Vec3::sAxisX();
-        const float speed = vel.Dot(forward);
-        const int grounded = wheelsOnGround(v);
-
-        // Driver input: brake reverses once nearly stopped.
-        float forwardInput = in.throttle, brakeInput = in.brake;
-        if (in.brake > 0.1f && in.throttle < 0.1f && speed < 1.0f) {
-            forwardInput = -in.brake;
-            brakeInput = 0;
-        }
-        const bool bike = v.setup.bike, light = v.setup.mass < 1000;
-        // Speed-sensitive steering keeps fast driving stable (cars and quads keep more lock
-        // at speed than bikes, which lean instead).
-        const float steerFade = bike ? std::clamp(1.0f / (1.0f + std::fabs(speed) / 22.0f), 0.3f, 1.0f)
-                                     : std::clamp(1.0f / (1.0f + std::fabs(speed) / 50.0f), 0.45f, 1.0f);
-        const float steer = in.steer * steerFade;
-        // Off the throttle: hold still when nearly stopped (no rolling away down a slope),
-        // engine braking above that (port arcade tuning; FUEL's values are not decoded).
-        const bool coasting = grounded >= 2 && in.throttle < 0.05f && in.brake < 0.05f;
-        const bool hold = coasting && std::fabs(speed) < 1.5f;
-        auto* controller = static_cast<WheeledVehicleController*>(v.constraint->GetController());
-        controller->SetDriverInput(forwardInput, steer, brakeInput, in.handbrake || hold ? 1.0f : 0.0f);
-        if (coasting && !hold) bi.AddForce(v.car, -forward * (speed > 0 ? 1.0f : -1.0f) * v.setup.mass * 0.8f);
-
-        Vec3 angular = bi.GetAngularVelocity(v.car);
-        if (grounded == 0) {
-            // Air control: pitch with throttle/brake, yaw and roll with steering.
-            angular += (right * (in.throttle - in.brake) * 3.0f + up * in.steer * 2.0f - forward * in.steer * 1.5f) * kStep;
-        } else if (v.lastWheelsOnGround == 0) {
-            // Landing: absorb the tumble so jumps end on the wheels.
-            angular *= 0.5f;
-        } else if (!bike && grounded >= 2) {
-            // Yaw assist (arcade): pull the turn rate towards what the steering asks for, so the
-            // vehicle turns in at once instead of waiting for the tyres; light ones turn quicker.
-            // With the wheels straight it only damps a lingering spin a little.
-            const float maxYaw = light ? 1.9f : 1.2f;  // rad/s at full lock
-            const float pace = std::clamp(std::fabs(speed) / 6.0f, 0.0f, 1.0f) * (speed < 0 ? -1.0f : 1.0f);
-            const float target = -in.steer * maxYaw * pace * steerFade;  // positive steer turns towards -yaw
-            const float yaw = angular.Dot(up);
-            const float gain = std::fabs(in.steer) > 0.05f ? 4.0f : 1.0f;
-            angular += up * ((target - yaw) * std::min(1.0f, gain * kStep));
-        }
-        bi.SetAngularVelocity(v.car, angular);
-        // A little downforce helps the tyres at speed.
-        bi.AddForce(v.car, -up * v.setup.mass * std::min(std::fabs(speed), 40.0f) * 0.04f);
-        v.lastWheelsOnGround = grounded;
-
-        // Self-righting: back on the wheels after two seconds upside down and slow.
-        v.upsideDownTime = (up.GetY() < 0.3f && vel.Length() < 3.0f) ? v.upsideDownTime + kStep : 0.0f;
-        if (v.upsideDownTime > 2.0f) {
-            resetUpright(v);
-            return;
-        }
-        updateSurfaces(v, vel);
+    void breadcrumbs(Vehicle& v, float dt) {  // 0x528830 / 0x5281c0 (simplified safety test)
+        v.crumbTimer += dt;
+        if (v.crumbTimer < 1.0f) return;
+        v.crumbTimer = 0;
+        const fv::FuelVehicle& m = *v.model;
+        for (int w = 0; w < m.wheelCount(); ++w)
+            if (!(m.wheelLoad(w) > 0)) return;
+        const fv::Vec3 up = fv::rotate(m.body().S.q, {0, 1, 0}), fwd = fv::rotate(m.body().S.q, {0, 0, 1});
+        if (up.y < 0.819f || m.body().S.v.y < -30 || fwd.y < -0.707f || fwd.y > 0.5f || m.wrecked()) return;
+        const fv::Vec3 o = m.modelOrigin();
+        const double x = double(o.x) + ox, z = double(o.z) + oz;
+        if (!v.crumbs.empty() && std::hypot(v.crumbs.back().x - x, v.crumbs.back().z - z) < 10.0) return;
+        v.crumbs.push_back({x, z, yawOf(v)});
+        if (v.crumbs.size() > 32) v.crumbs.pop_front();
     }
 
     void fixedStep() {
-        for (auto& v : vehicles)
-            if (!v->car.IsInvalid()) drive(*v);
-        updatePatches();  // keep terrain under every vehicle
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!vehicles.empty()) {
+            const fv::Vec3 p = vehicles.front()->model->modelOrigin();
+            if (std::fabs(p.x) > 3000 || std::fabs(p.z) > 3000) setOrigin(double(p.x) + ox, double(p.z) + oz);
+        }
+        std::vector<fv::FuelVehicle*> models;
+        for (auto& v : vehicles) {
+            fv::Inputs in;
+            in.accel = std::clamp(v->input.throttle, 0.0f, 1.0f);
+            in.brake = std::clamp(v->input.brake, 0.0f, 1.0f);
+            in.steer = std::clamp(v->input.steer, -1.0f, 1.0f);
+            in.handbrake = v->input.handbrake;
+            v->model->setInputs(in);
+            models.push_back(v->model.get());
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        fv::stepVehicles(models, env, kStep);
+        const auto t2 = std::chrono::steady_clock::now();
+        tris.trim(20000);
+        for (auto& vp : vehicles) {
+            Vehicle& v = *vp;
+            fv::FuelVehicle& m = *v.model;
+            if (m.wantsRespawn()) {
+                m.clearRespawn();
+                respawn(v);
+            }
+            breadcrumbs(v, kStep);
+            for (size_t k = 0; k < v.wheelMap.size(); ++k) {
+                const int w = v.wheelMap[k];
+                const float load = m.wheelLoad(w);
+                v.wheelCompression[k] = (load - v.prevLoad[k]) / kStep;
+                v.prevLoad[k] = load;
+                const fv::Vec3 hub = m.wheel(w).hubW;
+                v.wheelSurface[k] = load > 0 && surfaceQuery ? surfaceQuery(double(hub.x) + ox, double(hub.z) + oz) : -1;
+            }
+            if (!v.kin.IsInvalid()) {
+                RVec3 p;
+                Quat q;
+                modelPose(v, p, q);
+                bodies().MoveKinematic(v.kin, p, q, kStep);
+            }
+        }
+        updatePatches();
         physics.Update(kStep, 1, &temp, &jobs);
-    }
-
-    void resetUpright(Vehicle& v) {
-        const RVec3 pos = bodies().GetPosition(v.car);
-        const Vec3 fwd = bodies().GetRotation(v.car) * Vec3::sAxisZ();
-        place(v, pos.GetX(), pos.GetZ(), std::atan2(fwd.GetX(), fwd.GetZ()));
+        const auto t3 = std::chrono::steady_clock::now();
+        vehicleMs += std::chrono::duration<float, std::milli>(t2 - t1).count();
+        stepMs += std::chrono::duration<float, std::milli>(t3 - t0).count();
     }
 
     Vehicle* at(int i) const { return i >= 0 && size_t(i) < vehicles.size() ? vehicles[size_t(i)].get() : nullptr; }
@@ -651,14 +567,16 @@ DriveWorld::DriveWorld(const Heightfield& terrain) {
 
 DriveWorld::~DriveWorld() {
     if (impl_)
-        for (auto& v : impl_->vehicles) impl_->destroyVehicle(*v);
+        for (auto& v : impl_->vehicles) impl_->destroyKinematic(*v);
 }
 
 int DriveWorld::addVehicle(const VehicleSetup& setup, double x, double z, float yaw) {
     auto v = std::make_unique<Impl::Vehicle>();
     v->setup = setup;
-    impl_->place(*v, x, z, yaw);
+    Impl::Vehicle* raw = v.get();
     impl_->vehicles.push_back(std::move(v));
+    impl_->createModel(*raw);
+    impl_->place(*raw, x, z, yaw);
     return int(impl_->vehicles.size()) - 1;
 }
 
@@ -667,6 +585,7 @@ int DriveWorld::vehicleCount() const { return int(impl_->vehicles.size()); }
 void DriveWorld::replaceVehicle(int i, const VehicleSetup& setup, double x, double z, float yaw) {
     if (Impl::Vehicle* v = impl_->at(i)) {
         v->setup = setup;
+        impl_->createModel(*v);
         impl_->place(*v, x, z, yaw);
     }
 }
@@ -676,7 +595,10 @@ void DriveWorld::placeVehicle(int i, double x, double z, float yaw) {
 }
 
 void DriveWorld::reset(int i) {
-    if (Impl::Vehicle* v = impl_->at(i); v && !v->car.IsInvalid()) impl_->resetUpright(*v);
+    if (Impl::Vehicle* v = impl_->at(i)) {
+        const fv::Vec3 o = v->model->modelOrigin();
+        impl_->place(*v, double(o.x) + impl_->ox, double(o.z) + impl_->oz, impl_->yawOf(*v));
+    }
 }
 
 void DriveWorld::setInput(int i, const DriveInput& input) {
@@ -684,9 +606,9 @@ void DriveWorld::setInput(int i, const DriveInput& input) {
 }
 
 void DriveWorld::update(float dt) {
+    impl_->stepMs = impl_->vehicleMs = 0;
     if (impl_->vehicles.empty()) return;
     impl_->accumulator = std::min(impl_->accumulator + dt, 0.25f);
-    if (impl_->accumulator >= kStep) impl_->contacts.reset();
     while (impl_->accumulator >= kStep) {
         impl_->fixedStep();
         impl_->accumulator -= kStep;
@@ -705,6 +627,25 @@ void DriveWorld::update(float dt, const DriveInput& input) {
     update(dt);
 }
 
+void DriveWorld::nudge(int i, double dy, const std::array<float, 3>& velocity) {
+    if (Impl::Vehicle* v = impl_->at(i)) {
+        fv::RigidBody& b = v->model->body();
+        for (fv::BodyState* s : {&b.S, &b.P, &b.N}) {
+            s->x.y += float(dy);
+            s->v = {velocity[0], velocity[1], velocity[2]};
+        }
+    }
+}
+
+float DriveWorld::lastStepMs() const { return impl_->stepMs; }
+float DriveWorld::lastVehicleMs() const { return impl_->vehicleMs; }
+const fv::FuelVehicle* DriveWorld::model(int i) const {
+    const Impl::Vehicle* v = impl_->at(i);
+    return v ? v->model.get() : nullptr;
+}
+void DriveWorld::setWaterDepthQuery(WaterDepthQuery query) { impl_->waterQuery = std::move(query); }
+void DriveWorld::setDefaultWaterDepthQuery(WaterDepthQuery query) { defaultWaterQuery() = std::move(query); }
+float DriveWorld::waterDepthAt(double x, double z) const { return impl_->waterQuery ? impl_->waterQuery(x, z) : 0.0f; }
 
 bool DriveWorld::hasStaticShape(uint32_t key) const { return impl_->staticShapes.count(key) != 0; }
 
@@ -910,7 +851,7 @@ std::vector<PropPose> DriveWorld::changedProps() {
         if (bi.IsActive(p.body)) {
             // Rescue a prop that still sank through the ground (terrain patch edge, deep embedding).
             const float ground = impl_->terrain.smoothHeightAt(float(pos.GetX()), float(pos.GetZ()));
-            if (impl_->onPatch(pos.GetX(), pos.GetZ(), 1000.0) && pos.GetY() < ground - 1.0f) {
+            if (pos.GetY() < ground - 1.0f) {
                 pos = RVec3(pos.GetX(), ground + 0.3f, pos.GetZ());
                 bi.SetPositionAndRotation(p.body, pos, rot, EActivation::Activate);
                 bi.SetLinearAndAngularVelocity(p.body, Vec3::sZero(), Vec3::sZero());
@@ -933,42 +874,45 @@ std::vector<PropPose> DriveWorld::changedProps() {
 VehicleState DriveWorld::state(int i) const {
     VehicleState st;
     const Impl::Vehicle* v = impl_->at(i);
-    if (v == nullptr || v->car.IsInvalid()) return st;
-    BodyInterface& bi = impl_->bodies();
+    if (v == nullptr || !v->model) return st;
+    const fv::FuelVehicle& m = *v->model;
     RVec3 pos;
     Quat rot;
-    bi.GetPositionAndRotation(v->car, pos, rot);
+    impl_->modelPose(*v, pos, rot);
+    // Bikes: FUEL keeps the physics body upright and leans the drawn body (0x529ce0, P656-P661).
+    if (v->setup.bike && m.visualLean() != 0) rot = (rot * Quat::sRotation(Vec3::sAxisZ(), m.visualLean())).Normalized();
     st.chassis.position = {double(pos.GetX()), double(pos.GetY()), double(pos.GetZ())};
     st.chassis.rotation = {rot.GetX(), rot.GetY(), rot.GetZ(), rot.GetW()};
-    for (uint32_t i = 0; i < v->constraint->GetWheels().size(); ++i) {
-        // Wheel models have their axle along x and the vehicle's right is -x.
-        const RMat44 m = v->constraint->GetWheelWorldTransform(i, -Vec3::sAxisX(), Vec3::sAxisY());
-        const RVec3 t = m.GetTranslation();
-        const Quat q = m.GetQuaternion();
-        st.wheels.push_back({{double(t.GetX()), double(t.GetY()), double(t.GetZ())}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}});
-    }
-    st.speedKmh = bi.GetLinearVelocity(v->car).Dot(rot * Vec3::sAxisZ()) * 3.6f;
-    auto* controller = static_cast<WheeledVehicleController*>(v->constraint->GetController());
-    st.rpm = controller->GetEngine().GetCurrentRPM();
-    st.gear = controller->GetTransmission().GetCurrentGear();
-    st.wheelsOnGround = Impl::wheelsOnGround(*v);
-    // Slip proxy: sideways slip angle (rad) or wheelspin/lock-up ratio beyond what grips normally.
     float skid = 0;
     int touching = 0;
-    for (const Wheel* w : v->constraint->GetWheels()) {
+    for (size_t k = 0; k < v->setup.wheels.size(); ++k) {
+        const int w = v->wheelMap[k];
+        const auto& sw = v->setup.wheels[k];
+        // Drawn wheel: at its hub, dropped by the part of the sphere margin (P55/P56) the contact does not
+        // take up (port choice for the visuals; the engine's visual update 0x5cb8c0 is not decoded).
+        const float margin = m.param(m.front(w) ? 55 : 56);
+        const float droop = std::max(0.0f, margin - m.wheelLoad(w));
+        const Vec3 local(sw.hub[0], sw.hub[1] - droop, sw.hub[2]);
+        const RVec3 wp = pos + rot * local;
+        const Quat wq = rot * Quat::sRotation(Vec3::sAxisY(), m.wheelSteer(w)) * Quat::sRotation(Vec3::sAxisX(), m.wheelSpin(w));
+        st.wheels.push_back({{double(wp.GetX()), double(wp.GetY()), double(wp.GetZ())}, {wq.GetX(), wq.GetY(), wq.GetZ(), wq.GetW()}});
         float wheelSkid = 0;
-        if (w->HasContact()) {
-            const auto* wv = static_cast<const WheelWV*>(w);
+        if (m.wheelLoad(w) > 0) {
             ++touching;
-            wheelSkid = std::clamp(std::max((std::fabs(wv->mLateralSlip) - 0.12f) / 0.3f, (std::fabs(wv->mLongitudinalSlip) - 0.35f) / 0.5f), 0.0f, 1.0f);
+            ++st.wheelsOnGround;
+            wheelSkid = std::clamp((m.wheelUtil(w) - 0.8f) / 0.5f, 0.0f, 1.0f);  // grip utilisation past the peak
             skid += wheelSkid;
         }
         st.wheelSkid.push_back(wheelSkid);
     }
+    st.speedKmh = m.forwardSpeed() * 3.6f;
+    st.rpm = m.rpm();
+    st.gear = m.gear();
     st.skid = touching ? skid / float(touching) : 0.0f;
     st.wheelSurface = v->wheelSurface;
     st.wheelCompression = v->wheelCompression;
-    impl_->contacts.read(v->car, st.scrapeSpeed, st.impactSpeed);
+    st.scrapeSpeed = m.body().scrapeSpeed;
+    st.impactSpeed = m.body().impactSpeed;
     return st;
 }
 

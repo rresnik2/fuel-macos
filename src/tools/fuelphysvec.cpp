@@ -31,6 +31,68 @@ struct FuelVehicleTest {
         for (int w : sliding) v.setWheelSliding(w, true);
     }
     static void notAllLoaded(FuelVehicle& v, float t) { v.notAllLoaded_ = t; }
+    // The state of notes/p24-work/drive_gen.py (identity orientation, CoM at the model origin).
+    struct DriveState {
+        Vec3 v{0.5f, 0, 12}, w{0, 0.3f, 0};
+        float rpm = 4000, rims[4] = {13.0f, 12.0f, 12.5f, 11.8f}, loads[4] = {0.12f, 0.15f, 0.0f, 0.15f};
+        float ratio[4][2] = {{2.0f, 1.0f}, {0.5f, 1.0f}, {0.5f, 1.0f}, {0.5f, 1.0f}};
+        Vec3 fric0{0.1f, 0, -3.0f};
+        Vec3 dirs[4] = {{-0.0998f, 0, 0.995f}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
+        float rolling = 0.2f, soft = 0.5f;
+        int gear = 1;
+        float thr = 0.8f, accel = 0.8f, brake = 0;
+        bool hb = false, ai = true;
+    };
+    static void apply(FuelVehicle& v, const DriveState& d) {
+        BodyState& S = v.body_.S;
+        S.q = {};
+        S.x = {};
+        S.v = d.v, S.w = d.w;
+        S.auxVel[0] = d.rpm;
+        for (int k = 0; k < 4; ++k) {
+            S.auxVel[1 + k] = d.rims[k];
+            WheelRec& r = v.wheels_[size_t(k)];
+            r.load = d.loads[k];
+            r.sumFn = d.ratio[k][0], r.sumDen = d.ratio[k][1];
+            r.fric = k == 0 ? d.fric0 : Vec3{};
+            r.hubW = S.x + r.hubL;
+            v.wheelDirPost_[k] = d.dirs[k];
+            v.C_[size_t(k)].rolling = d.rolling, v.C_[size_t(k)].soft = d.soft, v.C_[size_t(k)].hard = 1 - d.soft;
+        }
+        v.st_.dir0 = d.dirs[0], v.st_.dir2 = d.dirs[2];
+        v.gear_ = d.gear;
+        v.engThrottle_ = d.thr;
+        v.boostMul_ = 1;
+        v.player_ = !d.ai;
+        v.in_ = Inputs{};
+        v.in_.accel = d.accel, v.in_.brake = d.brake, v.in_.handbrake = d.hb;
+        v.shiftT_ = 0;
+        v.shiftTimes_[0] = v.shiftTimes_[1] = v.shiftTimes_[2] = 0.05f;
+        v.autoBrake_ = 0;
+    }
+    static void driveline(FuelVehicle& v) { v.driveline(); }
+    // notes/p24-work/body_gen.py: orientation yaw about y, velocity, spin, airtime, steer channel B, slide accel, gear.
+    static void bodyForces(FuelVehicle& v, float yaw, Vec3 vel, Vec3 w, float airtime, float chB, float acc, int gear, const float loads[4]) {
+        BodyState& S = v.body_.S;
+        S.q = axisAngle({0, 1, 0}, yaw);
+        S.x = {};
+        S.v = vel, S.w = w;
+        for (int k = 0; k < 4; ++k) {
+            WheelRec& r = v.wheels_[size_t(k)];
+            r.load = loads[k];
+            r.hubW = rotate(S.q, r.hubL);
+        }
+        v.speed_ = len(vel);
+        v.airtime_ = airtime;
+        v.st_.chB = chB, v.st_.accel = acc;
+        v.refUp_ = {0, 1, 0};
+        v.gear_ = gear;
+        v.wrecked_ = 0, v.airborneLong_ = false;
+        v.body_.boundR = 1.4f;
+        v.body_.F = v.body_.T = {};
+        v.bodyForces();
+    }
+    static const float* dOmega(const FuelVehicle& v) { return v.dOmega_; }
 };
 }  // namespace fuel::fv
 
@@ -321,6 +383,79 @@ void airVector() {  // 0x52bb60 AIR1
     check("AIR1", "0x52bb60 w / 0x1350", {w.x, w.y, w.z, v.airTimer()}, {0.054f, 0.1425f, 0.231f, 0.51666665f}, 5e-5f);
 }
 
+// DL1-DL3: driveline 0x5211e0 (engine 0x520560, clutch 0x520b00, brakes 0x520fd0, tyre reaction / rolling
+// 0x520d40), emulated in P24 (notes/p24-work/drive_gen.py, dl.cmd).
+void drivelineVectors() {
+    std::vector<std::pair<int, float>> p = {{46, 1}, {47, 1}, {48, 0}, {49, 0.3f}, {50, 0.3f}, {53, 3}, {54, 4}, {68, 16}, {91, 0.01f},
+                                            {92, 0}, {129, 0.5f}, {153, 20}, {323, 8}, {324, 8000}, {325, 2000}, {327, 75000}, {328, 0.8f},
+                                            {329, 0.9f}, {350, 4.05f}, {351, -7}, {352, 4.845f}, {359, 1}, {360, 1}, {377, 0}, {378, 1},
+                                            {379, 70000}, {380, 385}, {381, 2000}, {395, 200}, {396, 400}, {397, 1500}, {398, 0}};
+    const float curve[11] = {0, 0.8f, 0.85f, 0.9f, 0.95f, 1, 1, 1, 1, 0.95f, 0};
+    for (int i = 0; i < 11; ++i) p.push_back({338 + i, curve[i]});
+    struct Case {
+        const char* id;
+        FuelVehicleTest::DriveState st;
+        float acc[5], vel[5], dw[4];
+    };
+    FuelVehicleTest::DriveState s1, s2, s3;
+    s2.brake = 0.7f, s2.hb = true, s2.ai = false, s2.accel = 0, s2.thr = 0;
+    s3.gear = 0;
+    for (auto& r : s3.ratio) r[0] = 0.5f, r[1] = 1;
+    const Case cases[] = {
+        {"DL1", s1, {22101.643f, -664.9882f, 0.0f, -721.2483f, 0.0f}, {4000, 13.0f, 11.88f, 12.5f, 12.12f},
+         {-808.74725f, -522.607f, -721.2483f, -504.4018f}},
+        {"DL2", s2, {-3600.0f, 11.248755f, 0.0f, -46.666664f, 0.0f}, {4000, 13.0f, 11.88f, 12.5f, 12.12f},
+         {-75.00667f, -471.04f, -46.666664f, -470.5824f}},
+        {"DL3", s3, {8655.0f, 0.0f, 0.0f, -66.666664f, 0.0f}, {4000, 11.746748f, 11.88f, 12.5f, 12.12f},
+         {-95.00667f, -126.04f, -66.666664f, -125.582405f}},
+    };
+    for (const Case& cs : cases) {
+        FuelVehicle v = synthetic(p);
+        FuelVehicleTest::apply(v, cs.st);
+        FuelVehicleTest::driveline(v);
+        const BodyState& S = v.body().S;
+        const float* dw = FuelVehicleTest::dOmega(v);
+        check(cs.id, "0x5211e0 aux accelerations", {S.auxAcc[0], S.auxAcc[1], S.auxAcc[2], S.auxAcc[3], S.auxAcc[4]},
+              {cs.acc[0], cs.acc[1], cs.acc[2], cs.acc[3], cs.acc[4]}, 1e-4f);
+        check(cs.id, "0x5211e0 aux velocities", {S.auxVel[0], S.auxVel[1], S.auxVel[2], S.auxVel[3], S.auxVel[4]},
+              {cs.vel[0], cs.vel[1], cs.vel[2], cs.vel[3], cs.vel[4]}, 1e-4f);
+        check(cs.id, "0x5211e0 d-omega (+0x12a4)", {dw[0], dw[1], dw[2], dw[3]}, {cs.dw[0], cs.dw[1], cs.dw[2], cs.dw[3]}, 1e-4f);
+    }
+}
+
+// BF1-BF3: body forces 0x522830 (gravity 0x530cb0, aero drag 0x530d20, downforce, anti-roll 0x52c900, slide-steer
+// couple), emulated in P24 (notes/p24-work/body_gen.py, bf.cmd). No water manager (water block skipped).
+void bodyForceVectors() {
+    const std::vector<std::pair<int, float>> p = {{87, 50}, {88, 40}, {93, 0.0001f}, {94, 0.002f}, {95, 1.0f}, {96, 1.2f}, {97, 1.0f},
+                                                  {98, 0.75f}, {99, 20}, {100, 0.05f}, {101, 2.0f}, {102, 1.5f}, {103, 2.5f}, {104, 2.0f},
+                                                  {266, 1.0f}, {267, 1.5f}, {268, 0.8f}, {269, 1.2f}, {287, 0.01f}, {288, -17}, {289, -15},
+                                                  {291, 0.2f}, {292, 0.25f}, {577, 2}, {579, 1.5f}, {580, 0.8f}, {581, 1.6f}, {46, 1}, {47, 1}};
+    struct Case {
+        const char* id;
+        float yaw;
+        Vec3 v, w;
+        float air, chB, acc;
+        int gear;
+        float loads[4];
+        Vec3 F, T;
+    };
+    const Case cases[] = {
+        {"BF1", 0.0f, {0.5f, 0.2f, 12}, {0.1f, 0.3f, -0.05f}, 0, 0.4f, 1.2f, 1, {0.12f, 0.15f, 0, 0.15f}, {262.53415f, -5642.2603f, -113.016525f},
+         {-166.58199f, -1133.3313f, 83.29099f}},
+        {"BF2", 0.5f, {3, 0.2f, 11}, {0.1f, -0.4f, 0.2f}, 0, -0.7f, -0.8f, -1, {0.12f, 0.15f, 0.1f, 0.15f}, {155.62605f, -5735.6084f, -90.66908f},
+         {-50.06648f, -562.5192f, -47.478012f}},
+        {"BF3", 0.3f, {2, -3, 20}, {0.5f, 0.2f, 0.1f}, 0.5f, 0, 0, 2, {0, 0, 0, 0}, {-32.017937f, -5919.7007f, -320.17932f},
+         {-312.5263f, -93.75789f, -62.505253f}},
+    };
+    for (const Case& cs : cases) {
+        FuelVehicle v = synthetic(p);
+        FuelVehicleTest::bodyForces(v, cs.yaw, cs.v, cs.w, cs.air, cs.chB, cs.acc, cs.gear, cs.loads);
+        const RigidBody& b = v.body();
+        check(cs.id, "0x522830 force", {b.F.x, b.F.y, b.F.z}, {cs.F.x, cs.F.y, cs.F.z}, 2e-4f);
+        check(cs.id, "0x522830 torque", {b.T.x, b.T.y, b.T.z}, {cs.T.x, cs.T.y, cs.T.z}, 2e-4f);
+    }
+}
+
 void derivedVectors() {
     // Gravity (0x530cb0): F = (0, m Pg, 0). Anti-roll example (QUAD): d = 0.02 -> F = m 0.1 min(50 0.02, 9.81) = 0.1 m.
     FuelVehicle v = synthetic({{287, 0.01f}, {288, -17}, {289, -15}, {87, 50}, {88, 50}});
@@ -342,6 +477,8 @@ int main() {
     steerAngleVectors();
     channelVectors();
     airVector();
+    drivelineVectors();
+    bodyForceVectors();
     derivedVectors();
     std::printf("%d match, %d mismatch\n", passes, failures);
     return failures ? 1 : 0;

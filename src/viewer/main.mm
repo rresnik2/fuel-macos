@@ -431,6 +431,34 @@ struct AssemblyMode {
 static fuel::GroundMaps gGround;
 static fuel::SurfaceMap gSurfaces;
 
+// Per-frame physics cost of the headless runs (--ai-check prints it).
+static struct PhysStats {
+    std::vector<double> frame, vehicle;
+    int vehicles = 0;
+    void add(double ms, double vehicleMs, int n) {
+        frame.push_back(ms);
+        vehicle.push_back(vehicleMs);
+        vehicles = n;
+    }
+    void print() const {
+        if (frame.empty()) return;
+        auto stats = [](std::vector<double> v, double& mean, double& p99, double& worst) {
+            mean = 0;
+            for (double x : v) mean += x;
+            mean /= double(v.size());
+            std::sort(v.begin(), v.end());
+            p99 = v[std::min(v.size() - 1, size_t(double(v.size()) * 0.99))];
+            worst = v.back();
+        };
+        double m, p, w, vm, vp, vw;
+        stats(frame, m, p, w);
+        stats(vehicle, vm, vp, vw);
+        std::printf("physics cost, %d vehicles, %zu frames: mean %.2f ms, p99 %.2f ms, worst %.2f ms per frame "
+                    "(FUEL vehicle model: mean %.2f, p99 %.2f, worst %.2f ms)\n",
+                    vehicles, frame.size(), m, p, w, vm, vp, vw);
+    }
+} gPhysStats;
+
 struct Garage {
     std::vector<std::unique_ptr<AssemblyMode>> archives;  // one per vehicle DPC
     std::vector<std::pair<size_t, size_t>> entries;       // (archive, variant)
@@ -1746,6 +1774,9 @@ int main(int argc, const char** argv) {
                         const double tp0 = CACurrentMediaTime();
                         drive->update(1.0f / 60, in);
                         const double tp1 = CACurrentMediaTime();
+                        {  // physics cost per frame (all vehicles, props, queries), for --ai-check
+                            gPhysStats.add((tp1 - tp0) * 1000.0, drive->physics().lastVehicleMs(), drive->vehicleCount());
+                        }
                         if (opt.film > 0) {
                             chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius(), opt.haveYaw ? opt.yawDeg * float(M_PI) / 180.0f : 0.0f);
                             dust.update(1.0f / 60, *drive, drive->position());
@@ -1836,6 +1867,7 @@ int main(int argc, const char** argv) {
                         if (race->racers.size() > 1) std::printf("order after %.1f s of racing:\n%s", std::max(0.0, race->clock), race->standings(*drive).c_str());
                         if (opt.aiCheck) {
                             printAiCheck(*race, *drive);
+                            gPhysStats.print();
                             return aiCheckVerdict(*race) ? 0 : 1;
                         }
                     }

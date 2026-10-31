@@ -138,7 +138,7 @@ void FuelVehicle::ackermann() {  // 0x526480
     const Vec3 Cc = F + m * t;
     for (int w : {0, 2}) {
         Vec3 d = normalize(cross(kUp, wheels_[size_t(w)].hubL - Cc));
-        if (den > 0) d = -d;
+        if (den < 0) d = -d;  // (the decode reads "negated if den > 0" with the operands of 0x4adfe0 swapped)
         (w == 0 ? st_.dir0 : st_.dir2) = d;
     }
 }
@@ -569,7 +569,7 @@ void FuelVehicle::postStep(float dt, Environment& env) {
         leanRender_ = 0;
     }
     // Wheel spin for the visuals; display rpm toward the engine (P389/P390 rates).
-    for (int w = 0; w < nWheels_; ++w) wheelAngle_[w] += -S.auxVel[1 + w] / std::max(wheelR(w), 0.01f) * dt;
+    for (int w = 0; w < nWheels_; ++w) wheelAngle_[w] += S.auxVel[1 + w] / std::max(wheelR(w), 0.01f) * dt;
     {
         const float target = S.auxVel[0];
         const float rate = (gear_ == 0 || clutchFraction() < 0.99f) ? P(389) : P(390);

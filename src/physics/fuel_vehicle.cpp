@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -520,7 +522,8 @@ void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehic
         const Vec3 c = S.x + rotate(S.q, b.c - com_);
         // Box vs terrain (0x74ead0, not transcribed): the port tests the eight corners against the
         // triangulated ground.
-        if (env.terrain) {
+        static const bool noBox = std::getenv("FUEL_NOBOX") != nullptr;
+        if (env.terrain && !noBox) {
             for (int k = 0; k < 8; ++k) {
                 const Vec3 corner = c + rotate(S.q, {(k & 1) ? b.half.x : -b.half.x, (k & 2) ? b.half.y : -b.half.y,
                                                      (k & 4) ? b.half.z : -b.half.z});
@@ -765,11 +768,24 @@ void FuelVehicle::driveline() {
         S.auxAcc[1 + w] += a;
         dOmega_[w] += a;
     }
+    if (std::getenv("FUEL_DBG") && player_) {
+        static int k = 0;
+        if (++k % 120 == 0) {
+            std::fprintf(stderr, "dbg v=%.1f g=%d rpm=%.0f thr=%.2f engAcc0=%.0f clutch=%.2f dOm=", speed_, gear_, rpm, engThrottle_, S.auxAcc[0], clutch);
+            for (int w = 0; w < nWheels_; ++w) std::fprintf(stderr, " %.1f", dOmega_[w]);
+            std::fprintf(stderr, " fric.fwd=");
+            for (int w = 0; w < nWheels_; ++w) std::fprintf(stderr, " %.2f", dot(wheels_[size_t(w)].fric, fwd()));
+            int chassis = 0;
+            for (const Contact& c : contacts_) chassis += c.wheel == nullptr ? 1 : 0;
+            std::fprintf(stderr, " F.fwd/m=%.2f Fy/m=%.2f chassisContacts=%d\n", dot(body_.F, fwd()) * body_.invMass, body_.F.y * body_.invMass, chassis);
+        }
+    }
     // Tyre reaction or kinematic rolling 0x520d40.
     for (int w = 0; w < nWheels_; ++w) {
         const WheelRec& rec = wheels_[size_t(w)];
         const float load = std::min(100 * rec.load, 1.0f);
-        const Vec3 dw = rotate(S.q, wheelDirPost_[w]);
+        // Direction: the Ackermann vectors for wheels 0 and 2 (+0x1000 / +0x1018, passed in EDX by 0x5211e0), else Z.
+        const Vec3 dw = rotate(S.q, w == 0 ? st_.dir0 : (w == 2 ? st_.dir2 : Vec3{0, 0, 1}));
         if (slipRatio(w) > 1 && driven(w)) {
             const float a = P(68) / wheelInertia(w) * -(dot(rec.fric, dw) * body_.mass) * load * 0.03f;
             const float bf = wheelBrakeFactor(w) - 0.5f;

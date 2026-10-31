@@ -1,17 +1,17 @@
-// Vehicle physics on the world terrain, built on Jolt Physics.
-//
-// Jolt's wheeled-vehicle constraint does the suspension, tyres, engine,
-// gearbox and differentials; it is tuned from FUEL's own vehicle data. On top
-// of it the port adds what an arcade off-roader needs: air control, speed-
-// sensitive steering, self-righting, landing stabilisation and off-road tyre
-// curves. The terrain collides as a heightfield patch that follows the vehicle.
+// Vehicle physics on the world terrain: FUEL's own vehicle model (physics/fuel_vehicle.hpp, decoded from
+// FUEL.exe; notes p23-vehicle-physics.md, p24-physics-port.md) driving every vehicle. The wheels touch the
+// terrain's collision triangles as the engine builds them (GenWorld_Z 0x77f510); Jolt Physics is kept only
+// for the placed static objects, the movable props and ray/sphere queries.
 #pragma once
 
 #include "core/dpc.hpp"
 #include "core/surface.hpp"
 #include "core/terrain.hpp"
+#include "core/vehicle_params.hpp"
+#include "physics/fuel_vehicle.hpp"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,12 +41,18 @@ struct VehicleSetup {
     std::vector<float> gears;  // forward ratios
     float reverseGear = -3, finalDrive = 3.5f;
     float topSpeedKmh = 150;
+    // What FUEL's model runs on: every VehiclePP value (index = parameter number), the `<V>_DYN` proxy and
+    // the global ground tables (pp001.tsc PP 4000-4398), all read from the player's files.
+    std::vector<float> params;
+    VehicleProxy proxy;
+    std::shared_ptr<const fv::GroundTables> ground;
 };
 
 // Builds a setup from the variant's VehiclesParam.tsc values and its physics
 // proxy in the vehicle DPC. `hubs`, when given, are the assembled wheel
 // centres (they can sit inboard of the proxy spheres); each proxy wheel takes
-// the nearest one. Throws when the data is missing or implausible.
+// the nearest one (for drawing only; the physics uses the proxy). The ground tables come from
+// CommonComponent/Param/pp001.tsc found above the DPC. Throws when the data is missing or implausible.
 VehicleSetup makeVehicleSetup(const DpcFile& vehicleDpc, const std::string& variant, const std::vector<float>& params,
                               const std::vector<std::array<float, 3>>& hubs = {});
 
@@ -120,6 +126,9 @@ public:
     void update(float dt, const DriveInput& input);
     VehicleState state() const { return state(0); }
 
+    // For checks: lifts vehicle `i` by `dy` metres and sets its velocity (world, m/s).
+    void nudge(int i, double dy, const std::array<float, 3>& velocity);
+
     // Free distance (metres, up to `length`) from (x, z) along heading `yaw` (0 = +z):
     // what a driver sees ahead. A ray `height` metres above the terrain at both ends
     // against static objects (not vehicles or props); with `maxSlope` > 0 the terrain
@@ -136,6 +145,18 @@ public:
     // surface counts as dirt. The default applies to worlds created afterwards.
     void setSurfaceQuery(SurfaceQuery query);
     static void setDefaultSurfaceQuery(SurfaceQuery query);
+    // Water depth (metres above the ground, 0 = dry) at a world point, for FUEL's water floor contacts,
+    // water drag and wet grip. Defaults to 0 everywhere (the world's water plugs in here).
+    using WaterDepthQuery = std::function<float(double x, double z)>;
+    void setWaterDepthQuery(WaterDepthQuery query);
+    static void setDefaultWaterDepthQuery(WaterDepthQuery query);
+    float waterDepthAt(double x, double z) const;
+
+    // Physics cost of the last update (milliseconds, wall clock) and the vehicle model's own share.
+    float lastStepMs() const;
+    float lastVehicleMs() const;
+    // FUEL's model of vehicle `i` (null when absent), for checks and telemetry.
+    const fv::FuelVehicle* model(int i) const;
 
     // Static world objects the vehicle collides with. A shape is registered
     // once per mesh; instances place it with a row-vector world matrix
