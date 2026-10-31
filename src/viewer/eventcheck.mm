@@ -27,6 +27,7 @@ Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& str
     // so the hops can reach them); the helicopter is simulated by the rules.
     const size_t others = mode == fuel::Race::GmHelicopter ? 0 : size_t(std::clamp(r.aiCount, 0, 11));
     fuel::RaceRules rules;
+    rules.ground = [&terrain](float x, float z) { return terrain.smoothHeightAt(x, z); };
     rules.begin(r, 1 + others, e.times[0]);
     std::vector<Vec3> pos(rules.racers.size(), r.start);
     for (size_t i = 1; i < pos.size(); ++i) {
@@ -37,6 +38,7 @@ Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& str
         } else {
             pos[i] = {r.start[0] - 8.0f * float(i), r.start[1], r.start[2]};
         }
+        pos[i][1] = terrain.smoothHeightAt(pos[i][0], pos[i][2]);  // they would stand on the ground
     }
     // Spawn on the start, facing the first target.
     float yaw = r.startYaw;

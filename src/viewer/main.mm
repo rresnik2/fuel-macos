@@ -445,6 +445,7 @@ struct RaceSession {
     std::vector<std::array<float, 3>> route;  // the player's gates (per lap), then the finish
     fuel::RaceLine line;                      // start, then the route (what the AI follows)
     fuel::RaceLine aiLine;                    // hunted racers: their grid, then the event's path
+    const fuel::Heightfield* terrain = nullptr;  // puts gates far off the ground onto it
     double clock = 0;  // seconds since the start (negative during the countdown)
 
     // Everyone in the race: [0] is the player, the others match the session's vehicles 1...
@@ -473,6 +474,7 @@ struct RaceSession {
     }
     void begin(DriveSession& d, WorldStreamer* streamer, fuel::MeshRenderer& renderer) {
         const fuel::Race& r = race();
+        if (terrain) rules.ground = [t = terrain](float x, float z) { return t->smoothHeightAt(x, z); };
         rules.begin(r, racers.size(), event().times[0]);
         route = rules.route;
         line.build(r.start, route);
@@ -1472,6 +1474,7 @@ int main(int argc, const char** argv) {
                 if (opt.eventCheck) return runEventCheck(fuel::loadEvents(opt.dataDir), *drive, *streamer, renderer, *terrain, opt.eventOnly);
                 if (!opt.race.empty()) {
                     race = std::make_unique<RaceSession>();
+                    race->terrain = terrain.get();
                     race->races = loadRaces(opt.dataDir);
                     if (race->races.empty()) die("no races found in the mission scripts");
                     auto it = std::find_if(race->races.begin(), race->races.end(), [&](const fuel::Event& e) {

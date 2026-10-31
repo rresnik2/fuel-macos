@@ -12,6 +12,7 @@
 #include "races.hpp"
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,12 @@ struct RaceRules {
     float heliSpeed = 0, heliTravelled = 0, heliFar = 0;
     bool heliLanded = false;
     std::vector<size_t> knockedAt;       // knock-out: gate index of each elimination so far
+
+    // Ground height at (x, z), set before begin(): points whose script height is more than
+    // kSnap metres off the ground are put on it (FUEL snaps race points to the ground, 0x460220,
+    // radius parameter 30.0 at 0x9dbf90; Inferred), and gates at y = 0 get a height.
+    std::function<float(float x, float z)> ground;
+    static constexpr float kSnap = 30.0f;
 
     // `racerCount` includes the player. `targetTime` (AddMissionTime 1st value) sets the helicopter's flight time.
     void begin(const Race& r, size_t racerCount, float targetTime);

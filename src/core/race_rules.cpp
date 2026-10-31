@@ -39,6 +39,14 @@ void RaceRules::begin(const Race& r, size_t racerCount, float targetTime) {
         aiPath.insert(aiPath.end(), path.begin(), path.end());
         if (set(r.finish)) aiPath.push_back(r.finish);
     }
+    if (ground) {
+        auto snap = [&](Vec3& p) {
+            const float h = ground(p[0], p[2]);
+            if (std::isfinite(h) && std::fabs(p[1] - h) > kSnap) p[1] = h;
+        };
+        for (Vec3& p : route) snap(p);
+        for (Vec3& p : aiPath) snap(p);
+    }
     aiTargets.assign(aiPath.size() > 1 ? aiPath.begin() + 1 : aiPath.end(), aiPath.end());
     racers.assign(std::max<size_t>(1, racerCount), Racer{});
     state = Countdown;
