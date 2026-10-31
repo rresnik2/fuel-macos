@@ -275,6 +275,7 @@ private:
     uint8_t wrecked_ = 0;         // +0x1420 (1 wrecked, 2 drowned)
     bool airborneLong_ = false;   // +0x1424
     bool inWater_ = false;        // +0x1428
+    float waterTimer_ = 0, waterEvent_ = 0;  // +0x13a4, port
     bool respawnWanted_ = false;
     float respawnHold_ = 0;
     Vec3 refUp_{0, 1, 0}, refUp2_{0, 1, 0};  // +0x103c, +0x1048

@@ -532,6 +532,16 @@ void FuelVehicle::postStep(float dt, Environment& env) {
         respawnWanted_ = true;
     }
     if (S.x.y < groundHeight_ - 50) respawnWanted_ = true;
+    // Deep water (0x528cf0): every wheel deeper than P581 (+0x1428) and slow (< 5 m/s) or there longer than
+    // 0.5 s raises the vehicle's water event (FUN_00420180(veh+0x118), consumer not decoded); the port respawns
+    // after 1 s of it (approximation).
+    if (!wrecked_ && inWater_) {
+        waterTimer_ += dt;
+        if (waterTimer_ > 0.5f || std::hypot(S.v.x, S.v.z) < 5.0f) waterEvent_ += dt;
+        if (waterEvent_ > 1.0f) respawnWanted_ = true;
+    } else {
+        waterTimer_ = waterEvent_ = 0;
+    }
     // Reference normals (smoothed towards the ground probe normal).
     auto smoothVec = [&](Vec3& cur, float k) {
         const Vec3 d = probeNormal_ - cur;
@@ -614,6 +624,7 @@ void FuelVehicle::resetTo(const Vec3& modelOrigin, float yaw, Environment& env) 
     wrecked_ = 0;
     wreckTime_ = 0;
     respawnWanted_ = false;
+    waterTimer_ = waterEvent_ = 0;
     for (int w = 0; w < nWheels_; ++w) {
         dOmega_[w] = 0;
         groundTime_[w] = 0;

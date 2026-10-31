@@ -1599,6 +1599,16 @@ int main(int argc, const char** argv) {
                                 if (lakes->valid()) {
                                     ground->setLakes(lakes.get());
                                     streamer->setLakes(lakes.get());
+                                    if (drive) {  // p24: water for FUEL's vehicle physics, 0x4df5a0's first term (depth above the 2 m floor)
+                                        const fuel::Lakes* lk = lakes.get();
+                                        const fuel::Heightfield* th = terrain.get();
+                                        drive->physics().setWaterDepthQuery([lk, th](double x, double z) {
+                                            bool inside = false;
+                                            for (const fuel::Lake& l : lk->lakes()) inside = inside || l.contains(x, z);
+                                            if (!inside) return 0.0f;
+                                            return float(std::max(0.0, lk->depthAbove(x, z, th->smoothHeightAt(x, z)) - 2.0));
+                                        });
+                                    }
                                     const std::vector<float> wc = fuel::readEngineFloats(*f, 0xa26880, 32);  // WaterConstant_Z defaults
                                     if (wc.size() == 32) {
                                         std::array<simd_float4, 8> c;
