@@ -88,6 +88,8 @@ public:
     MenuRequest take();
 
     std::string textOf(uint32_t tt) const;
+    // A vehicle variant label ("QUAD_ROAD_2") as the game names it ("Speed Demon").
+    std::string vehicleName(const std::string& label) const;
 
 private:
     enum class Screen { Title, Tab, CareerList, ChallengeList, CampList, VehicleList, OptDisplay, OptAudio, Results, Single };

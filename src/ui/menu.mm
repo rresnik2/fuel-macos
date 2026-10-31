@@ -131,6 +131,15 @@ std::string Menu::textOf(uint32_t tt) const {
     return s ? pcButtons(*s) : std::string();
 }
 
+std::string Menu::vehicleName(const std::string& label) const {
+    for (const VehicleInfo& v : vehicles_)
+        if (v.name == label && v.nameText) {
+            const std::string n = textOf(v.nameText);
+            if (!n.empty()) return n;
+        }
+    return label;
+}
+
 void Menu::setSession(const std::string& event, const std::string& hub, const std::string& vehicle) {
     sessionEvent_ = event, sessionHub_ = upper(hub), sessionVehicle_ = vehicle;
     for (const Event& e : events_)
@@ -595,7 +604,8 @@ void Menu::prepareRows() {
                 it->hasDynText = true;
                 it->dynText = e.nameText ? textOf(e.nameText) : e.id;
                 if (it->dynText.empty()) it->dynText = e.id;
-                it->enabled = e.playable;
+                it->enabled = false;                    // +9 turns these labels black (authored colours)
+                it->tNormal.a = e.playable ? 1.0f : 0.4f;  // port: races it cannot run yet are dimmed
             }
             if (Item* it = p->find("ITEM_ID_BUTTON_NUMBER" + n)) {
                 char b[8];
@@ -627,7 +637,7 @@ void Menu::prepareRows() {
                 } else {
                     const VehicleInfo& v = *vehicles[size_t(idx)];
                     const std::string nm = textOf(v.nameText);
-                    it->dynText = (nm.empty() ? v.name : nm) + "  (" + v.name + ")";
+                    it->dynText = nm.empty() ? v.name : nm;
                 }
                 it->enabled = true;
             }
@@ -638,9 +648,14 @@ void Menu::prepareRows() {
     } else if (screen_ == Screen::Results) {
         Page* p = scripts_.page("race_ranking_win");
         if (!p) return;
+        for (Item& it : p->items) it.visible = true;
         for (int k = 1; k <= 5; ++k) {
             const bool on = k <= int(results_.size());
             setRow(*p, k, on);
+            if (!on)  // the row's unnumbered bars too (those inside the row's halo band)
+                if (const Item* halo = p->find("ITEM_ID_HALO" + std::to_string(k)))
+                    for (Item& it : p->items)
+                        if (rowOf(it.id) == 0 && it.y + it.h * 0.5f > halo->y && it.y + it.h * 0.5f < halo->y + halo->h) it.visible = false;
             if (!on) continue;
             const ResultRow& rr = results_[size_t(k - 1)];
             const std::string n = std::to_string(k);
@@ -648,7 +663,7 @@ void Menu::prepareRows() {
                 if (Item* it = p->find(id)) it->hasDynText = true, it->dynText = s, it->enabled = rr.player;
             };
             dyn("ITEM_ID_PLAYER_POS" + n, std::to_string(k));
-            dyn("ITEM_ID_PLAYER_NAME" + n, rr.name);
+            dyn("ITEM_ID_PLAYER_NAME" + n, vehicleName(rr.name));
             dyn("ITEM_ID_PLAYER_TIME" + n, formatTime(rr.time));
             if (Item* it = p->find("ITEM_ID_HALO" + n)) it->visible = rr.player, it->focus = true;
             if (Item* it = p->find("ITEM_ID_PLAYER_VEHICLE" + n)) it->visible = false;
@@ -671,6 +686,9 @@ void Menu::prepareRows() {
             if (Item* it = p->find(lists[k])) it->entryIndex = vals[k] ? 1 : 0, it->focus = focus_ == k;
         if (Item* g = p->find("ITEM_ID_DISPLAY_OPTIONS_RECT_BRIGHTNESS_PERCENT")) g->w = 313.0f * options_.brightness;
         if (Item* lb = p->find("ITEM_ID_DISPLAY_OPTIONS_BRIGHTNESS_PERCENT")) lb->visible = false;
+        // The arrows (authored on row 5) follow the focused row; rows are 49 apart (port rows too).
+        for (const char* a : {"ITEM_ID_FLECHE_GAUCHE", "ITEM_ID_FLECHE_DROITE"})
+            if (Item* it = p->find(a)) it->y = 419.0f + 49.0f * float(focus_ - 4) + (focus_ >= 6 ? -1.0f : 0.0f);
         for (Item& it : p->items) {
             const int row = rowOf(it.id);
             if (it.id.rfind("ITEM_ID_HALO", 0) == 0) it.visible = row - 1 == focus_, it.focus = true;
@@ -680,6 +698,8 @@ void Menu::prepareRows() {
         if (!p) return;
         if (Item* g = p->find("ITEM_ID_SOUND_VOLUME_PERCENT")) g->w = 317.0f * settings_.volume;
         if (Item* g = p->find("ITEM_ID_MUSIC_VOLUME_PERCENT")) g->w = 317.0f * options_.musicVolume;
+        for (const char* a : {"ITEM_ID_FLECHE_GAUCHE", "ITEM_ID_FLECHE_DROITE"})
+            if (Item* it = p->find(a)) it->y = 307.0f + 60.0f * float(focus_);
         for (Item& it : p->items) {
             const int row = rowOf(it.id);
             if (it.id.rfind("ITEM_ID_HALO", 0) == 0) it.visible = row - 1 == focus_, it.focus = true;
@@ -715,8 +735,10 @@ void Menu::draw(UiRenderer& r) {
         return;
     }
     page("tache_tout_menu");
-    page("TopMenu");
-    page("TopTitle");
+    if (screen_ != Screen::Results) {  // the ranking page has its own title line
+        page("TopMenu");
+        page("TopTitle");
+    }
     switch (screen_) {
         case Screen::Tab:
             if (tab_ == TabMap) {
@@ -797,7 +819,7 @@ void Menu::drawHud(UiRenderer& r, const HudState& hud) {
                 const size_t i = show[size_t(row - 1)];
                 const ResultRow& rr = hud.standings[i];
                 if (it.id.find("NUMBER") != std::string::npos) it.hasDynText = true, it.dynText = std::to_string(i + 1);
-                if (it.id.find("NAME") != std::string::npos) it.hasDynText = true, it.dynText = rr.name;
+                if (it.id.find("NAME") != std::string::npos) it.hasDynText = true, it.dynText = vehicleName(rr.name);
                 if (it.id.find("DIST") != std::string::npos) {
                     char b[32];
                     std::snprintf(b, sizeof b, rr.time > 0 ? "+%.1f" : "", rr.time);

@@ -75,7 +75,8 @@ constexpr MTLPixelFormat kColorFormat = fuel::kOutputColorFormat;
 constexpr NSUInteger kSamples = 4;  // the scene's MSAA
 
 fuel::Recorder gRecorder;  // --record
-std::unique_ptr<fuel::ui::GameOverlay> gOverlay;  // --in-game: pause/results menu and HUD
+std::unique_ptr<fuel::ui::GameOverlay> gOverlay;
+fuel::ui::HudState gShotHud;  // --in-game --film: the HUD drawn on the film frames  // --in-game: pause/results menu and HUD
 std::vector<fuel::Hub> gHubs;  // the 19 hubs (--hub, --hub-check, the T key)
 const fuel::Heightfield* gTerrain = nullptr;  // for the T key
 
@@ -759,6 +760,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     for (int k = 0; k <= bench; ++k) {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         renderer.render(cb, image, cam);
+        if (gOverlay) gOverlay->draw(cb, image, gShotHud);
         [cb commit];
         [cb waitUntilCompleted];
         const double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
@@ -1620,6 +1622,24 @@ int main(int argc, const char** argv) {
                             char suffix[16];
                             std::snprintf(suffix, sizeof suffix, "_%04d", i / std::max(1, int(opt.film * 60)));
                             frame.shot = (out.parent_path() / (out.stem().string() + suffix + out.extension().string())).string();
+                            if (opt.inGame) {  // --in-game --film: the HUD (and, with FUEL_MENU_FILM=1, the pause menu) on the frames
+                                if (!gOverlay)
+                                    gOverlay = std::make_unique<fuel::ui::GameOverlay>(device, kColorFormat, argv[0], opt.dataDir, fuel::loadSettings(), opt.race,
+                                                                                       opt.hub, opt.assemble);
+                                if (std::getenv("FUEL_MENU_FILM") && !gOverlay->open()) gOverlay->openPause();
+                                gShotHud = {};
+                                gShotHud.speedKmh = std::fabs(drive->state().speedKmh);
+                                gShotHud.odometerKm = float(i) / 60.0f * gShotHud.speedKmh / 3600.0f;
+                                if (const fuel::Hub* h = fuel::nearestHub(gOverlay->menu().hubs(), drive->position().x, drive->position().z))
+                                    gShotHud.hubName = gOverlay->menu().textOf(h->nameText);
+                                if (race && race->racers.size() > 1) {
+                                    gShotHud.race = true;
+                                    const std::vector<int> pos = race->positions(*drive);
+                                    for (int q = 1; q <= int(race->racers.size()); ++q)
+                                        for (size_t k = 0; k < race->racers.size(); ++k)
+                                            if (pos[k] == q) gShotHud.standings.push_back({race->racers[k].name, 0, k == 0});
+                                }
+                            }
                             const double gpuMs = renderShot(device, renderer, frame, chaseView);
                             const fuel::VehicleState fs = drive->state();
                             const simd_float3 fp = drive->position();

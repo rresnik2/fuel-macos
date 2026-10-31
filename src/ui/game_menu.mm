@@ -148,7 +148,8 @@ int runMenuShot(const std::string& dataDir, const Settings& s, const std::string
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         Menu menu(dataDir, s, MenuMode::Main);
-        if (!menu.showPage(page)) {
+        const bool imageOnly = page.rfind("image:", 0) == 0;  // debugging: one picture on a grey ground
+        if (!imageOnly && !menu.showPage(page)) {
             std::fprintf(stderr, "menu-shot: no page '%s'\n", page.c_str());
             return 2;
         }
@@ -160,7 +161,13 @@ int runMenuShot(const std::string& dataDir, const Settings& s, const std::string
         ui.begin(float(w), float(h));
         backdrop(ui);
         const std::string p = page;
-        if (p == "compteur" || p == "classement" || p == "boussole" || p == "hud") {
+        if (imageOnly) {
+            ui.rect(0, 0, 1280, 720, Rgba{0.5f, 0.5f, 0.5f, 1});
+            const BitmapRef b = menu.assets().image(p.substr(6));
+            std::printf("menu-shot: %s: %ux%u\n", p.c_str() + 6, b.width, b.height);
+            const float k = std::min(1200.0f / float(std::max(1u, b.width)), 680.0f / float(std::max(1u, b.height)));
+            ui.image(b, 40, 20, float(b.width) * k, float(b.height) * k, Rgba{1, 1, 1, 1});
+        } else if (p == "compteur" || p == "classement" || p == "boussole" || p == "hud") {
             HudState hud;
             hud.speedKmh = 87, hud.odometerKm = 12.3f, hud.race = true, hud.position = 2, hud.racers = 4;
             hud.hubName = menu.hubs().empty() ? "" : menu.textOf(menu.hubs()[0].nameText);
