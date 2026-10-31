@@ -205,8 +205,10 @@ bool TerrainLod::cover(double cx, double cz, double size, int level, double ex, 
         std::vector<std::shared_ptr<const TerrainChunk>> kids;
         bool all = true;
         const double q = size * 0.25;
+        // FUEL's child order (0x7dfaa0): (+,+), (+,-), (-,-), (-,+).
+        static constexpr int kSx[4] = {1, 1, -1, -1}, kSz[4] = {1, -1, -1, 1};
         for (int k = 0; k < 4; ++k)
-            all = cover(cx + ((k & 1) ? q : -q), cz + ((k & 2) ? q : -q), size * 0.5, level + 1, ex, ez, kids, want) && all;
+            all = cover(cx + kSx[k] * q, cz + kSz[k] * q, size * 0.5, level + 1, ex, ez, kids, want) && all;
         if (all) {
             out.insert(out.end(), kids.begin(), kids.end());
             return true;
@@ -218,23 +220,39 @@ bool TerrainLod::cover(double cx, double cz, double size, int level, double ex, 
         out.push_back(it->second);
         return true;
     }
-    if (!pending_.count(key)) want.push_back({key, cx, cz, size, dist / size});
+    if (!pending_.count(key)) {
+        // FUEL's build key (0x7dfdc0, notes p31 D): the chunk size when the chunk is in the view
+        // frustum, x 1024 when off-screen in front of the camera, x 1024^2 behind it; the smallest
+        // key is built first, ties in traversal order. The port approximates the frustum by a
+        // horizontal 65 degree half-angle cone around the view direction.
+        double mult = 1;
+        const double fl = std::hypot(fx_, fz_), r = size * 0.70711;
+        if (fl > 0 && dist > r) {
+            const double along = ((cx - ex) * fx_ + (cz - ez) * fz_) / fl;
+            const double ang = std::acos(std::clamp(along / dist, -1.0, 1.0)) - std::asin(std::min(1.0, r / dist));
+            if (along + r <= 0) mult = 1024.0 * 1024.0;
+            else if (ang > 65.0 * M_PI / 180.0) mult = 1024.0;
+        }
+        want.push_back({key, cx, cz, size, size * mult});
+    }
     return false;
 }
 
-std::vector<std::shared_ptr<const TerrainChunk>> TerrainLod::update(double ex, double ez) {
+std::vector<std::shared_ptr<const TerrainChunk>> TerrainLod::update(double ex, double ez, double fx, double fz) {
     std::vector<std::shared_ptr<const TerrainChunk>> out;
     std::vector<Job> want;
     {
         std::lock_guard<std::mutex> lk(mu_);
         ++frame_;
-        // 9 x 9 roots of 12288 m around the camera, inside the ring i^2 + j^2 < 17 (0x7df0e0).
+        fx_ = fx, fz_ = fz;
+        // 9 x 9 roots of 12288 m around the camera, inside the ring i^2 + j^2 < 17 (0x7df0e0),
+        // traversed x-major like the engine.
         const double rx = std::round(ex / kRoot), rz = std::round(ez / kRoot);
-        for (int j = -4; j <= 4; ++j)
-            for (int i = -4; i <= 4; ++i)
+        for (int i = -4; i <= 4; ++i)
+            for (int j = -4; j <= 4; ++j)
                 if (i * i + j * j < 17) cover((rx + i) * kRoot, (rz + j) * kRoot, kRoot, 0, ex, ez, out, want);
-        // Requeue: nearest first, relative to chunk size.
-        std::sort(want.begin(), want.end(), [](const Job& a, const Job& b) { return a.priority < b.priority; });
+        // Requeue: FUEL's key order (smallest first, then traversal order).
+        std::stable_sort(want.begin(), want.end(), [](const Job& a, const Job& b) { return a.priority < b.priority; });
         std::deque<Job> keep;
         for (const Job& j : queue_) pending_.erase(j.key);  // not started: re-decide
         queue_.clear();

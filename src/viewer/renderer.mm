@@ -2641,7 +2641,8 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
                 terrainLod_->update(eye.x, eye.z);
                 terrainLod_->settle();
             }
-        terrainChunks = terrainLod_->update(eye.x, eye.z);
+        const simd_float3 look = (cam.explicitPose ? cam.target : center_) - eye;
+        terrainChunks = terrainLod_->update(eye.x, eye.z, look.x, look.z);
         ++chunkFrame_;
         for (const auto& c : terrainChunks) {
             ChunkGpu& g = chunkGpu_[c->key];
