@@ -141,6 +141,18 @@ public:
     void setRoads(const fuel::RoadNetwork* roads) { roads_ = roads; }
     // Call every frame; refreshes after the player has moved a little.
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
+    // Waits for every worker job, then rebuilds everything (objects, plants, roads, grass,
+    // fine ground colour) for `player` on this thread: the world as it stands when streaming
+    // has fully caught up (--capture-spot).
+    void settle(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
+    // Placed objects within `radius` of (x, z) whose base is more than `minGap` metres off the
+    // port's terrain (FITTOGROUND objects are seated, so only authored heights show up here).
+    struct GroundGap {
+        uint32_t meshId = 0;
+        simd_float3 position = {0, 0, 0};  // the placement's origin
+        float gap = 0;                     // origin y - terrain height, metres (+ floats, - buried)
+    };
+    std::vector<GroundGap> groundGaps(double x, double z, double radius, float minGap) const;
     // Knock-aside props: small objects near the player are dynamic bodies.
     struct PropStats {
         size_t tracked = 0;  // props with state (a body near the player, or knocked away)

@@ -69,6 +69,7 @@ add_executable(fuelview
   src/viewer/drive.mm
   src/viewer/recorder.mm
   src/viewer/hubcheck.mm
+  src/viewer/capture.mm
   src/viewer/eventcheck.mm
   src/viewer/game_settings.mm
   src/audio/drive_audio.mm

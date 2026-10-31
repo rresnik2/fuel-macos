@@ -37,6 +37,7 @@
 #include "rider_view.h"
 #include "eventcheck.h"
 #include "hubcheck.h"
+#include "capture.h"
 #include "core/hubs.hpp"
 #import <GameController/GameController.h>
 #include "audio/drive_audio.h"
@@ -127,6 +128,14 @@ struct Options {
     std::string menuShot, menuShotOut, menuPage;  // --menu-shot PAGE OUT.png, --menu-page PAGE
     bool menuCheck = false; // --menu-check
     bool settings = false;  // --settings: size, fullscreen, post effects, grass, volume (and data) from the settings file; --game implies it
+    // Reference captures (capture.h): --capture-spot NAME renders one spot of the spot list to
+    // NAME.png (or --shot FILE), --capture-all DIR every spot to DIR/NAME.png, --spots FILE picks
+    // the list, --capture-find X,Z[,R] prints roads and floating objects near a point.
+    std::string captureSpot, captureAll, spotsFile;
+    std::vector<CaptureSpot> spots;
+    bool captureFind = false;
+    double findX = 0, findZ = 0, findRadius = 300;
+    bool haveSize = false;
 };
 
 // Paint and liveries available for the chosen vehicle.
@@ -202,7 +211,15 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--hub-check") { o.hubCheck = true; o.drive = true; o.terrain = true; }
         else if (a == "--assemble") o.assemble = next();
         else if (a == "--lod") { o.lod = std::stoi(next()); if (o.lod < 1) die("--lod starts at 1"); }
-        else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); }
+        else if (a == "--size") { const std::string s = next(); if (std::sscanf(s.c_str(), "%dx%d", &o.width, &o.height) != 2) die("bad --size"); o.haveSize = true; }
+        else if (a == "--capture-spot") { o.captureSpot = next(); o.drive = true; o.terrain = true; }
+        else if (a == "--capture-all") { o.captureAll = next(); o.drive = true; o.terrain = true; }
+        else if (a == "--spots") o.spotsFile = next();
+        else if (a == "--capture-find") {
+            const std::string v = next();
+            if (std::sscanf(v.c_str(), "%lf,%lf,%lf", &o.findX, &o.findZ, &o.findRadius) < 2) die("bad --capture-find (use X,Z or X,Z,RADIUS in metres)");
+            o.captureFind = true, o.drive = true, o.terrain = true;
+        }
         else if (a == "--yaw") o.yawDeg = std::stof(next()), o.haveYaw = true;
         else if (a == "--pitch") o.pitchDeg = std::stof(next());
         else if (a == "--distance") o.distance = std::stof(next());
@@ -223,7 +240,9 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--paint") { const std::string v = next(); if (std::sscanf(v.c_str(), "%d,%d,%d", &o.paint[0], &o.paint[1], &o.paint[2]) != 3) die("bad --paint"); o.havePaint = true; }
         else if (a == "-h" || a == "--help") { std::puts("usage: fuelview [--data DIR] [--mesh ID | --assemble VARIANT [--lod N] | --scene FILE.json]\n"
                                                          "                [--vehicle NAME] [--livery N] [--color N | --paint R,G,B]\n"
-                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--distance RADII] [--no-cull] [--dirt 0..1]] [DPC ...]"); std::exit(0); }
+                                                         "                [--shot FILE.png [--size WxH] [--yaw DEG] [--pitch DEG] [--distance RADII] [--no-cull] [--dirt 0..1]] [DPC ...]\n"
+                                                         "       fuelview [--data DIR] [--spots FILE.tsv] (--capture-spot NAME [--shot FILE.png] | --capture-all DIR) [--size WxH]\n"
+                                                         "       fuelview [--data DIR] --capture-find X,Z[,RADIUS]"); std::exit(0); }
         else if (!a.empty() && a[0] == '-') die("unknown option " + a);
         else o.dpcs.push_back(a);
     }
@@ -238,6 +257,34 @@ Options parseArgs(int argc, const char** argv) {
         if (o.shot.empty()) o.shot = "-";
         if (o.assemble.empty()) o.assemble = "QUAD_ROAD_2";
         o.opponents = 0;
+    }
+    if (!o.captureSpot.empty() || !o.captureAll.empty() || o.captureFind) {  // headless reference captures
+        if (o.assemble.empty()) o.assemble = "QUAD_ROAD_2";
+        o.opponents = 0;
+        if (!o.haveSize) o.width = 1920, o.height = 1080;  // the size the checklist asks for from the real game
+        if (o.captureFind) {
+            o.atX = float(o.findX), o.atZ = float(o.findZ), o.haveAt = true;
+        } else {
+            if (o.spotsFile.empty()) o.spotsFile = defaultCaptureSpotsPath();
+            try {
+                o.spots = loadCaptureSpots(o.spotsFile);
+            } catch (const std::exception& e) {
+                die(e.what());
+            }
+            if (o.spots.empty()) die("no spots in " + o.spotsFile);
+            const CaptureSpot* first = &o.spots.front();
+            if (!o.captureSpot.empty()) {
+                first = findCaptureSpot(o.spots, o.captureSpot);
+                if (first == nullptr) {
+                    std::string names;
+                    for (const CaptureSpot& sp : o.spots) names += " " + sp.name;
+                    die("no spot '" + o.captureSpot + "' in " + o.spotsFile + "; it has:" + names);
+                }
+                if (o.shot.empty()) o.shot = first->name + ".png";
+            }
+            o.atX = float(first->x), o.atZ = float(first->z), o.atYaw = first->headingDeg * float(M_PI) / 180.0f, o.haveAt = true;
+        }
+        if (o.shot.empty()) o.shot = "-";
     }
     if (o.propCheck && o.shot.empty()) o.shot = "-";  // headless: drive and report, no picture
     if (o.propCheck) o.opponents = 0;                  // the player alone among the props
@@ -1550,6 +1597,30 @@ int main(int argc, const char** argv) {
                 }
                 if (opt.hubCheck) return runHubCheck(gHubs, *drive, *streamer, renderer, *terrain);
                 if (opt.eventCheck) return runEventCheck(fuel::loadEvents(opt.dataDir), *drive, *streamer, renderer, *terrain, opt.eventOnly);
+                if (opt.captureFind) {
+                    printCaptureCandidates(opt.findX, opt.findZ, opt.findRadius, *streamer, roads.get(), *terrain);
+                    return 0;
+                }
+                if (!opt.captureSpot.empty() || !opt.captureAll.empty()) {  // reference captures: settled world, chase camera at rest
+                    std::string err;
+                    if (!renderer.setScene(scene.parts, &err)) die(scene.variant + ": " + err);
+                    std::vector<const CaptureSpot*> todo;
+                    if (!opt.captureSpot.empty()) todo.push_back(findCaptureSpot(opt.spots, opt.captureSpot));
+                    else
+                        for (const CaptureSpot& sp : opt.spots) todo.push_back(&sp);
+                    if (!opt.captureAll.empty()) fs::create_directories(opt.captureAll);
+                    for (const CaptureSpot* sp : todo) {
+                        const CaptureView v = prepareCapture(*sp, *drive, *streamer, renderer, *terrain);
+                        renderer.setFocus(v.focus);
+                        renderer.speedBlur = 0;
+                        Options frame = opt;
+                        frame.shot = opt.captureAll.empty() ? opt.shot : (fs::path(opt.captureAll) / (sp->name + ".png")).string();
+                        std::printf("%s\n", v.report.c_str());
+                        const double gpuMs = renderShot(device, renderer, frame, v.cam);
+                        std::printf("wrote %s (%dx%d, gpu %.1f ms)\n", frame.shot.c_str(), frame.width, frame.height, gpuMs);
+                    }
+                    return 0;
+                }
                 if (!opt.race.empty()) {
                     race = std::make_unique<RaceSession>();
                     race->terrain = terrain.get();

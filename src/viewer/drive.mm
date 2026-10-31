@@ -636,6 +636,36 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
     applySolids(physics);
 }
 
+void WorldStreamer::settle(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics) {
+    if (job_.valid()) (void)job_.get();  // stale: built for an earlier position
+    if (grassJob_.valid()) grassCache_ = std::move(grassJob_.get().cache);
+    if (tileJob_.valid()) (void)tileJob_.get();
+    rerun_ = false;
+    grassAt_ = {1e30f, 0, 1e30f};  // rebuild grass and both fine colour tiles here
+    tileAt_[0] = tileAt_[1] = simd_make_float2(1e30f, 1e30f);
+    update(player, renderer, physics, true);
+}
+
+std::vector<WorldStreamer::GroundGap> WorldStreamer::groundGaps(double x, double z, double radius, float minGap) const {
+    std::vector<GroundGap> out;
+    if (terrain_ == nullptr) return out;
+    const int64_t r = int64_t(std::ceil(radius / kCell));
+    const int64_t cx = int64_t(std::floor(x / kCell)), cz = int64_t(std::floor(z / kCell));
+    for (int64_t dz = -r; dz <= r; ++dz)
+        for (int64_t dx = -r; dx <= r; ++dx) {
+            auto it = cells_.find(cellKey(cx + dx, cz + dz));
+            if (it == cells_.end()) continue;
+            for (uint32_t i : it->second) {
+                const Placed& p = placed_[i];
+                if (p.fitToGround || std::hypot(p.world[12] - x, p.world[14] - z) > radius) continue;
+                const float gap = p.world[13] - terrain_->smoothHeightAt(p.world[12], p.world[14]);
+                if (std::fabs(gap) >= minGap) out.push_back({p.meshId, simd_make_float3(p.world[12], p.world[13], p.world[14]), gap});
+            }
+        }
+    std::sort(out.begin(), out.end(), [](const GroundGap& a, const GroundGap& b) { return a.gap > b.gap; });
+    return out;
+}
+
 WorldStreamer::RoadMesh WorldStreamer::buildRoads(simd_float3 player) const {
     // Nearby lines from the road grid.
     std::set<uint32_t> lines;
