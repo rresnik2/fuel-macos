@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -524,9 +525,15 @@ struct DriveWorld::Impl {
             models.push_back(v->model.get());
         }
         const auto t1 = std::chrono::steady_clock::now();
+        const uint64_t cells0 = tris.cellsBuilt, heights0 = tris.heightsEvaluated;
         fv::stepVehicles(models, env, kStep);
         const auto t2 = std::chrono::steady_clock::now();
-        tris.trim(20000);
+        static const bool trace = std::getenv("FUEL_PHYS_TRACE") != nullptr;
+        if (trace && std::chrono::duration<float, std::milli>(t2 - t1).count() > 3.0f)
+            std::fprintf(stderr, "slow vehicle step %.1f ms: %llu cells built, %llu heights evaluated, %zu cached cells\n",
+                         std::chrono::duration<float, std::milli>(t2 - t1).count(), (unsigned long long)(tris.cellsBuilt - cells0),
+                         (unsigned long long)(tris.heightsEvaluated - heights0), tris.cachedCells());
+        tris.trim(6000);
         for (auto& vp : vehicles) {
             Vehicle& v = *vp;
             fv::FuelVehicle& m = *v.model;

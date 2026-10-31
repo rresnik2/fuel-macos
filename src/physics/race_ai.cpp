@@ -1,5 +1,8 @@
 #include "race_ai.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <algorithm>
 #include <cmath>
 
@@ -197,6 +200,9 @@ DriveInput RaceDriver::drive(const RaceLine& line, size_t next, const Sense& s, 
     // ahead of where it is.
     if (!resetWanted_ && (stuckTotal_ > 4.0f || upsideDown_ > 4.0f || sinceProgress_ > 12.0f)) {
         resetWanted_ = true;
+        if (std::getenv("FUEL_AI_TRACE"))
+            std::printf("ai reset at (%.0f, %.0f): stuck %.1f s, upside down %.1f s, no progress %.1f s, %.0f km/h, remaining %.0f m\n", s.x, s.z,
+                        stuckTotal_, upsideDown_, sinceProgress_, kmh, remaining);
         // 6 m ahead, then 30 m more for each reset that did not help; never past the target.
         const float ahead = std::min(6.0f + 30.0f * float(failedResets_), std::max(0.0f, remaining - 30.0f));
         resetAt_ = line.pointAhead(next, s.x, s.z, ahead, &resetHeading_);

@@ -408,10 +408,13 @@ bool sphereTriangle(const Tri& t, const Vec3& c, float r, float& depth, Vec3& n,
 }
 
 float TerrainTriangles::sample(int64_t x, int64_t z) {
-    const uint64_t key = (uint64_t(uint32_t(int32_t(x))) << 32) | uint32_t(int32_t(z));
+    // Keyed by world coordinates (the origin is a whole number of metres).
+    const int64_t wx = x + int64_t(std::llround(ox_)), wz = z + int64_t(std::llround(oz_));
+    const uint64_t key = (uint64_t(uint32_t(int32_t(wx))) << 32) | uint32_t(int32_t(wz));
     auto it = samples_.find(key);
     if (it != samples_.end()) return it->second;
-    const float h = height_(double(x) + ox_, double(z) + oz_);
+    const float h = height_(double(wx), double(wz));
+    ++heightsEvaluated;
     samples_.emplace(key, h);
     return h;
 }
@@ -425,6 +428,7 @@ const TerrainTriangles::Cell& TerrainTriangles::cell(int64_t ix, int64_t iz) {
     }
     Cell c;
     c.used = ++tick_;
+    ++cellsBuilt;
     const int64_t x0 = ix * 4, z0 = iz * 4;
     Vec3 pt[9];
     for (int i = 0; i < 9; ++i) {
@@ -488,7 +492,7 @@ void TerrainTriangles::trim(size_t maxCells) {
     if (cells_.size() <= maxCells) return;
     const uint64_t keep = tick_ > maxCells ? tick_ - maxCells : 0;
     for (auto it = cells_.begin(); it != cells_.end();) it = it->second.used < keep ? cells_.erase(it) : std::next(it);
-    if (samples_.size() > maxCells * 12) samples_.clear();
+    if (samples_.size() > 400000) samples_.clear();  // ~16 MB; world-keyed, so this is rare
 }
 
 }  // namespace fuel::fv

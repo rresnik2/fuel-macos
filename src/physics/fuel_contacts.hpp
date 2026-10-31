@@ -179,7 +179,7 @@ public:
     explicit TerrainTriangles(HeightFn h) : height_(std::move(h)) {}
     void setOrigin(double ox, double oz) {
         ox_ = ox, oz_ = oz;
-        cells_.clear();
+        cells_.clear();  // (the height samples are keyed by world coordinates and survive)
     }
     // Triangles of the cells overlapping the square around (cx, cz) (local coordinates) of half-size r.
     void query(float cx, float cz, float r, std::vector<const Tri*>& out);
@@ -187,6 +187,8 @@ public:
     // (then it builds the cell).
     float surfaceHeight(float x, float z, Vec3* normal = nullptr);
     size_t cachedCells() const { return cells_.size(); }
+    // Counters for the cost report: cells built and heights evaluated since construction.
+    uint64_t cellsBuilt = 0, heightsEvaluated = 0;
     void trim(size_t maxCells);  // drops the oldest cells beyond maxCells
 
 private:
