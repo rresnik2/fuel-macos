@@ -7,6 +7,7 @@
 #include "core/roads.hpp"
 #include "core/vegetation.hpp"
 #include "core/world.hpp"
+#include "physics/fuel_camera.hpp"
 #include "physics/vehicle_physics.hpp"
 #include "renderer.h"
 
@@ -15,16 +16,24 @@
 #include <unordered_map>
 #include <vector>
 
+class RiderView;
+// The riders' animation and skinning (rider_view.h); set by the viewer, null = static riders.
+extern RiderView* gRiderView;
+
 // The drawn parts of one vehicle and how they follow its physics state.
 class VehicleRig {
 public:
-    // `riders`: extra meshes (the baked rider, in vehicle space) that follow the chassis.
+    // `riders`: extra meshes (the rider, in vehicle space) that follow the chassis; animated when gRiderView
+    // knows them (RiderView::animated).
     VehicleRig(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const std::vector<uint32_t>& riders);
     // The parts in vehicle space, for MeshRenderer::setScene.
     const std::vector<fuel::MeshInstance>& parts() const { return parts_; }
     const fuel::VehicleSetup& setup() const { return setup_; }
-    // Rider body language for this frame's input.
-    void animate(float dt, const fuel::DriveInput& input, float speedKmh);
+    // The rider for this frame (FUEL's rider state machine, rider_anim.hpp).
+    void animate(float dt, const fuel::DriveInput& input, const fuel::VehicleState& st, const fuel::fv::FuelVehicle* model, bool player,
+                 int raceState, const fuel::Heightfield& terrain);
+    // Skins the animated rider into the renderer's mesh.
+    void uploadRider() const;
     // World matrices for the parts, in parts() order.
     std::vector<simd_float4x4> partWorlds(const fuel::VehicleState& st) const;
     simd_float3 focus(const fuel::VehicleState& st) const;  // a point on the body, for the camera
@@ -33,9 +42,9 @@ private:
     struct PartLink {
         int wheel = -1;              // physics wheel driving this part, -1 = chassis
         simd_float4x4 local;         // vehicle space (chassis parts) or wheel-model space (rotation only)
-        bool rider = false;          // leans with the driving input
+        bool rider = false;          // the rider (follows the chassis, or its own fall when ejected)
+        uint32_t key = 0;            // rider mesh key
     };
-    float lean_ = 0, pitch_ = 0;     // rider body language (radians), smoothed
     fuel::VehicleSetup setup_;
     std::vector<fuel::MeshInstance> parts_;
     std::vector<PartLink> links_;
@@ -75,30 +84,45 @@ public:
     fuel::VehicleState state(int i = 0) const { return world_.state(i); }
     simd_float3 position(int i = 0) const { return rigs_[size_t(i)].focus(world_.state(i)); }  // a point on the body, for the camera
     fuel::DriveWorld& physics() { return world_; }
+    const fuel::DriveWorld& physics() const { return world_; }
+    const fuel::Heightfield& terrain() const { return terrain_; }
     float heading(int i = 0) const;  // radians; 0 = +z
+    // Race state for the riders (FUEL's race-state +0x48: 4 start, 6 finished, 0 otherwise).
+    void setRaceState(int s) { raceState_ = s; }
+    // Skins the animated riders (call before drawing a frame).
+    void uploadRiders() const {
+        for (const VehicleRig& r : rigs_) r.uploadRider();
+    }
 
 private:
+    const fuel::Heightfield& terrain_;
+    int raceState_ = 0;
     fuel::DriveWorld world_;
     std::vector<VehicleRig> rigs_;
     std::vector<fuel::DriveInput> inputs_;
 };
 
-// The racing chase camera: low and close behind the vehicle, swinging round after
-// it with some lag. It drops back when the vehicle accelerates and closes in when
-// it brakes, and pulls back and widens its field of view with speed.
+// FUEL's player camera (CameraMove_G, physics/fuel_camera.hpp) on the player's vehicle of a drive session:
+// near chase (view 5, default), first person (1) and far chase (4), cycled with the CAMERA button, plus the
+// race intro (8), finish (9) and wreck/drown (10/11) views. The camera collides with the terrain and the
+// static objects (sphere push-out) and with the other vehicles.
 class ChaseCamera {
 public:
-    // Call every frame (or physics step). `yawOffset` looks around the vehicle
-    // (radians), `pitchOffset` raises the camera, `zoom` scales the distance.
-    fuel::OrbitCamera update(float dt, const DriveSession& drive, float sceneRadius, float yawOffset = 0, float pitchOffset = 0,
-                             float zoom = 1);
-    simd_float3 focus() const { return focus_; }  // for MeshRenderer::setFocus (vertically smoothed)
-    float speedEffect() const;                     // 0..1, for MeshRenderer::speedBlur
+    fuel::OrbitCamera update(float dt, const DriveSession& drive, const fuel::cam::CameraControls& in = {},
+                             fuel::cam::Override ov = fuel::cam::Override::None);
+    simd_float3 focus() const { return focus_; }  // for MeshRenderer::setFocus (the vehicle)
+    float speedEffect() const { return blur_; }   // 0..1 of FUEL's speed blur (P572..P573), for MeshRenderer::speedBlur
+    int view() const { return cam_.view(); }
+    void setView(int v) { cam_.setPlayerView(v); }
+    const fuel::cam::CameraPose& pose() const { return pose_; }
 
 private:
-    bool started_ = false;
-    float yaw_ = 0, speedFast_ = 0, speedSlow_ = 0, surge_ = 0;
+    fuel::cam::ChaseCamera cam_;
+    fuel::cam::CameraPose pose_;
     simd_float3 focus_ = {0, 0, 0};
+    float blur_ = 0;
+    double prev_[3] = {0, 0, 0};
+    bool havePrev_ = false;
 };
 
 // Dust thrown up by the wheels: billowing particles, more on loose ground and

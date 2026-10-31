@@ -60,6 +60,13 @@ struct OrbitCamera {
     float distance = 2.1f; // in model radii
     float fovY = 0.70f;    // vertical field of view, radians
     float aim = 0;         // the camera looks this many metres above the focus
+    // FUEL's cameras (physics/fuel_camera.hpp) give the pose directly: eye and target (world), roll about the
+    // view axis, near plane and the horizontal FOV of a 4:3 frame (Hor+ for wider frames, A10).
+    bool explicitPose = false;
+    simd_float3 eye = {0, 0, 0}, target = {0, 0, 1};
+    float roll = 0;      // radians
+    float zNear = 0.25f;
+    float fovH43 = 0;    // radians; > 0 replaces fovY
 };
 
 // Vehicle paint: the colour mixed in where the diffuse alpha is 0, and the
@@ -103,6 +110,8 @@ public:
     // livery bitmaps substituted. Replaces an earlier mesh with the same key;
     // pick keys that are not Mesh_Z IDs. Returns false (and says why) on bad data.
     bool addBakedMesh(uint32_t key, const BakedMesh& mesh, std::string* error);
+    // New vertices (same count and layout) for a baked mesh: the animated riders, skinned every frame.
+    void updateBakedVertices(uint32_t key, const std::vector<uint8_t>& vertices);
 
     // Shows one Mesh_Z at the origin; returns false with a reason on failure.
     bool setMesh(uint32_t meshId, std::string* error);
@@ -158,6 +167,7 @@ public:
     // (viewport +0x1dc = VehiclePP 574 x the speed fraction; 0.015 for most vehicles).
     float speedBlur = 0;
     float speedBlurMax = 0.015f;
+    float speedBlurAbsolute = -1;  // >= 0: FUEL's blur strength (viewport +0x1dc) from the camera, used as is
     bool postEffects = true;  // false: tone mapping and auto exposure only (no bloom, star, radial blur)
 
     // ---- Time of day and weather (p26-renderer.md L1-L5)

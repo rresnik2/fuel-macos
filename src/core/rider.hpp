@@ -67,6 +67,36 @@ public:
     std::vector<Mat4> pose(int slot, double time) const;
     size_t boneCount() const { return skel_.bones.size(); }
 
+    // ---- per-frame animation (rider_anim.*) ----
+    struct BoneTRS {
+        std::array<double, 4> q{0, 0, 0, 1};
+        std::array<double, 3> t{}, s{1, 1, 1};
+    };
+    bool hasSlot(int slot) const { return animSlots_.count(uint32_t(slot)) != 0; }
+    float duration(int slot) const;  // seconds
+    bool loops(int slot) const;      // Animation_Z flags bit 0 (header u16 at +8)
+    // Local TRS of every bone at `time` (bones without a track keep the bind TRS); `has[b]` = the animation
+    // has a track for bone b (the layer's per-bone mask).
+    void sampleLocal(int slot, double time, std::vector<BoneTRS>& out, std::vector<uint8_t>* has) const;
+    std::vector<BoneTRS> bindLocal() const;
+    // World (model space) matrices from local TRS (FK, p9 S9).
+    std::vector<Mat4> worlds(const std::vector<BoneTRS>& local) const;
+    int bone(const std::string& name) const;  // -1 when absent
+    int parent(int b) const { return skel_.bones[size_t(b)].parent; }
+
+    // Skinning prepared once for a choice of parts and livery; skin() writes BakedMesh vertices for a pose.
+    struct SkinTemplate {
+        BakedMesh mesh;  // indices, batches, materials; vertices of the bind
+        struct V {
+            float pos[3], nrm[3], tan[3];
+            int bone[4];
+            float w[4];
+        };
+        std::vector<V> verts;
+    };
+    SkinTemplate prepareSkin(int head = 1, int chest = 1, int legs = 1, int livery = 1) const;
+    void skin(const SkinTemplate& t, const std::vector<Mat4>& world, std::vector<uint8_t>& vertices) const;
+
 private:
     struct Track {
         std::vector<std::pair<float, std::array<float, 3>>> translation, scale;
@@ -75,6 +105,7 @@ private:
     struct Animation {
         std::map<uint32_t, Track> tracks;  // by bone name CRC
         float duration = 0;
+        bool loop = false;
     };
     const Animation& animation(int slot) const;
     std::vector<Mat4> poseWorlds(const Animation* a, double time) const;
@@ -88,6 +119,7 @@ private:
     std::map<uint32_t, size_t> boneByName_;
     std::map<uint32_t, uint32_t> materialByName_;  // Material_Z by name CRC (first)
     std::map<uint32_t, uint32_t> liveryByName_;    // MaterialAnim_Z name CRC -> Material_Z
+    std::vector<Mat4> invBind_;                    // inverse bind world per bone
     mutable std::map<uint32_t, Animation> anims_;
 };
 

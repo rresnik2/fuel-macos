@@ -119,18 +119,25 @@ CaptureView prepareCapture(const CaptureSpot& spot, DriveSession& drive, WorldSt
     CaptureView v;
     v.vehicle = drive.position();
     v.ground = terrain.smoothHeightAt(v.vehicle.x, v.vehicle.z);
-    ChaseCamera chase;  // the window's chase camera, at rest
-    v.cam = chase.update(1.0f / 60, drive, renderer.sceneRadius());
+    ChaseCamera chase;  // FUEL's chase camera (view 5), at rest
+    drive.uploadRiders();
+    v.cam = chase.update(1.0f / 60, drive);
     v.focus = chase.focus();
+    simd_float3 eye = v.cam.eye;
+    float dist = simd_distance(eye, v.focus);
     if (spot.distance >= 0) {  // an explicit orbit behind the vehicle
         const float radius = std::max(renderer.sceneRadius(), 0.05f);
+        v.cam = fuel::OrbitCamera{};
         v.cam.yaw = drive.heading() + float(M_PI);
         v.cam.pitch = spot.pitchDeg * float(M_PI) / 180.0f;
         v.cam.distance = spot.distance / radius;
+        dist = v.cam.distance * radius;
+        eye = v.focus + dist * simd_make_float3(std::cos(v.cam.pitch) * std::sin(v.cam.yaw), std::sin(v.cam.pitch),
+                                                std::cos(v.cam.pitch) * std::cos(v.cam.yaw));
+    } else {
+        v.cam.pitch = std::asin(std::clamp(simd_normalize(v.cam.target - eye).y, -1.0f, 1.0f));
+        v.cam.fovY = 2.0f * std::atan(std::tan(v.cam.fovH43 * 0.5f) * 0.75f);
     }
-    const float dist = v.cam.distance * std::max(renderer.sceneRadius(), 0.05f);
-    const simd_float3 eye = v.focus + dist * simd_make_float3(std::cos(v.cam.pitch) * std::sin(v.cam.yaw), std::sin(v.cam.pitch),
-                                                              std::cos(v.cam.pitch) * std::cos(v.cam.yaw));
     char line[512];
     std::snprintf(line, sizeof line,
                   "capture %s: vehicle (%.1f, %.1f, %.1f) heading %.0f deg, %.2f m above the port terrain (%.1f, slope %.0f deg), %.1f km/h; "
