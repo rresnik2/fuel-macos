@@ -95,6 +95,15 @@ const CaptureSpot* findCaptureSpot(const std::vector<CaptureSpot>& spots, const 
 CaptureView prepareCapture(const CaptureSpot& spot, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer,
                            const fuel::Heightfield& terrain) {
     const float heading = spot.headingDeg * float(M_PI) / 180.0f;
+    // The spot's ForceDayTime HH.MM, unless --time chose one (the renderer's forcedTimeOfDay is then set).
+    bool timeApplied = false;
+    if (!spot.timeOfDay.empty() && !renderer.timeFromCommandLine) {
+        int h = 0, m = 0;
+        if (std::sscanf(spot.timeOfDay.c_str(), "%d.%d", &h, &m) >= 1) {
+            renderer.forcedTimeOfDay = (std::clamp(h, 0, 23) * 60 + std::clamp(m, 0, 59)) * 60.0;
+            timeApplied = true;
+        }
+    }
     drive.teleport(spot.x, spot.z, heading);
     streamer.update(drive.position(), renderer, drive.physics(), true);
     // 2 s on the handbrake (the brake pedal reverses once stopped): the vehicle drops onto the
@@ -136,7 +145,7 @@ CaptureView prepareCapture(const CaptureSpot& spot, DriveSession& drive, WorldSt
                   spot.name.c_str(), v.vehicle.x, v.vehicle.y, v.vehicle.z, drive.heading() * 57.29578f, v.vehicle.y - v.ground, v.ground,
                   slopeDeg(terrain, v.vehicle.x, v.vehicle.z), drive.state().speedKmh, spot.distance >= 0 ? "orbit" : "chase", v.cam.pitch * 57.29578f,
                   dist, v.cam.fovY * 57.29578f, eye.x, eye.y, eye.z,
-                  spot.timeOfDay.empty() ? "" : ("; time of day " + spot.timeOfDay + " not applied (the port's sun is fixed)").c_str());
+                  spot.timeOfDay.empty() ? "" : ("; time of day " + spot.timeOfDay + (timeApplied ? "" : " (overridden by --time)")).c_str());
     v.report = line;
     return v;
 }

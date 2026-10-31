@@ -894,7 +894,10 @@ WorldStreamer::GroundTile WorldStreamer::buildGroundTile(int level, simd_float3 
                     const size_t o = (size_t(j) * n + i) * 4;
                     uint8_t* px = &t.rgba[o];
                     for (int q = 0; q < 3; ++q) px[q] = uint8_t(std::clamp(c.base[q], 0.0f, 1.0f) * 255.0f + 0.5f);
-                    px[3] = uint8_t(std::clamp(c.forest, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    // Alpha: the ground's sky occlusion for the lighting (ground.vhl; P28). Inferred to be stored
+                    // like the tufts' byte clamp(0.8 a + 0.2), a = ctx+0x230. (The far band's forest weight comes
+                    // from the 60 m map.)
+                    px[3] = uint8_t(std::clamp(0.8f * c.occlusion + 0.2f, 0.0f, 1.0f) * 255.0f + 0.5f);
                     // Record bytes R+0x3a..0x41 (0x6ac120): weight byte = floor(255 w + 0.5).
                     for (int q = 0; q < 4; ++q)
                         t.types[o + size_t(q)] =

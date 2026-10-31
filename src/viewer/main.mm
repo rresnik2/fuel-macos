@@ -38,6 +38,7 @@
 #include "eventcheck.h"
 #include "hubcheck.h"
 #include "capture.h"
+#include "rendercheck.h"
 #include "core/terrain_height.hpp"
 #include "core/hubs.hpp"
 #import <GameController/GameController.h>
@@ -104,6 +105,9 @@ struct Options {
     int opponents = -1;    // --race: AI opponents on the grid (-1: the event's EMD_SetNbIA)
     bool aiCheck = false;  // --ai-check: race headless and report the opponents' progress
     float driveTime = 4.0f;
+    double timeOfDay = -1;     // --time HH.MM: FUEL's ForceDayTime (seconds of the day); < 0 the running clock
+    float cloud = 0, fog = 0, wet = 0;  // --weather C,F,W: inputs of World_SetWeatherAtmosphere (0..1)
+    bool renderCheck = false;  // --rendercheck: the renderer's test vectors (no game data needed)
     bool haveAt = false;
     float atX = 0, atZ = 0, atYaw = 0;
     std::string hub;       // --hub NAME: start at that hub's camp (free roam)
@@ -198,6 +202,16 @@ Options parseArgs(int argc, const char** argv) {
             return argv[++i];
         };
         if (a == "--data") o.dataDir = next();
+        else if (a == "--time") {  // ForceDayTime HH.MM (0x4d64d0): H 0..23, M 0..59
+            const std::string v = next();
+            int h = 0, m = 0;
+            if (std::sscanf(v.c_str(), "%d.%d", &h, &m) < 1) die("bad --time (use HH.MM)");
+            o.timeOfDay = (std::clamp(h, 0, 23) * 60 + std::clamp(m, 0, 59)) * 60.0;
+        }
+        else if (a == "--weather") {
+            if (std::sscanf(next().c_str(), "%f,%f,%f", &o.cloud, &o.fog, &o.wet) < 1) die("bad --weather (use CLOUD,FOG,WET in 0..1)");
+        }
+        else if (a == "--rendercheck") o.renderCheck = true;
         else if (a == "--mesh") { o.meshId = uint32_t(std::stoul(next(), nullptr, 16)); o.haveMeshId = true; }
         else if (a == "--shot") o.shot = next();
         else if (a == "--scene") o.scene = next();
@@ -1396,6 +1410,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     _drive->uploadRiders();
     _renderer->setFocus(_chase.focus());
     _renderer->speedBlur = _chase.speedEffect();
+    _renderer->speedBlurAbsolute = _chase.pose().blur;  // FUEL's viewport +0x1dc (P574 x the speed fraction)
     _dust.update(dt, *_drive, _drive->position());
     _renderer->setDust(_dust.particles());
     const fuel::VehicleState st = _drive->state();
@@ -1477,6 +1492,7 @@ int main(int argc, const char** argv) {
     @autoreleasepool {
         Options opt = parseArgs(argc, argv);
         if (opt.menuCheck) return fuel::ui::runMenuCheck(opt.dataDir, fuel::loadSettings().language);
+        if (opt.renderCheck) return fuel::runRenderCheck(opt.dataDir);
         if (opt.camCheck) return runCamCheck(opt.dataDir);
         if (!opt.menuShot.empty()) {
             fuel::Settings ms = fuel::loadSettings();
@@ -1543,6 +1559,9 @@ int main(int argc, const char** argv) {
         if (!device.supportsBCTextureCompression) die("this GPU cannot sample DXT (BC) textures");
         fuel::MeshRenderer renderer(device, kSamples, library);
         renderer.postEffects = std::getenv("FUEL_NO_POST") == nullptr;  // FUEL_NO_POST=1: plain tone mapping (O toggles in the window)
+        renderer.timeFromCommandLine = opt.timeOfDay >= 0;
+        renderer.forcedTimeOfDay = opt.timeOfDay;  // --time: ForceDayTime; else 08:00 + the game clock x PP371
+        renderer.weather.cloud = opt.cloud, renderer.weather.fog = opt.fog, renderer.weather.wet = opt.wet;
         fuel::Settings playerSettings;
         if (opt.settings) {
             playerSettings = fuel::loadSettings();
@@ -1968,7 +1987,10 @@ int main(int argc, const char** argv) {
                             if (race) renderer.setMarkers(race->markers());
                             renderer.setFocus(chase.focus());
                             renderer.speedBlur = chase.speedEffect();
+                            renderer.speedBlurAbsolute = chase.pose().blur;
                             renderer.setDust(dust.particles());
+                            renderer.gameClock = i / 60.0;            // the time of day runs with the race clock
+                            renderer.exposureDt = std::max(opt.film, 0.0f);  // the eye adapts over the time between frames
                             Options frame = opt;
                             const fs::path out(opt.shot);
                             char suffix[16];

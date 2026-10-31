@@ -23,6 +23,8 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed);
 // (next to the game data that holds `world`); empty when it cannot be read.
 // Engine constant tables are read this way instead of being copied into the port.
 std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count);
+// The same from the FUEL.exe at `exe`.
+std::vector<float> readEngineFloats(const std::string& exe, uint32_t va, size_t count);
 
 // Path of the player's FUEL.exe next to the game data that holds `world`.
 std::string engineExePath(const DpcFile& world);

@@ -19,7 +19,7 @@ struct CaptureSpot {
     float headingDeg = 0;   // vehicle heading: 0 faces +z, 90 faces +x (FUEL's TeLePort third argument, in degrees)
     float pitchDeg = -1;    // camera pitch above the horizon; < 0 ("chase"): the port's chase camera at rest
     float distance = -1;    // camera distance from the vehicle in metres; < 0 ("chase"): the chase camera
-    std::string timeOfDay;  // HH.MM as FUEL's ForceDayTime takes it; the port's sun is fixed, so it is only reported
+    std::string timeOfDay;  // HH.MM as FUEL's ForceDayTime takes it (applied unless --time is given)
     std::string notes;
 };
 
