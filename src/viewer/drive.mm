@@ -1,4 +1,5 @@
 #import "drive.h"
+#include "rider_view.h"
 
 #include <algorithm>
 #include <cmath>
@@ -62,38 +63,66 @@ VehicleRig::VehicleRig(const fuel::AssembledVehicle& vehicle, const fuel::Vehicl
     }
     for (uint32_t id : riders) {
         parts_.push_back({id, matrix_identity_float4x4});
-        links_.push_back({-1, matrix_identity_float4x4, true});
+        links_.push_back({-1, matrix_identity_float4x4, true, id});
     }
     for (const auto& w : setup.wheels) focusHeight_ = std::max(focusHeight_, w.hub[1] + w.radius * 0.6f);
 }
 
-void VehicleRig::animate(float dt, const fuel::DriveInput& input, float speedKmh) {
-    // The rider leans into turns (more with speed) and forward/back with throttle and brakes.
-    const float speed = std::fabs(speedKmh) / 3.6f;
-    const float leanTarget = setup_.bike ? 0.0f : input.steer * std::min(speed / 15.0f, 1.0f) * 0.32f;
-    const float pitchTarget = (input.throttle - input.brake) * 0.12f;
-    const float k = std::min(1.0f, dt * 6.0f);
-    lean_ += (leanTarget - lean_) * k;
-    pitch_ += (pitchTarget - pitch_) * k;
+RiderView* gRiderView = nullptr;
+
+void VehicleRig::animate(float dt, const fuel::DriveInput& input, const fuel::VehicleState& st, const fuel::fv::FuelVehicle* model, bool player,
+                         int raceState, const fuel::Heightfield& terrain) {
+    if (gRiderView == nullptr || model == nullptr || dt <= 0) return;
+    for (const PartLink& l : links_) {
+        if (!l.rider) continue;
+        fuel::RiderAnimator* a = gRiderView->animator(l.key);
+        if (a == nullptr) continue;
+        fuel::RiderDrive d;
+        d.dt = dt;
+        d.q = st.chassis.rotation;
+        d.pos = st.chassis.position;
+        const fuel::fv::Vec3 v = model->body().avgV;
+        d.vel = {v.x, v.y, v.z};
+        d.steer = input.steer;
+        d.stickZ = 0;  // the port's input has no fore/aft lean axis
+        d.airtime = model->airtime();
+        d.heightAbove = model->heightAboveGround();
+        d.gear = model->gear();
+        d.sliding = model->slidingMajority();
+        d.bump = model->body().impactSpeed;
+        d.wheelBumps = model->meanWheelBumpsRot();
+        d.accel = input.throttle > 0;
+        d.brake = input.brake > 0;
+        d.player = player;
+        d.ejected = model->riderEjected();
+        d.raceState = raceState;
+        d.ground = [&terrain](double x, double z) { return terrain.smoothHeightAt(x, z); };
+        a->update(d);
+    }
+}
+
+void VehicleRig::uploadRider() const {
+    if (gRiderView == nullptr) return;
+    for (const PartLink& l : links_)
+        if (l.rider) gRiderView->upload(l.key);
 }
 
 std::vector<simd_float4x4> VehicleRig::partWorlds(const fuel::VehicleState& st) const {
     const simd_float4x4 chassis = poseMatrix(st.chassis);
-    // Rider pose offset: rotate about the seat (forward axis for lean, sideways for pitch).
-    const float seat = focusHeight_ * 0.55f;
-    simd_float4x4 toSeat = matrix_identity_float4x4, fromSeat = matrix_identity_float4x4;
-    toSeat.columns[3] = simd_make_float4(0, -seat, 0, 1);
-    fromSeat.columns[3] = simd_make_float4(0, seat, 0, 1);
-    const simd_float4x4 rot = simd_matrix4x4(simd_mul(simd_quaternion(lean_, simd_make_float3(0, 0, 1)),
-                                                      simd_quaternion(pitch_, simd_make_float3(1, 0, 0))));
-    const simd_float4x4 riderPose = simd_mul(chassis, simd_mul(fromSeat, simd_mul(rot, toSeat)));
     std::vector<simd_float4x4> out;
     out.reserve(links_.size());
     for (const PartLink& l : links_) {
-        if (l.wheel >= 0 && size_t(l.wheel) < st.wheels.size())
+        if (l.wheel >= 0 && size_t(l.wheel) < st.wheels.size()) {
             out.push_back(simd_mul(poseMatrix(st.wheels[size_t(l.wheel)]), l.local));
-        else
-            out.push_back(simd_mul(l.rider ? riderPose : chassis, l.local));
+        } else if (l.rider && gRiderView != nullptr && gRiderView->animator(l.key) && gRiderView->animator(l.key)->detached()) {
+            // the ejected rider: its bones are world-space offsets from where it left the vehicle
+            const auto o = gRiderView->animator(l.key)->worldOrigin();
+            simd_float4x4 m = matrix_identity_float4x4;
+            m.columns[3] = simd_make_float4(float(o[0]), float(o[1]), float(o[2]), 1);
+            out.push_back(m);
+        } else {
+            out.push_back(simd_mul(chassis, l.local));
+        }
     }
     return out;
 }
@@ -104,7 +133,7 @@ simd_float3 VehicleRig::focus(const fuel::VehicleState& st) const {
 
 DriveSession::DriveSession(const fuel::AssembledVehicle& vehicle, const fuel::VehicleSetup& setup, const fuel::Heightfield& terrain,
                            double x, double z, float yaw, const std::vector<uint32_t>& riders)
-    : world_(terrain) {
+    : terrain_(terrain), world_(terrain) {
     addVehicle(vehicle, setup, x, z, yaw, riders);
 }
 
@@ -130,7 +159,8 @@ void DriveSession::update(float dt, const fuel::DriveInput& input) {
     inputs_[0] = input;
     for (int i = 0; i < vehicleCount(); ++i) world_.setInput(i, inputs_[size_t(i)]);
     world_.update(dt);
-    for (int i = 0; i < vehicleCount(); ++i) rigs_[size_t(i)].animate(dt, inputs_[size_t(i)], world_.state(i).speedKmh);
+    for (int i = 0; i < vehicleCount(); ++i)
+        rigs_[size_t(i)].animate(dt, inputs_[size_t(i)], world_.state(i), world_.model(i), i == 0, i == 0 ? raceState_ : 0, terrain_);
 }
 
 float DriveSession::heading(int i) const {
@@ -148,41 +178,83 @@ float smoothstep(float a, float b, float x) {
 
 }  // namespace
 
-fuel::OrbitCamera ChaseCamera::update(float dt, const DriveSession& drive, float sceneRadius, float yawOffset, float pitchOffset,
-                                      float zoom) {
-    const float speed = std::fabs(drive.state().speedKmh);
-    const simd_float3 at = drive.position();
-    const float behind = drive.heading() + float(M_PI) + yawOffset;
-    if (!started_ || simd_distance(at, focus_) > 30.0f) {  // first frame, or a reset/teleport
-        started_ = true;
-        yaw_ = behind;
-        speedFast_ = speedSlow_ = speed;
-        surge_ = 0;
-        focus_ = at;
+fuel::OrbitCamera ChaseCamera::update(float dt, const DriveSession& drive, const fuel::cam::CameraControls& in, fuel::cam::Override ov) {
+    namespace cam = fuel::cam;
+    const fuel::fv::FuelVehicle* m = drive.physics().model(0);
+    const fuel::VehicleState st = drive.state(0);
+    cam::VehicleInput vi;
+    const std::vector<float>& P = drive.setup(0).params;
+    if (m != nullptr && !P.empty() && dt > 0) {
+        vi.valid = true;
+        vi.q = {st.chassis.rotation[0], st.chassis.rotation[1], st.chassis.rotation[2], st.chassis.rotation[3]};
+        vi.ox = st.chassis.position[0], vi.oy = st.chassis.position[1], vi.oz = st.chassis.position[2];
+        vi.vel = m->body().avgV;
+        vi.angVel = m->body().avgW;
+        if (havePrev_)
+            vi.fdVel = {float((vi.ox - prev_[0]) / dt), float((vi.oy - prev_[1]) / dt), float((vi.oz - prev_[2]) / dt)};
+        else
+            vi.fdVel = vi.vel;
+        prev_[0] = vi.ox, prev_[1] = vi.oy, prev_[2] = vi.oz, havePrev_ = true;
+        vi.gear = m->gear();
+        vi.sliding = m->slidingMajority();
+        vi.airtime = m->airtime();
+        vi.heightAbove = m->heightAboveGround();
+        vi.wreck = m->wreckState();
+        vi.anyWheelLoaded = m->anyLoaded();
+        vi.maxBumps = m->maxWheelBumps();
+        const float top = P.size() > 619 ? P[619] : 0.0f;
+        vi.speedFrac = top > 0 ? std::clamp(fuel::fv::len(m->body().S.v) / (top * 0.869565f * 0.277778f), 0.0f, 1.0f) : 0.0f;
+        vi.P = &P;
     }
-    speedFast_ += (speed - speedFast_) * std::min(1.0f, dt * 6.0f);
-    speedSlow_ += (speed - speedSlow_) * std::min(1.0f, dt * 1.2f);
-    // Accelerating leaves the camera behind for a moment; braking lets it catch up.
-    surge_ += (std::clamp((speedFast_ - speedSlow_) * 0.025f, -0.5f, 0.6f) - surge_) * std::min(1.0f, dt * 4.0f);
-    const float fast = smoothstep(20.0f, 160.0f, speedSlow_);
-    yaw_ += std::remainder(behind - yaw_, 2.0f * float(M_PI)) * std::min(1.0f, dt * (2.5f + 2.5f * fast));
-    // Follow the body exactly across the ground, but smooth its bumps.
-    focus_.x = at.x, focus_.z = at.z;
-    focus_.y += (at.y - focus_.y) * std::min(1.0f, dt * 9.0f);
-
-    const float base = std::clamp(sceneRadius * 2.4f, 3.4f, 10.0f);  // metres behind at rest
-    const float back = std::max(1.5f, (base * (1.0f + 0.08f * fast) + surge_) * zoom);
-    const float up = std::max(0.3f, base * 0.36f * zoom + pitchOffset * back);
-    fuel::OrbitCamera cam;
-    cam.yaw = yaw_;
-    cam.pitch = std::atan2(up, back);
-    cam.distance = std::hypot(back, up) / std::max(sceneRadius, 0.05f);
-    cam.fovY = (56.0f + 12.0f * fast) * float(M_PI) / 180.0f;
-    cam.aim = base * 0.2f;
-    return cam;
+    cam::WorldQueries wq;
+    const fuel::Heightfield& terrain = drive.terrain();
+    const fuel::DriveWorld& world = drive.physics();
+    wq.ground = [&terrain, &world](double x, double y, double z, bool detail) {  // Cam_GroundHeight 0x402620
+        float h = std::max(detail ? terrain.smoothHeightAt(x, z) : terrain.baseHeightAt(x, z), -10000.0f);
+        h += std::max(0.0f, world.waterDepthAt(x, z));  // the water layer (U-B5): the lake surface
+        const float t = world.rayFraction({x, y, z}, {x, y - 100.0, z});
+        if (t < 1.0f) h = std::max(h, float(y - 100.0 * t));
+        return h;
+    };
+    wq.overlap = [&world, &drive](double x, double y, double z, float r, std::vector<cam::WorldQueries::Contact>& out) {  // 0x63a0b0
+        std::vector<fuel::DriveWorld::SphereContact> hits;
+        world.overlapStatics({x, y, z}, r, hits);
+        for (const auto& h : hits) {
+            if (h.volume <= 1.0f) continue;  // 0x4063a0: objects of more than 1 m^3
+            cam::WorldQueries::Contact c;
+            c.p = {float(h.p[0] - x), float(h.p[1] - y), float(h.p[2] - z)};
+            c.n = {h.n[0], h.n[1], h.n[2]};
+            c.d = fuel::fv::len(c.p);
+            out.push_back(c);
+        }
+        // the other vehicles (I: the query's mask includes vehicles; 0x402450 excludes the player's own), 1 m spheres
+        for (int i = 1; i < drive.vehicleCount(); ++i) {
+            const simd_float3 p = drive.position(i);
+            const fuel::fv::Vec3 d{float(p.x - x), float(p.y - y), float(p.z - z)};
+            const float l = fuel::fv::len(d), rr = 1.0f;
+            if (l >= r + rr || l < 1e-4f) continue;
+            cam::WorldQueries::Contact c;
+            c.n = d * (-1.0f / l);
+            c.p = d + c.n * rr;
+            c.d = fuel::fv::len(c.p);
+            out.push_back(c);
+        }
+    };
+    pose_ = cam_.update(dt, vi, wq, in, ov);
+    focus_ = drive.position(0);
+    const float lo = P.size() > 574 ? P[572] : 0, hi = P.size() > 574 ? P[573] : 1, mx = P.size() > 574 ? P[574] : 0;
+    blur_ = std::clamp(mx > 0 ? pose_.blur / mx : (hi > lo ? (fuel::fv::len(vi.vel) - lo) / (hi - lo) : 0.0f), 0.0f, 1.0f);
+    fuel::OrbitCamera c;
+    c.explicitPose = vi.valid;
+    c.eye = simd_make_float3(float(pose_.ex), float(pose_.ey), float(pose_.ez));
+    c.target = simd_make_float3(float(pose_.tx), float(pose_.ty), float(pose_.tz));
+    c.roll = pose_.roll;
+    c.zNear = pose_.zNear;
+    c.fovH43 = pose_.fovDeg * 0.017453292f;
+    c.fovY = 1.0f;
+    return c;
 }
 
-float ChaseCamera::speedEffect() const { return smoothstep(40.0f, 170.0f, speedSlow_); }
 
 float DustSystem::random() {
     rng_ ^= rng_ << 13, rng_ ^= rng_ >> 17, rng_ ^= rng_ << 5;

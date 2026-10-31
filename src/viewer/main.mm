@@ -489,7 +489,7 @@ struct Garage {
             if (it == params.end()) throw std::runtime_error("no driving parameters");
             av = am.assembler->assemble(am.variant(), am.lod);
             setup = fuel::makeVehicleSetup(am.assembler->dpc(), name, it->second, assembledHubs(av));
-            rider = riders ? riders->parts(name) : std::vector<uint32_t>{};
+            rider = riders ? riders->animated(name, av, am.assembler->dpc(), setup.params) : std::vector<uint32_t>{};
             return true;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "fuelview: %s: %s\n", name.c_str(), e.what());
@@ -906,6 +906,14 @@ void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> te
 }
 
 // Renders one frame to o.shot; returns its GPU time in milliseconds.
+// The camera override the race asks for (0x402930): the intro during the countdown (view 8), the finish (9).
+fuel::cam::Override cameraOverride(const RaceSession* race) {
+    if (race == nullptr) return fuel::cam::Override::None;
+    if (race->state == RaceSession::Countdown) return fuel::cam::Override::Intro;
+    if (race->state == RaceSession::Finished || (!race->rules.racers.empty() && race->rules.racers[0].finished >= 0)) return fuel::cam::Override::Finish;
+    return fuel::cam::Override::None;
+}
+
 // Rider vectors for --camcheck: the slot table and action properties replayed from the player's FUEL.exe
 // (emulated 0x5d6950 / 0x5d3660, p25 R2/R3) and the sway target 0x5d7d40.
 std::vector<fuel::CamCheckItem> riderCheckItems(const std::string& dataDir) {
@@ -1016,6 +1024,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     float _camYawOffset;      // mouse look around the chase camera
     fuel::OrbitCamera _startCam;  // --drive: mouse pitch and zoom act relative to this
     ChaseCamera _chase;       // --drive: the camera actually used (_cam holds the mouse's changes)
+    bool _viewChange;         // V pressed: the CAMERA button
     fuel::OrbitCamera _chaseView;
     DustSystem _dust;
     fuel::Recorder::Frame _frame;  // --record: this frame's timings
@@ -1077,6 +1086,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
         _lastTime = 0;
         _steer = 0;
         _camYawOffset = 0;
+        _viewChange = false;
         _startCam = cam;
         _sceneMode = assembly != nullptr || !scene.parts.empty();
         self.colorPixelFormat = kColorFormat;  // the renderer draws offscreen and finishes into the drawable
@@ -1247,6 +1257,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     NSString* ch = e.charactersIgnoringModifiers.lowercaseString;
     if ([ch isEqualToString:@"c"]) _renderer->cullBackFaces = !_renderer->cullBackFaces;
     else if ([ch isEqualToString:@"w"]) _renderer->wireframe = !_renderer->wireframe;
+    else if ([ch isEqualToString:@"v"]) _viewChange = true;
     else if ([ch isEqualToString:@"r"]) _cam = fuel::OrbitCamera{};
     else if ([ch isEqualToString:@"o"]) _renderer->postEffects = !_renderer->postEffects;
     else if ([ch isEqualToString:@"d"]) _renderer->dirt = _renderer->dirt >= 1.0f ? 0.0f : _renderer->dirt + 0.5f;
@@ -1351,6 +1362,7 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     _frame.dt = dt;
     double t0 = CACurrentMediaTime();
     if (_race) _race->update(dt, *_drive, in);
+    if (_race) _drive->setRaceState(_race->state == RaceSession::Countdown ? 4 : _race->state == RaceSession::Finished ? 6 : 0);
     _drive->update(dt, in);
     _frame.physicsMs = (CACurrentMediaTime() - t0) * 1000.0;
     if (_race) {
@@ -1368,9 +1380,20 @@ double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Opti
     _renderer->setInstanceWorlds(_drive->partWorlds());
     // Chase camera: swings behind the vehicle; mouse look decays back, drag and
     // scroll raise and zoom it.
-    _chaseView = _chase.update(dt, *_drive, _renderer->sceneRadius(), _camYawOffset, _cam.pitch - _startCam.pitch,
-                               _cam.distance / _startCam.distance);
-    _camYawOffset *= std::max(0.0f, 1.0f - dt * 0.5f);
+    // FUEL's camera: mouse drag = the look stick (CAM X/Y), V = the CAMERA button (views 5 -> 1 -> 4).
+    fuel::cam::CameraControls cc;
+    cc.stickX = std::clamp(_camYawOffset * -2.0f, -1.0f, 1.0f);
+    cc.stickY = std::clamp((_cam.pitch - _startCam.pitch) * 2.0f, -1.0f, 1.0f);
+    cc.viewChange = _viewChange;
+    _viewChange = false;
+    if (GCExtendedGamepad* pad = GCController.controllers.firstObject.extendedGamepad) {
+        if (std::fabs(pad.rightThumbstick.xAxis.value) > 0.1f) cc.stickX = pad.rightThumbstick.xAxis.value;
+        if (std::fabs(pad.rightThumbstick.yAxis.value) > 0.1f) cc.stickY = -pad.rightThumbstick.yAxis.value;
+    }
+    _chaseView = _chase.update(dt, *_drive, cc, cameraOverride(_race));
+    _camYawOffset *= std::max(0.0f, 1.0f - dt * 4.0f);
+    _cam.pitch = _startCam.pitch + (_cam.pitch - _startCam.pitch) * std::max(0.0f, 1.0f - dt * 4.0f);
+    _drive->uploadRiders();
     _renderer->setFocus(_chase.focus());
     _renderer->speedBlur = _chase.speedEffect();
     _dust.update(dt, *_drive, _drive->position());
@@ -1520,7 +1543,9 @@ int main(int argc, const char** argv) {
                 std::ifstream f(fs::path(opt.dataDir) / "LocalizedComponent/GameTsc/Story/VehiclesDef.tsc");
                 std::stringstream text;
                 text << f.rdbuf();
-                riders = std::make_unique<RiderView>(*library.files().back(), text.str(), renderer);
+                riders = std::make_unique<RiderView>(*library.files().back(), text.str(), renderer,
+                                                     (fs::path(opt.dataDir) / "XFinalComponent/FUEL.exe").string());
+                gRiderView = riders.get();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "fuelview: no rider: %s\n", e.what());
             }
@@ -1579,7 +1604,8 @@ int main(int argc, const char** argv) {
                     const fuel::AssembledVehicle av = assembly->assembler->assemble(assembly->variant(), assembly->lod);
                     const fuel::VehicleSetup setup = fuel::makeVehicleSetup(subject, name, it->second, assembledHubs(av));
                     drive = std::make_unique<DriveSession>(av, setup, *terrain, opt.haveAt ? opt.atX : -51358.0, opt.haveAt ? opt.atZ : -30043.0,
-                                                           opt.haveAt ? opt.atYaw : 0.0f, riders ? riders->parts(name) : std::vector<uint32_t>{});
+                                                           opt.haveAt ? opt.atYaw : 0.0f,
+                                                           riders ? riders->animated(name, av, subject, setup.params) : std::vector<uint32_t>{});
                 } catch (const std::exception& e) {
                     die(name + ": " + e.what());
                 }
@@ -1872,6 +1898,14 @@ int main(int argc, const char** argv) {
                             if (opt.aiCheck && i % 600 == 0) printAiCheck(*race, *drive);
                             if (opt.aiCheck && race->allDone()) break;
                         }
+                        if (opt.dropAt >= 0 && i == int(opt.dropAt * 60)) {  // --drop: a jump landing
+                            const auto st0 = drive->state();
+                            const float yaw = drive->heading();
+                            const float v = std::fabs(st0.speedKmh) / 3.6f;
+                            drive->physics().nudge(0, opt.dropHeight, {v * std::sin(yaw), 0, v * std::cos(yaw)});
+                            std::printf("drop: player lifted %.1f m at t=%.1f\n", opt.dropHeight, opt.dropAt);
+                        }
+                        if (race) drive->setRaceState(race->state == RaceSession::Countdown ? 4 : race->state == RaceSession::Finished ? 6 : 0);
                         const double tp0 = CACurrentMediaTime();
                         drive->update(1.0f / 60, in);
                         const double tp1 = CACurrentMediaTime();
@@ -1879,7 +1913,8 @@ int main(int argc, const char** argv) {
                             gPhysStats.add((tp1 - tp0) * 1000.0, drive->physics().lastVehicleMs(), drive->physics().lastVehicleCpuMs(), drive->vehicleCount());
                         }
                         if (opt.film > 0) {
-                            chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius(), opt.haveYaw ? opt.yawDeg * float(M_PI) / 180.0f : 0.0f);
+                            if (i == 0 && opt.camView > 0) chase.setView(opt.camView);
+                            chaseView = chase.update(1.0f / 60, *drive, {}, cameraOverride(race.get()));
                             dust.update(1.0f / 60, *drive, drive->position());
                         }
                         if (streamer && (opt.propCheck || opt.film > 0 || i % 30 == 0)) streamer->update(drive->position(), renderer, drive->physics());
@@ -1893,6 +1928,7 @@ int main(int argc, const char** argv) {
                             }
                         }
                         if (opt.film > 0 && i % std::max(1, int(opt.film * 60)) == 0) {  // --film: OUT_0001.png ... from the chase camera
+                            drive->uploadRiders();
                             renderer.setInstanceWorlds(drive->partWorlds());
                             showOpponents(*drive, renderer);
                             if (race) renderer.setMarkers(race->markers());
@@ -1927,6 +1963,9 @@ int main(int argc, const char** argv) {
                             const simd_float3 fp = drive->position();
                             std::printf("film %s t=%.1f (%.0f, %.0f, %.0f) %.0f km/h %d wheels down, %zu dust, gpu %.1f ms%s\n", frame.shot.c_str(), i / 60.0, fp.x, fp.y, fp.z,
                                         fs.speedKmh, fs.wheelsOnGround, dust.particles().size(), gpuMs, race ? (" " + race->hud(*drive)).c_str() : "");
+                            const auto& cp = chase.pose();
+                            std::printf("  camera view %d eye (%.1f, %.1f, %.1f) target (%.1f, %.1f, %.1f) %.1f m, fov %.1f, roll %.3f, near %.2f\n", cp.view, cp.ex, cp.ey,
+                                        cp.ez, cp.tx, cp.ty, cp.tz, std::hypot(std::hypot(cp.ex - fp.x, cp.ey - fp.y), cp.ez - fp.z), cp.fovDeg, cp.roll, cp.zNear);
                         }
                         if (streamer && opt.propCheck) {
                             const float v = drive->state().speedKmh;

@@ -278,6 +278,24 @@ bool FuelVehicle::anyWheelLoaded() const {
         if (wheels_[size_t(w)].load > 1e-6f) return true;
     return false;
 }
+bool FuelVehicle::slidingMajority() const {  // 0x52f100: wheel 1; with > 2 wheels also 3; with > 5 also 4 and 5
+    int n = wheelSliding(1 % std::max(nWheels_, 1)) ? 1 : 0, need = 1;
+    if (nWheels_ > 2) {
+        n += wheelSliding(3) ? 1 : 0, need = 2;
+        if (nWheels_ > 5) n += (wheelSliding(4) ? 1 : 0) + (wheelSliding(5) ? 1 : 0), need = 4;
+    }
+    return n >= need;
+}
+float FuelVehicle::maxWheelBumps() const {
+    float m = 0;
+    for (int w = 0; w < nWheels_; ++w) m = std::max(m, C_[size_t(w)].bumpsWheel);
+    return m;
+}
+float FuelVehicle::meanWheelBumpsRot() const {
+    float s = 0;
+    for (int w = 0; w < nWheels_; ++w) s += C_[size_t(w)].bumpsRot;
+    return nWheels_ ? s / float(nWheels_) : 0.0f;
+}
 bool FuelVehicle::allWheelsLoaded() const {
     for (int w = 0; w < nWheels_; ++w)
         if (!(wheels_[size_t(w)].load > 1e-6f)) return false;

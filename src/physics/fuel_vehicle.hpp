@@ -122,6 +122,13 @@ public:
     float airtime() const { return airtime_; }
     bool wrecked() const { return wrecked_ != 0; }
     bool riderEjected() const { return riderEjected_; }  // wrecked with P655 > 0.5: the rider goes into the ragdoll
+    // ---- read-outs for the camera and the rider (p25/p27) ----
+    int wreckState() const { return wrecked_; }           // +0x1420: 0 ok, 1 wrecked, 2 drowned
+    float heightAboveGround() const { return heightAbove_; }  // +0x13b8
+    bool slidingMajority() const;                         // 0x52f100: rear wheel(s) 1 (and 3, 4, 5) sliding
+    bool anyLoaded() const { return anyWheelLoaded(); }   // 0x52e620
+    float maxWheelBumps() const;                          // 0x526a30: max over wheels of C[w]+0x64 (BUMPS WHEEL)
+    float meanWheelBumpsRot() const;                      // mean of C[w]+0x60 (veh+0x1708), the rider's action 43
     Vec3 comLocal() const { return com_; }  // model space
     // Model origin pose (position of the model's y = 0 origin, orientation).
     Vec3 modelOrigin() const { return body_.S.x - rotate(body_.S.q, com_); }
