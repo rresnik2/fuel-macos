@@ -1,5 +1,8 @@
 #include "terrain_height.hpp"
 #include "terrain.hpp"
+#include "road_types.hpp"
+
+#include <cstdio>
 
 #include <algorithm>
 #include <cmath>
@@ -143,16 +146,9 @@ struct TerrainDetail::RoadBuilt {
 
 namespace {
 
-// AGW_TerraRoad per-type values (0xa677e0 + 0x200 * type, filled by constants in code by
-// AGW_TerraRoad::Init 0x6f24a0; the values its second run leaves, p21 H6). Only the
-// fields the height uses. Types 0-3, 14 (gulches) and 17 (bridges) carve nothing.
-struct RoadType {
-    float T0, T24, T28, T34, T4c, T50, T54, T5c, T74, T78, T7c, T80, Tbc, Tc4, Tcc, Mbase, T1e8;
-};
-constexpr RoadType kRoadTypes[21] = {
-    // engine table removed from the published history; read from FUEL.exe at run time
-};
-bool roadBuiltType(uint8_t t) { return t < 21 && kRoadTypes[t].T0 > 0; }
+// GwRoad types the engine builds into the ground (0x6fa8a0): not 0-3 (invisible trails),
+// 14 (gulches, 0x7a00e0) or 17 (bridges).
+bool roadBuiltType(uint8_t t) { return t >= 4 && t <= 20 && t != 14 && t != 17; }
 constexpr double kRoadCell = 64.0;
 
 }  // namespace
@@ -255,6 +251,14 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
     const uint32_t roadId = rd32(b, 8);
     const DpcFile::Entry* re = world.find(roadId);
     const auto road = re ? world.body(*re) : std::nullopt;
+    // Per-type road values, replayed from the player's FUEL.exe (road_types.hpp).
+    std::string roadErr;
+    if (auto rt = loadRoadTypes(world, &roadErr)) {
+        roadTypes_ = *rt;
+        haveRoadTypes_ = true;
+    } else {
+        std::fprintf(stderr, "fuel: %s; roads will not shape the ground\n", roadErr.c_str());
+    }
     if (road) {
         const std::vector<uint8_t>& g = *road;
         const uint32_t count = rd32(g, 0);
@@ -265,7 +269,7 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
             q += 3;
             if (q + size_t(np) * 5 > g.size()) break;
             const uint8_t rtype = type & 0x7f;  // bit 7: built by 0x6f9150 (no XZ cleanup; port: same path)
-            if (roadBuiltType(rtype) && np >= 2) {
+            if (haveRoadTypes_ && roadBuiltType(rtype) && np >= 2) {
                 RoadLine rl;
                 rl.type = rtype;
                 for (uint16_t k = 0; k < np; ++k) {
@@ -280,7 +284,7 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
                 }
                 if (rl.pts.size() >= 2) {
                     const auto idx = uint32_t(roadLines_.size());
-                    const double reach = kRoadTypes[rtype].T0;
+                    const double reach = roadTypes_[rtype].reach;
                     std::vector<uint64_t> keys;
                     for (size_t k = 0; k + 1 < rl.pts.size(); ++k) {
                         const double x0 = std::min(rl.pts[k][0], rl.pts[k + 1][0]) - reach, x1 = std::max(rl.pts[k][0], rl.pts[k + 1][0]) + reach;
@@ -635,7 +639,7 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
     std::call_once(roadOnce_[line], [&] {
         auto out = std::make_unique<RoadBuilt>();
         const RoadLine& rl = roadLines_[line];
-        const RoadType& T = kRoadTypes[rl.type];
+        const RoadTypeParams& T = roadTypes_[rl.type];
         const auto& pts = rl.pts;
         std::vector<double> cum(pts.size(), 0.0);
         for (size_t i = 1; i < pts.size(); ++i) cum[i] = cum[i - 1] + std::hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
@@ -654,7 +658,7 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
             const double t = segLen > 0 ? (s - cum[i]) / segLen : 0;
             px = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t, pz = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t;
         };
-        const double M = std::min(std::max(double(T.Mbase), double(T.T1e8)), L / 4);
+        const double M = std::min(std::max(double(T.smooth), double(T.smoothMin)), L / 4);
         const int K = int(std::floor(M / 2));
         // Raw heights every 2 m (0x64a2a0 flags 3), from s = -2K to L + 2K + 2.
         const int n = int(std::floor(L / 2)) + 2;
@@ -670,7 +674,7 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
         const double hs = detailOnly(ex, ez, nullptr);
         at(L, ex, ez);
         const double he = detailOnly(ex, ez, nullptr);
-        const double ls = std::min(double(T.Tcc) + std::min(double(T.Tcc), 1.0) * M, 0.33 * L);
+        const double ls = std::min(double(T.flat) + std::min(double(T.flat), 1.0) * M, 0.33 * L);
         const double Rl = std::max(std::min(std::max(M, 50.0), L - 2 * ls), 0.001);
         // Smoothing kernel (2 - u) u, u = (K + 1 - |K - j|)/(K + 1) (0x6f85c0).
         std::vector<double> wk(size_t(2 * K + 1));
@@ -692,11 +696,11 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
             const double r1 = S2(2 * clamp01(1 - (sk - ls) / Rl) - 1), r2 = S2(2 * clamp01(1 - ((L - sk) - ls) / Rl) - 1);
             h = r1 * hs + (1 - r1) * h;
             h = (1 - r2) * h + r2 * he;
-            if (T.T7c != 0 && T.T80 != 0) {
-                const double a = 6.28 * sk / double(T.T80);
-                h += 0.33 * 0.5 * double(T.T7c) * (std::sin(a) + std::sin(0.390933 * a) + std::sin(1.839735 * a));
+            if (T.waveAmp != 0 && T.waveLen != 0) {
+                const double a = 6.28 * sk / double(T.waveLen);
+                h += 0.33 * 0.5 * double(T.waveAmp) * (std::sin(a) + std::sin(0.390933 * a) + std::sin(1.839735 * a));
             }
-            if (T.T74 != 0 && T.T78 != 0) h += double(T.T74) * std::pow((std::sin(0.390933 * 6.28 * sk / double(T.T78)) + 1) / 2, 4);
+            if (T.bumpAmp != 0 && T.bumpLen != 0) h += double(T.bumpAmp) * std::pow((std::sin(0.390933 * 6.28 * sk / double(T.bumpLen)) + 1) / 2, 4);
             out->profile[size_t(k)] = h;
         }
         const double base = std::floor(out->profile[0]);
@@ -708,8 +712,8 @@ const TerrainDetail::RoadBuilt& TerrainDetail::roadBuilt(uint32_t line) const {
             if (sg.len <= 0) continue;
             sg.ux = (sg.bx - sg.ax) / sg.len, sg.uz = (sg.bz - sg.az) / sg.len, sg.invLen = 1 / sg.len;
             sg.start = cum[i];
-            sg.minX = std::min(sg.ax, sg.bx) - T.T0, sg.maxX = std::max(sg.ax, sg.bx) + T.T0;
-            sg.minZ = std::min(sg.az, sg.bz) - T.T0, sg.maxZ = std::max(sg.az, sg.bz) + T.T0;
+            sg.minX = std::min(sg.ax, sg.bx) - T.reach, sg.maxX = std::max(sg.ax, sg.bx) + T.reach;
+            sg.minZ = std::min(sg.az, sg.bz) - T.reach, sg.maxZ = std::max(sg.az, sg.bz) + T.reach;
             out->segs.push_back(sg);
         }
         roadBuilt_[line] = std::move(out);
@@ -723,12 +727,12 @@ double TerrainDetail::roadCarve(double x, double z, double& y, double omc, doubl
     const auto it = roadCells_.find(cellKey(int32_t(std::floor(x / kRoadCell)), int32_t(std::floor(z / kRoadCell))));
     if (it == roadCells_.end()) return 0;
     double sumWH = 0, sumW = 0, blend = 0, cov = 0, bump = 0, minLn = 1000;
-    const RoadType* best = nullptr;
+    const RoadTypeParams* best = nullptr;
     bool haveF = false, haveF2 = false;
     double F = 0, F2 = 0;
     int used = 0;
     for (uint32_t line : it->second) {
-        const RoadType& T = kRoadTypes[roadLines_[line].type];
+        const RoadTypeParams& T = roadTypes_[roadLines_[line].type];
         const RoadBuilt& rb = roadBuilt(line);
         for (const RoadBuilt::Seg& S : rb.segs) {
             if (x < S.minX || x > S.maxX || z < S.minZ || z > S.maxZ) continue;
@@ -739,7 +743,7 @@ double TerrainDetail::roadCarve(double x, double z, double& y, double omc, doubl
             if (t <= 0) dist = std::hypot(x - S.ax, z - S.az);
             else if (t > 1) dist = std::hypot(x - S.bx, z - S.bz);
             else dist = std::fabs(d);
-            if (dist > T.T0) continue;
+            if (dist > T.reach) continue;
             ++used;
             const double tc = clamp01(t);
             const double offs = 0;  // bend m0/m1 (0x6fa7a0): not built by the port
@@ -747,14 +751,14 @@ double TerrainDetail::roadCarve(double x, double z, double& y, double omc, doubl
             const double lat = std::fabs(sd + offs);
             const double wid = 1.0;  // S.52/S.53 * 0.02 without junction widening or cross slope
             double ln = lat / wid;
-            if (ln > T.T5c) {
+            if (ln > T.stretch) {
                 if (!haveF) F = b11cec_.at(x, z), haveF = true;
-                ln = (ln - T.T5c) / ((1.25 - 0.75) * F + 0.75) + T.T5c;
+                ln = (ln - T.stretch) / ((1.25 - 0.75) * F + 0.75) + T.stretch;
             }
-            const double nW = T.Tbc / wid, e = nW - ln;
+            const double nW = T.band / wid, e = nW - ln;
             if (e <= 0) continue;
-            const double wgt = S2(2 * clamp01(e * (1.0 / T.Tbc) * wid) - 1) * nW;
-            if (!best || best->Tbc < T.Tbc) best = &T;
+            const double wgt = S2(2 * clamp01(e * (1.0 / T.band) * wid) - 1) * nW;
+            if (!best || best->band < T.band) best = &T;
             minLn = std::min(minLn, ln);
             // h_seg (0x6f1800): profile shorts of this segment, N = len * 0.5.
             const double N = S.len * 0.5;
@@ -766,28 +770,28 @@ double TerrainDetail::roadCarve(double x, double z, double& y, double omc, doubl
             const double ext = t < 0 ? t * N : (t > 1 ? (t - 1) * N : 0.0);
             const double hseg = h0 + (h1 - h0) * (ti - fi) + (h1 - h0) * ext;
             if (!haveF2) F2 = b3f54_.at(x, z), haveF2 = true;
-            const double target = hseg - 1.5 * omw - F2 * T.T34;  // + (offs + d) * cross slope * T8c: no cross slope
+            const double target = hseg - 1.5 * omw - F2 * T.noise;  // + (offs + d) * cross slope * T8c: no cross slope
             double b = 0;
-            const double q1 = T.Tcc - 0.5 - lat;
-            if (q1 > 0) b = (2 - q1 / T.Tcc) * (q1 / T.Tcc) * T.Tcc * T.T24;
-            if (T.Tcc + 1 - lat > 0) b += clamp01((T.Tcc + 1 - lat) / 2) * best->T28;
+            const double q1 = T.flat - 0.5 - lat;
+            if (q1 > 0) b = (2 - q1 / T.flat) * (q1 / T.flat) * T.flat * T.crown;
+            if (T.flat + 1 - lat > 0) b += clamp01((T.flat + 1 - lat) / 2) * best->verge;
             bump = std::max(bump, b);
-            const double cv = ln < T.Tc4 - 1.5 ? 1.0 : (ln > nW - 0.5 * T.T4c ? 0.0 : clamp01((nW - ln - T.T4c) * 2.0 / 3.0));
+            const double cv = ln < T.core - 1.5 ? 1.0 : (ln > nW - 0.5 * T.fade ? 0.0 : clamp01((nW - ln - T.fade) * 2.0 / 3.0));
             cov = std::max(cov, cv);
             sumWH += target * wgt;
             sumW += wgt;
-            blend = std::max(blend, S2(2 * clamp01(e / T.T4c) - 1));
+            blend = std::max(blend, S2(2 * clamp01(e / T.fade) - 1));
         }
     }
     if (sumW <= 1e-7) return 0;
     double H = sumWH / sumW;
-    const double g = best->Tc4 - minLn;
+    const double g = best->core - minLn;
     if (g > 0) {
         double dt = 0;
-        if (g < best->T50) {
-            const double r = g / best->T50, v = r <= 0.5 ? 1 - 4 * r : 4 * r - 3;
+        if (g < best->ditch) {
+            const double r = g / best->ditch, v = r <= 0.5 ? 1 - 4 * r : 4 * r - 3;
             const double sv = S2(v);
-            dt = -(1 - sv * sv) * best->T54;
+            dt = -(1 - sv * sv) * best->ditchDepth;
         }
         H += std::min(0.0, clamp01(H - y - 0.5) + dt * omc);
     }

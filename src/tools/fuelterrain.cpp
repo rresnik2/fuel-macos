@@ -10,6 +10,7 @@
 #include "core/events.hpp"
 #include "core/ground.hpp"
 #include "core/ground_point.hpp"
+#include "core/road_types.hpp"
 #include "core/roads.hpp"
 #include "core/terrain.hpp"
 #include "core/terrain_height.hpp"
@@ -130,6 +131,19 @@ int main(int argc, char** argv) {
                     const auto v = fuel::buildTerrainChunk(ground, X + 3 * c, Z, c);
                     std::printf("chunk %5.0f m: %zu vertices in %.1f ms\n", c, v.size(),
                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count() * 1e3);
+                }
+            } else if (a == "--road-types") {  // the AGW_TerraRoad table replayed from FUEL.exe
+                std::string err;
+                const auto t = fuel::loadRoadTypes(dpc, &err);
+                if (!t) {
+                    std::printf("road types: %s\n", err.c_str());
+                    return 1;
+                }
+                for (size_t k = 0; k < t->size(); ++k) {
+                    const fuel::RoadTypeParams& q = (*t)[k];
+                    std::printf("type %2zu: T0 %g T24 %g T28 %g T34 %g T4c %g T50 %g T54 %g T5c %g T74 %g T78 %g T7c %g T80 %g Tbc %g Tc4 %g Tcc %g M %g Mmin %g\n", k,
+                                q.reach, q.crown, q.verge, q.noise, q.fade, q.ditch, q.ditchDepth, q.stretch, q.bumpAmp, q.bumpLen, q.waveAmp,
+                                q.waveLen, q.band, q.core, q.flat, q.smooth, q.smoothMin);
                 }
             } else if (a == "--events") {
                 // Race starts and checkpoints (authored on FUEL's ground) against the ground.

@@ -113,6 +113,8 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed) {
     return out;
 }
 
+std::string engineExePath(const DpcFile& world) { return exePath(world).string(); }
+
 std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count) {
     const auto b = readExe(exePath(world), va, count * 4);
     if (!b) return {};

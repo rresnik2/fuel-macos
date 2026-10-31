@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace fuel {
@@ -22,6 +23,9 @@ Permutation buildPermutation(const DpcFile& world, uint32_t seed);
 // (next to the game data that holds `world`); empty when it cannot be read.
 // Engine constant tables are read this way instead of being copied into the port.
 std::vector<float> readEngineFloats(const DpcFile& world, uint32_t va, size_t count);
+
+// Path of the player's FUEL.exe next to the game data that holds `world`.
+std::string engineExePath(const DpcFile& world);
 
 // The seed stored in the world's GenWorld_Z (the u32 after the materials list).
 // Throws if the world has no GenWorld_Z.

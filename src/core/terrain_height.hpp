@@ -13,6 +13,7 @@
 
 #include "dpc.hpp"
 #include "genworld_noise.hpp"
+#include "road_types.hpp"
 
 #include <array>
 #include <atomic>
@@ -114,6 +115,8 @@ private:
     std::unordered_map<uint64_t, std::vector<uint32_t>> gulchCells_;
     mutable std::unique_ptr<std::once_flag[]> gulchOnce_;
     mutable std::vector<std::vector<GulchSeg>> gulchSegs_;
+    std::array<RoadTypeParams, 21> roadTypes_{};
+    bool haveRoadTypes_ = false;
     std::vector<RoadLine> roadLines_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> roadCells_;
     mutable std::unique_ptr<std::once_flag[]> roadOnce_;
