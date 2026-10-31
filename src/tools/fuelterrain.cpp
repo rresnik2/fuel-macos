@@ -13,6 +13,7 @@
 #include "core/roads.hpp"
 #include "core/terrain.hpp"
 #include "core/terrain_height.hpp"
+#include "core/terrain_mesh.hpp"
 #include "core/vegetation.hpp"
 #include "core/world.hpp"
 
@@ -119,6 +120,16 @@ int main(int argc, char** argv) {
                         }
                     } catch (const std::exception&) {
                     }
+                }
+            } else if (a == "--chunks" && i + 2 < argc) {  // --chunks X Z: time ground chunk builds of every size there
+                const float X = std::strtof(argv[i + 1], nullptr), Z = std::strtof(argv[i + 2], nullptr);
+                i += 2;
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                for (double c = 24; c <= 12288; c *= 2) {
+                    const auto c0 = std::chrono::steady_clock::now();
+                    const auto v = fuel::buildTerrainChunk(ground, X + 3 * c, Z, c);
+                    std::printf("chunk %5.0f m: %zu vertices in %.1f ms\n", c, v.size(),
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count() * 1e3);
                 }
             } else if (a == "--events") {
                 // Race starts and checkpoints (authored on FUEL's ground) against the ground.
