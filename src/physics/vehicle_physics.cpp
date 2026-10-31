@@ -572,10 +572,19 @@ struct DriveWorld::Impl {
             forwardInput = -in.brake;
             brakeInput = 0;
         }
-        // Speed-sensitive steering keeps fast driving stable.
-        const float steer = in.steer * std::clamp(1.0f / (1.0f + std::fabs(speed) / 22.0f), 0.3f, 1.0f);
+        const bool bike = v.setup.bike, light = v.setup.mass < 1000;
+        // Speed-sensitive steering keeps fast driving stable (cars and quads keep more lock
+        // at speed than bikes, which lean instead).
+        const float steerFade = bike ? std::clamp(1.0f / (1.0f + std::fabs(speed) / 22.0f), 0.3f, 1.0f)
+                                     : std::clamp(1.0f / (1.0f + std::fabs(speed) / 50.0f), 0.45f, 1.0f);
+        const float steer = in.steer * steerFade;
+        // Off the throttle: hold still when nearly stopped (no rolling away down a slope),
+        // engine braking above that (port arcade tuning; FUEL's values are not decoded).
+        const bool coasting = grounded >= 2 && in.throttle < 0.05f && in.brake < 0.05f;
+        const bool hold = coasting && std::fabs(speed) < 1.5f;
         auto* controller = static_cast<WheeledVehicleController*>(v.constraint->GetController());
-        controller->SetDriverInput(forwardInput, steer, brakeInput, in.handbrake ? 1.0f : 0.0f);
+        controller->SetDriverInput(forwardInput, steer, brakeInput, in.handbrake || hold ? 1.0f : 0.0f);
+        if (coasting && !hold) bi.AddForce(v.car, -forward * (speed > 0 ? 1.0f : -1.0f) * v.setup.mass * 0.8f);
 
         Vec3 angular = bi.GetAngularVelocity(v.car);
         if (grounded == 0) {
@@ -584,6 +593,16 @@ struct DriveWorld::Impl {
         } else if (v.lastWheelsOnGround == 0) {
             // Landing: absorb the tumble so jumps end on the wheels.
             angular *= 0.5f;
+        } else if (!bike && grounded >= 2) {
+            // Yaw assist (arcade): pull the turn rate towards what the steering asks for, so the
+            // vehicle turns in at once instead of waiting for the tyres; light ones turn quicker.
+            // With the wheels straight it only damps a lingering spin a little.
+            const float maxYaw = light ? 1.9f : 1.2f;  // rad/s at full lock
+            const float pace = std::clamp(std::fabs(speed) / 6.0f, 0.0f, 1.0f) * (speed < 0 ? -1.0f : 1.0f);
+            const float target = -in.steer * maxYaw * pace * steerFade;  // positive steer turns towards -yaw
+            const float yaw = angular.Dot(up);
+            const float gain = std::fabs(in.steer) > 0.05f ? 4.0f : 1.0f;
+            angular += up * ((target - yaw) * std::min(1.0f, gain * kStep));
         }
         bi.SetAngularVelocity(v.car, angular);
         // A little downforce helps the tyres at speed.

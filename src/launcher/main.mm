@@ -359,12 +359,12 @@ static NSTextField* label(NSString* text, NSFont* font = nil, NSColor* color = n
     [self save];
     [self setLog:@""];
     // fuelview reads the settings file itself.
-    [self startGame:@[@"--game", @"--data", ns(_s.dataDir)] fallback:YES];
+    [self startGame:@[@"--game", @"--data", ns(_s.dataDir)]];
 }
 
-// Starts fuelview with `args`. When `fallback` is set and this fuelview does not know --game yet,
-// starts the fallback run instead.
-- (void)startGame:(NSArray<NSString*>*)args fallback:(BOOL)allowFallback {
+// Starts fuelview with `args` (the menus move between menu and sessions by exec, so this
+// process lives until the player quits).
+- (void)startGame:(NSArray<NSString*>*)args {
     NSURL* exe = [self gameBinary];
     if (![NSFileManager.defaultManager isExecutableFileAtPath:exe.path]) {
         [self setLog:[NSString stringWithFormat:@"The game binary is missing: %@", exe.path]];
@@ -395,7 +395,7 @@ static NSTextField* label(NSString* text, NSFont* font = nil, NSColor* color = n
             NSString* text;
             @synchronized(captured) { text = [[NSString alloc] initWithData:captured encoding:NSUTF8StringEncoding] ?: @""; }
             [self gameEnded:t status:t.terminationStatus reason:t.terminationReason log:text command:command
-                    seconds:NSDate.timeIntervalSinceReferenceDate - started fallback:allowFallback];
+                    seconds:NSDate.timeIntervalSinceReferenceDate - started];
         });
     };
     NSError* e = nil;
@@ -409,20 +409,10 @@ static NSTextField* label(NSString* text, NSFont* font = nil, NSColor* color = n
 }
 
 - (void)gameEnded:(NSTask*)task status:(int)status reason:(NSTaskTerminationReason)reason log:(NSString*)log command:(NSString*)command
-          seconds:(NSTimeInterval)seconds fallback:(BOOL)allowFallback {
+          seconds:(NSTimeInterval)seconds {
     logEvent([NSString stringWithFormat:@"launcher: game exited, status %d after %.1f s", status, seconds]);
     _task = nil;
     _play.title = @"Play";
-
-    // FALLBACK (remove once P19's `fuelview --game` is on main): a fuelview without --game stops at once
-    // with "unknown option --game". Then start the old driving demo, which reads the same settings file
-    // through --settings, so Play still goes somewhere.
-    if (allowFallback && status != 0 && seconds < 15 && [log containsString:@"unknown option --game"]) {
-        logEvent(@"launcher: this fuelview has no --game yet; starting the fallback driving demo");
-        [self startGame:@[@"--data", ns(_s.dataDir), @"--assemble", @"QUAD_ROAD_2", @"--drive", @"--at", @"-39700,-28300", @"--settings"]
-               fallback:NO];
-        if (_task) return;
-    }
 
     [self showFolder];  // re-enables Play
     if (status != 0) {
