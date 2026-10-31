@@ -524,6 +524,8 @@ struct TerrainVertexIn {
     float tweenInv;
     packed_float3 n;
     float size;
+    packed_float3 n1;  // morph target normal
+    float pad;
 };
 
 vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[buffer(1)]],
@@ -538,7 +540,7 @@ vertex TerrainOut vsTerrain(uint vid [[vertex_id]], constant FrameUniforms& f [[
     const Scatter sc = fuelScattering(f, w);
     o.ext = sc.ext;
     o.insc = sc.insc;
-    o.normal = float3(v.n);
+    o.normal = normalize(mix(float3(v.n), float3(v.n1), t));  // ground.vhl lerps the normal with the position
     o.chunk = v.size;
     return o;
 }

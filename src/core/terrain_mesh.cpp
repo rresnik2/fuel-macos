@@ -27,13 +27,15 @@ std::vector<TerrainVertex> buildTerrainChunk(const Heightfield& hf, double cx, d
     constexpr int N = kChunkSide;
     const double s = size / 24.0, x0 = cx - size * 0.5, z0 = cz - size * 0.5;
     const TerrainDetail* d = hf.detail.get();
-    // Heights with a one-point border (0x64dfe0 evaluates the neighbours outside the patch).
-    constexpr int G = N + 2;
+    // Heights with a border (0x64dfe0 evaluates the neighbours outside the patch): one point for
+    // the fine normals, two for the coarse normals of chunks under 60 m.
+    const bool coarse2 = size < 60.0;
+    const int B = coarse2 ? 2 : 1, G = N + 2 * B;
     std::vector<double> h(size_t(G) * G);
     std::vector<std::array<float, 3>> mapN(size_t(N) * N, {0.f, 1.f, 0.f});
     const bool far = size >= kFarChunk, mapNormal = size >= kMapNormalChunk;
-    for (int j = -1; j <= N; ++j)
-        for (int i = -1; i <= N; ++i) {
+    for (int j = -B; j < N + B; ++j)
+        for (int i = -B; i < N + B; ++i) {
             const bool inside = i >= 0 && j >= 0 && i < N && j < N;
             if ((far || mapNormal) && !inside) continue;
             const double x = x0 + i * s, z = z0 + j * s;
@@ -52,9 +54,13 @@ std::vector<TerrainVertex> buildTerrainChunk(const Heightfield& hf, double cx, d
                     mapN[size_t(j) * N + size_t(i)] = {n[0], n[1], n[2]};
                 }
             }
-            h[size_t(j + 1) * G + size_t(i + 1)] = y;
+            h[size_t(j + B) * G + size_t(i + B)] = y;
         }
-    auto H = [&](int i, int j) { return h[size_t(j + 1) * G + size_t(i + 1)]; };
+    auto H = [&](int i, int j) { return h[size_t(j + B) * G + size_t(i + B)]; };
+    auto setN = [](float* o, double nx, double ny, double nz) {
+        const double l = std::sqrt(nx * nx + ny * ny + nz * nz);
+        o[0] = float(nx / l), o[1] = float(ny / l), o[2] = float(nz / l);
+    };
     const float tweenStart = float((size * kSplit * 2 - size) - size * 0.5 * 1.5), tweenInv = float(1.0 / (size * 0.5));
     std::vector<TerrainVertex> v(size_t(N) * N + 4 * N);
     for (int j = 0; j < N; ++j)
@@ -62,6 +68,7 @@ std::vector<TerrainVertex> buildTerrainChunk(const Heightfield& hf, double cx, d
             TerrainVertex& t = v[size_t(j) * N + size_t(i)];
             t.p0[0] = float(x0 + i * s), t.p0[1] = float(H(i, j)), t.p0[2] = float(z0 + j * s);
             t.tweenStart = tweenStart, t.tweenInv = tweenInv, t.size = float(size);
+            t.pad = 0;
             if (mapNormal || !d) {
                 const auto& n = mapN[size_t(j) * N + size_t(i)];
                 if (d) {
@@ -70,23 +77,45 @@ std::vector<TerrainVertex> buildTerrainChunk(const Heightfield& hf, double cx, d
                     t.n[0] = 0, t.n[1] = 1, t.n[2] = 0;
                 }
             } else {  // central differences over the neighbour points (0x7f92c0)
-                const double nx = H(i - 1, j) - H(i + 1, j), ny = 2 * s, nz = H(i, j - 1) - H(i, j + 1);
-                const double l = std::sqrt(nx * nx + ny * ny + nz * nz);
-                t.n[0] = float(nx / l), t.n[1] = float(ny / l), t.n[2] = float(nz / l);
+                setN(t.n, H(i - 1, j) - H(i + 1, j), 2 * s, H(i, j - 1) - H(i, j + 1));
             }
         }
-    // Morph targets on the half-resolution grid (port reconstruction of 0x7f9b50's coarse
-    // positions: even points stay, odd ones go to the midpoint of their coarse edge).
-    for (int j = 0; j < N; ++j)
-        for (int i = 0; i < N; ++i) {
-            TerrainVertex& t = v[size_t(j) * N + size_t(i)];
-            auto P = [&](int a, int b) { return v[size_t(b) * N + size_t(a)].p0; };
-            const bool oi = i & 1, oj = j & 1;
-            const float *a = P(i, j), *b = P(i, j);
-            if (oi && !oj) a = P(i - 1, j), b = P(i + 1, j);
-            else if (!oi && oj) a = P(i, j - 1), b = P(i, j + 1);
-            else if (oi && oj) a = P(i - 1, j - 1), b = P(i + 1, j + 1);
-            for (int k = 0; k < 3; ++k) t.p1[k] = 0.5f * (a[k] + b[k]);
+    // Morph targets (0x7f9b50, asm 0x7f9e30-0x7fa2a8, notes p31 E6): vertex (i, j) morphs to the
+    // even point (i & ~1, j & ~1) as the parent chunk (2C) builds it, so odd vertices collapse onto
+    // the lower-left even vertex and at full tween every 2 x 2 block is the parent's quad (with the
+    // (i+1, j)-(i, j+1) diagonal of terrainChunkIndices). The target height is that point's +0x30:
+    // its own height for C < 120 and C >= 240, the far height 0x64be70 for 120 <= C < 240 (what the
+    // parent, C >= 240, draws). The target normal is its coarse normal +0x20: central differences
+    // over two steps for C < 60, the map normal from 60 m up. Root chunks (chunk +0xa8 = 1) never morph.
+    const bool root = size >= kRoot;
+    for (int j = 0; j < N; j += 2)
+        for (int i = 0; i < N; i += 2) {
+            TerrainVertex& e = v[size_t(j) * N + size_t(i)];
+            float p1[3] = {e.p0[0], e.p0[1], e.p0[2]}, n1[3] = {0, 1, 0};
+            if (coarse2) {
+                setN(n1, H(i - 2, j) - H(i + 2, j), 4 * s, H(i, j - 2) - H(i, j + 2));
+            } else if (d && mapNormal && !far) {
+                p1[1] = float(d->farHeight(e.p0[0], e.p0[2], n1));
+            } else if (d && !mapNormal) {
+                d->baseNormal(e.p0[0], e.p0[2], n1);
+            } else {
+                n1[0] = e.n[0], n1[1] = e.n[1], n1[2] = e.n[2];
+            }
+            if (root) {
+                p1[1] = e.p0[1];
+                n1[0] = e.n[0], n1[1] = e.n[1], n1[2] = e.n[2];
+            }
+            for (int dj = 0; dj < 2 && j + dj < N; ++dj)
+                for (int di = 0; di < 2 && i + di < N; ++di) {
+                    TerrainVertex& t = v[size_t(j + dj) * N + size_t(i + di)];
+                    if (root) {
+                        std::copy(t.p0, t.p0 + 3, t.p1);
+                        std::copy(t.n, t.n + 3, t.n1);
+                    } else {
+                        std::copy(p1, p1 + 3, t.p1);
+                        std::copy(n1, n1 + 3, t.n1);
+                    }
+                }
         }
     // Skirts (port addition against cracks where neighbouring chunks differ in size).
     const float drop = float(1.0 + 0.05 * size);
@@ -110,7 +139,7 @@ const std::vector<uint32_t>& terrainChunkIndices() {
         for (uint32_t j = 0; j + 1 < N; ++j)
             for (uint32_t i = 0; i + 1 < N; ++i) {
                 const uint32_t a = j * N + i, b = a + 1, c = a + N, d = c + 1;
-                r.insert(r.end(), {a, b, d, a, d, c});  // diagonal (i, j)-(i+1, j+1)
+                r.insert(r.end(), {a, b, c, b, d, c});  // FUEL's (k, k+1, k+25), (k+1, k+26, k+25): diagonal (i+1, j)-(i, j+1)
             }
         const uint32_t base = N * N;
         auto side = [&](uint32_t sk, auto edge) {
