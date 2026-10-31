@@ -150,6 +150,7 @@ private:
     Fractal t0c_, t18_, t24_, t28_;
     Fractal f3f54_;                                 // surface variant noise (0x6a81f0)
     Fractal f0004_, f9e4c_, fcdc8_;                 // colour noises (p16 C8, C11)
+    Fractal f8e78_, fae20_, fbdf4_;                 // clay / chalk / volcano noises (p32)
     std::vector<std::array<float, 4>> palette_;    // GenWorld Colors by slot
     std::vector<float> tileWeight_, tileSize_;
     uint32_t grassAtlas_ = 0;  // FUEL.exe 0x9ff02c / 0x9ff04c

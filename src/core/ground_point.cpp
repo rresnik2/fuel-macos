@@ -157,6 +157,9 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
     f3f54_ = Fractal(perm_, 1, 10.0f, 25.148701f, 0.3f, 0.3f, 5.0f);
     f9e4c_ = Fractal(perm_, 1, 100.0f, 65.145248f, 0.3f, 0.3f, 5.0f);
     fcdc8_ = Fractal(perm_, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
+    f8e78_ = Fractal(perm_, 1, 100.0f, 67.349632f, 0.3f, 0.3f, 5.0f);  // clay noise (0x45d010)
+    fae20_ = Fractal(perm_, 1, 100.0f, 42.407471f, 0.3f, 0.3f, 5.0f);  // chalk noise (0x45c270)
+    fbdf4_ = Fractal(perm_, 1, 100.0f, 52.488899f, 0.3f, 0.3f, 5.0f);  // volcano noise (0x459530)
     palette_ = loadGroundPalette(world);
     // Grass_EmitTuft tables: tile weights (0x9ff02c) and tile sizes (0x9ff04c); the
     // tile index reaches 8, and the engine reads past the weights into the sizes.
@@ -486,7 +489,11 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     // Bit 23 (0x6bb1f0): palette-half blend T0 and the material weights.
     const float T = t0 >= 0 ? t0 : clamp01(f0004_.at(x, z));
     auto L = [&](int k1, int k2) { return lerp(P(k1), P(k2), T); };
-    const float clay = mapAt(3, x, z), chalk = mapAt(6, x, z), volcano = mapAt(5, x, z);
+    // Clay 0x45d010 / chalk 0x45c270 / volcano 0x459530 = clamp(1.2 m - 0.1 + 0.05 F) (p32 pointcolours 1.1;
+    // [0x9dc834] 1.2, [0x99648c] 0.1, [0x996158] 0.05), not the raw maps.
+    const float clay = clamp01(1.2f * mapAt(3, x, z) - 0.1f + 0.05f * f8e78_.at(x, z));
+    const float chalk = clamp01(1.2f * mapAt(6, x, z) - 0.1f + 0.05f * fae20_.at(x, z));
+    const float volcano = clamp01(1.2f * mapAt(5, x, z) - 0.1f + 0.05f * fbdf4_.at(x, z));
     const float a0 = clamp01(1.3f * mapAt(4, x, z) - 0.15f + 0.1f * f9e4c_.at(x, z));  // 0x6a9d90
     float a = a0, u = 0;
     if (a0 < 1) {

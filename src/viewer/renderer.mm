@@ -696,12 +696,13 @@ GroundBand groundBand(float C, float2 xz, float2 warp, float steep, float sandy,
         if (k2 != 0xff) t = mix(t, detail.sample(rep, uv, k2), B2);
         out.n = t;
     } else {
-        // Chunks of 96 m and more use fixed sets (0x7f7ea0 / 0x7f8850): steepness w1 and the
-        // sand / snow / cracked share w2. Inferred: the *NL textures (types 17-21).
+        // Chunks of 96 m and more use one fixed set for every mid/far band (0x7f7ea0 / 0x7f8390 /
+        // 0x7f8850 store bump slots 0x11, 0x14, 0x15 at 0x7f820e / 0x7f86f0 / 0x7f8af1; p32):
+        // T0 = 17 STEPPENL, T1 = 20 ROCKNL (steepness w1), T2 = 21 PLAINNL (sand / snow share w2).
         const float scale = C < 383.0 ? 0.015 : 0.0015, extra = C < 383.0 ? 0.75 : 0.0;
         const float2 uvF = warp * scale;
-        const float4 t0 = detail.sample(rep, uvF, 21), t1 = detail.sample(rep, uvF, 20);
-        const float4 t2 = detail.sample(rep, uvF, extra > 0.0 ? 19 : 18);
+        const float4 t0 = detail.sample(rep, uvF, 17), t1 = detail.sample(rep, uvF, 20);
+        const float4 t2 = detail.sample(rep, uvF, 21);
         out.n = mix(mix(t0, t1, steep), t2, saturate(saturate(sandy + extra) - steep));
     }
     // Decal (ground.phl !bNoDecal): material of the first vertex that has one; uv and
