@@ -559,6 +559,18 @@ struct DriveWorld::Impl {
         }
         updatePatches();
         physics.Update(kStep, 1, &temp, &jobs);
+        // The vehicles push the props as kinematic bodies (infinite mass): keep a struck prop from leaving
+        // faster than the fastest vehicle (+5 m/s), as a dynamic push would.
+        if (!props.empty()) {
+            float vmax = 0;
+            for (const auto& v : vehicles) vmax = std::max(vmax, fv::len(v->model->body().S.v));
+            const float cap = vmax + 5.0f;
+            for (auto& [id, p] : props) {
+                if (!bodies().IsActive(p.body)) continue;
+                const Vec3 lv = bodies().GetLinearVelocity(p.body);
+                if (lv.Length() > cap) bodies().SetLinearVelocity(p.body, lv * (cap / lv.Length()));
+            }
+        }
         const auto t3 = std::chrono::steady_clock::now();
         vehicleMs += std::chrono::duration<float, std::milli>(t2 - t1).count();
         stepMs += std::chrono::duration<float, std::milli>(t3 - t0).count();
