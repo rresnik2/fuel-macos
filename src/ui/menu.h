@@ -13,6 +13,7 @@
 #include "ui/menu_model.hpp"
 
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <vector>
@@ -123,6 +124,7 @@ private:
     std::vector<Hub> hubs_;
     std::vector<Event> events_;
     std::vector<VehicleInfo> vehicles_;
+    std::set<std::string> startable_;  // variants the port can assemble and drive
 
     Screen screen_ = Screen::Title;
     std::string singlePage_;

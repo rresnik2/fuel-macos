@@ -37,9 +37,11 @@ std::vector<Event> loadEventsStub(const std::string& dataDir) {
             e.id = l.args[2];
             e.nameText = uint32_t(std::atoi(l.args[3].c_str()));
             auto it = races.find(e.id);
-            e.playable = it != races.end() && (it->second.start[0] != 0 || it->second.start[2] != 0);
+            // As main.mm's loadRaces keeps them: a start and a route.
+            e.playable = it != races.end() && (it->second.start[0] != 0 || it->second.start[2] != 0) &&
+                         (!it->second.checkpoints.empty() || it->second.finish[0] != 0 || it->second.finish[2] != 0);
             if (it != races.end()) e.race = it->second;
-            if (!e.playable) e.note = "no start position decoded";
+            if (!e.playable) e.note = "no start or route decoded";
             out.push_back(e);
         } else if (cmd == "ADDMISSIONNEEDEDVEHICLE" && l.args.size() > 4) {
             // event, specific vehicle (MESH_ID_x or NONE), surface, class (QUAD, MUSCLE_BUGGY, ...)

@@ -1,5 +1,8 @@
 #include "ui/menu.h"
 
+#include "core/assembly.hpp"
+#include "core/dpc.hpp"
+#include "core/vehicle_params.hpp"
 #include "ui/events_stub.hpp"
 #include "ui/tsc.hpp"
 #include "ui/ui_renderer.h"
@@ -9,8 +12,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+
+namespace fs = std::filesystem;
 
 namespace fuel::ui {
 namespace {
@@ -121,6 +127,26 @@ Menu::Menu(const std::string& dataDir, const Settings& settings, MenuMode mode)
     }
     events_ = loadEventsStub(dataDir);  // P17: replace with fuel::loadEvents(dataDir)
     vehicles_ = loadVehicleInfos(dataDir);
+    // What the port can start: a variant of that exact name in the vehicle's archive
+    // (some variants' names are not decoded yet) with driving parameters.
+    {
+        std::ifstream pf(findPathNoCase((fs::path(dataDir) / "CommonComponent").string(), "Param\\VehiclesParam.tsc"));
+        std::stringstream text;
+        text << pf.rdbuf();
+        const auto params = parseVehiclesParam(text.str());
+        for (const char* cls : {"QUAD", "BIKE", "BUGGY", "MUSCLE", "SUV", "TRUCK", "BONUS1"}) {
+            const std::string path = findPathNoCase((fs::path(dataDir) / "CommonComponent").string(), std::string("DATAS\\") + cls + ".DPC");
+            if (path.empty()) continue;
+            try {
+                DpcFile dpc(path);
+                VehicleAssembler va(dpc);
+                for (const VehicleVariant& v : va.variants())
+                    if (params.count(v.label)) startable_.insert(v.label);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "menu: %s: %s\n", path.c_str(), e.what());
+            }
+        }
+    }
     setMode(mode);
 }
 
@@ -213,6 +239,7 @@ std::vector<const VehicleInfo*> Menu::vehicleChoices() const {
     std::vector<const VehicleInfo*> out;
     for (const VehicleInfo& v : vehicles_) {
         if (v.family == "UNKNOWN") continue;  // test and traffic vehicles (VEH_TEST_*, TRAFFIC_TRUCK)
+        if (!startable_.count(v.name)) continue;
         bool ok = family.empty();
         if (byName) ok = upper(v.name) == family;
         else if (!family.empty()) {
