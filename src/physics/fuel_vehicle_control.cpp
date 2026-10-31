@@ -508,6 +508,9 @@ void FuelVehicle::wreckDetect(float dt) {  // 0x528e40 (the orientation tests; d
     if (wreck) {
         wrecked_ = 1;
         wreckTime_ = 0.001f;
+        // The rider leaves the vehicle into the ragdoll only with VehiclePP P655 > 0.5 (bikes, quads; p25 Part R
+        // corrects p23's "P631 -> 0x5c8b30"). The ragdoll is not ported yet: the flag is a read-out.
+        riderEjected_ = P(655) > 0.5f;
         if (!player_) respawnWanted_ = true;  // AI on a path: reset at once
     }
 }

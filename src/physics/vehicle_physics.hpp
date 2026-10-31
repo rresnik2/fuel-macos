@@ -155,6 +155,7 @@ public:
     // Physics cost of the last update (milliseconds, wall clock) and the vehicle model's own share.
     float lastStepMs() const;
     float lastVehicleMs() const;
+    float lastVehicleCpuMs() const;  // thread CPU time of the vehicle model (excludes preemption)
     // FUEL's model of vehicle `i` (null when absent), for checks and telemetry.
     const fv::FuelVehicle* model(int i) const;
 

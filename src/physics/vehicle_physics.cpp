@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -268,7 +269,7 @@ struct DriveWorld::Impl {
     bool originSet = false;
     fv::TerrainTriangles tris;
     fv::Environment env;
-    float stepMs = 0, vehicleMs = 0;
+    float stepMs = 0, vehicleMs = 0, vehicleCpuMs = 0, staticsMs = 0, groundMs = 0;
 
     explicit Impl(const Heightfield& hf) : terrain(hf), tris([&hf](double x, double z) { return hf.smoothHeightAt(x, z); }) {
         layerPairs.EnableCollision(kMoving, kProp);
@@ -282,13 +283,21 @@ struct DriveWorld::Impl {
         physics.Init(8192, 0, 8192, 8192, broadPhaseLayers, *objectVsBroadPhase, layerPairs);
         physics.SetGravity(Vec3(0, -kGravity, 0));
         env.terrain = &tris;
-        env.sphereStatics = [this](const fv::Vec3& c, float r, std::vector<fv::StaticHit>& out) { collideStatics(new SphereShape(r), c, fv::Quat{}, out); };
+        env.sphereStatics = [this](const fv::Vec3& c, float r, std::vector<fv::StaticHit>& out) {
+            const auto t0 = std::chrono::steady_clock::now();
+            collideStatics(new SphereShape(r), c, fv::Quat{}, out);
+            staticsMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
         env.boxStatics = [this](const fv::Vec3& c, const fv::Quat& q, const fv::Vec3& half, std::vector<fv::StaticHit>& out) {
+            const auto t0 = std::chrono::steady_clock::now();
             collideStatics(new BoxShape(Vec3(std::max(half.x, 0.06f), std::max(half.y, 0.06f), std::max(half.z, 0.06f)), 0.05f), c, q, out);
+            staticsMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
         };
         env.waterDepthAt = [this](double x, double z) { return waterQuery ? waterQuery(x, z) : 0.0f; };
         env.groundClasses = [this](double x, double z, float frac[fv::kGroundClasses], float& sink) {
+            const auto t0 = std::chrono::steady_clock::now();
             const int t = surfaceQuery ? surfaceQuery(x, z) : -1;
+            groundMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
             frac[physicsGroundClass(t)] = 1;
             sink = 0;
         };
@@ -303,11 +312,20 @@ struct DriveWorld::Impl {
         const RMat44 at = RMat44::sRotationTranslation(Quat(q.x, q.y, q.z, q.w), RVec3(double(c.x) + ox, double(c.y), double(c.z) + oz));
         CollideShapeSettings settings;
         settings.mActiveEdgeMode = EActiveEdgeMode::CollideOnlyWithActive;
-        AllHitCollisionCollector<CollideShapeCollector> hits;
+        // At most 8 hits per query (FUEL caps a body at 256 contacts): a shape deep inside a dense mesh would
+        // otherwise collect hundreds of triangles (spikes of 50+ ms).
+        class Limited : public CollideShapeCollector {
+        public:
+            std::vector<CollideShapeResult> hits;
+            void AddHit(const CollideShapeResult& r) override {
+                hits.push_back(r);
+                if (hits.size() >= 8) ForceEarlyOut();
+            }
+        } hits;
         physics.GetNarrowPhaseQuery().CollideShape(shape, Vec3::sReplicate(1.0f), at, settings, RVec3::sZero(), hits,
                                                    SpecifiedBroadPhaseLayerFilter(BroadPhaseLayer(0)), SpecifiedObjectLayerFilter(kStatic),
                                                    NotTerrainFilter());
-        for (const CollideShapeResult& h : hits.mHits) {
+        for (const CollideShapeResult& h : hits.hits) {
             if (!(h.mPenetrationDepth > 0)) continue;
             const Vec3 axis = h.mPenetrationAxis.NormalizedOr(Vec3::sAxisY());
             fv::StaticHit s;
@@ -526,12 +544,17 @@ struct DriveWorld::Impl {
         }
         const auto t1 = std::chrono::steady_clock::now();
         const uint64_t cells0 = tris.cellsBuilt, heights0 = tris.heightsEvaluated;
+        staticsMs = groundMs = 0;
+        timespec c0, c1;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
         fv::stepVehicles(models, env, kStep);
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
         const auto t2 = std::chrono::steady_clock::now();
+        vehicleCpuMs += float(c1.tv_sec - c0.tv_sec) * 1000.0f + float(c1.tv_nsec - c0.tv_nsec) * 1e-6f;
         static const bool trace = std::getenv("FUEL_PHYS_TRACE") != nullptr;
         if (trace && std::chrono::duration<float, std::milli>(t2 - t1).count() > 3.0f)
-            std::fprintf(stderr, "slow vehicle step %.1f ms: %llu cells built, %llu heights evaluated, %zu cached cells\n",
-                         std::chrono::duration<float, std::milli>(t2 - t1).count(), (unsigned long long)(tris.cellsBuilt - cells0),
+            std::fprintf(stderr, "slow vehicle step %.1f ms (static-object queries %.1f ms, surface queries %.1f ms): %llu cells built, %llu heights evaluated, %zu cached cells\n",
+                         std::chrono::duration<float, std::milli>(t2 - t1).count(), staticsMs, groundMs, (unsigned long long)(tris.cellsBuilt - cells0),
                          (unsigned long long)(tris.heightsEvaluated - heights0), tris.cachedCells());
         tris.trim(6000);
         for (auto& vp : vehicles) {
@@ -625,7 +648,7 @@ void DriveWorld::setInput(int i, const DriveInput& input) {
 }
 
 void DriveWorld::update(float dt) {
-    impl_->stepMs = impl_->vehicleMs = 0;
+    impl_->stepMs = impl_->vehicleMs = impl_->vehicleCpuMs = 0;
     if (impl_->vehicles.empty()) return;
     impl_->accumulator = std::min(impl_->accumulator + dt, 0.25f);
     while (impl_->accumulator >= kStep) {
@@ -658,6 +681,7 @@ void DriveWorld::nudge(int i, double dy, const std::array<float, 3>& velocity) {
 
 float DriveWorld::lastStepMs() const { return impl_->stepMs; }
 float DriveWorld::lastVehicleMs() const { return impl_->vehicleMs; }
+float DriveWorld::lastVehicleCpuMs() const { return impl_->vehicleCpuMs; }
 const fv::FuelVehicle* DriveWorld::model(int i) const {
     const Impl::Vehicle* v = impl_->at(i);
     return v ? v->model.get() : nullptr;

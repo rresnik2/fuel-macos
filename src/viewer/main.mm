@@ -434,11 +434,12 @@ static fuel::SurfaceMap gSurfaces;
 
 // Per-frame physics cost of the headless runs (--ai-check prints it).
 static struct PhysStats {
-    std::vector<double> frame, vehicle;
+    std::vector<double> frame, vehicle, cpu;
     int vehicles = 0;
-    void add(double ms, double vehicleMs, int n) {
+    void add(double ms, double vehicleMs, double cpuMs, int n) {
         frame.push_back(ms);
         vehicle.push_back(vehicleMs);
+        cpu.push_back(cpuMs);
         vehicles = n;
     }
     void print() const {
@@ -451,12 +452,13 @@ static struct PhysStats {
             p99 = v[std::min(v.size() - 1, size_t(double(v.size()) * 0.99))];
             worst = v.back();
         };
-        double m, p, w, vm, vp, vw;
+        double m, p, w, vm, vp, vw, cm, cp, cw;
         stats(frame, m, p, w);
         stats(vehicle, vm, vp, vw);
+        stats(cpu, cm, cp, cw);
         std::printf("physics cost, %d vehicles, %zu frames: mean %.2f ms, p99 %.2f ms, worst %.2f ms per frame "
-                    "(FUEL vehicle model: mean %.2f, p99 %.2f, worst %.2f ms)\n",
-                    vehicles, frame.size(), m, p, w, vm, vp, vw);
+                    "(FUEL vehicle model: mean %.2f, p99 %.2f, worst %.2f ms wall; CPU mean %.2f, p99 %.2f, worst %.2f ms)\n",
+                    vehicles, frame.size(), m, p, w, vm, vp, vw, cm, cp, cw);
     }
 } gPhysStats;
 
@@ -1816,7 +1818,7 @@ int main(int argc, const char** argv) {
                         drive->update(1.0f / 60, in);
                         const double tp1 = CACurrentMediaTime();
                         {  // physics cost per frame (all vehicles, props, queries), for --ai-check
-                            gPhysStats.add((tp1 - tp0) * 1000.0, drive->physics().lastVehicleMs(), drive->vehicleCount());
+                            gPhysStats.add((tp1 - tp0) * 1000.0, drive->physics().lastVehicleMs(), drive->physics().lastVehicleCpuMs(), drive->vehicleCount());
                         }
                         if (opt.film > 0) {
                             chaseView = chase.update(1.0f / 60, *drive, renderer.sceneRadius(), opt.haveYaw ? opt.yawDeg * float(M_PI) / 180.0f : 0.0f);
