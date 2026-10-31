@@ -628,6 +628,7 @@ void FuelVehicle::resetTo(const Vec3& modelOrigin, float yaw, Environment& env) 
     wreckTime_ = 0;
     respawnWanted_ = false;
     waterTimer_ = waterEvent_ = 0;
+    riderEjected_ = false;
     for (int w = 0; w < nWheels_; ++w) {
         dOmega_[w] = 0;
         groundTime_[w] = 0;
