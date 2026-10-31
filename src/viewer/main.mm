@@ -46,6 +46,8 @@
 #include "core/race_rules.hpp"
 #include "core/races.hpp"
 #include "physics/race_ai.hpp"
+#include "physics/camcheck.hpp"
+#include "core/rider_anim.hpp"
 #include "core/vehicle_params.hpp"
 #include <fstream>
 #include <set>
@@ -128,6 +130,9 @@ struct Options {
     bool inGame = false;    // --in-game: a session started from the menus (pause/results menu, HUD)
     std::string menuShot, menuShotOut, menuPage;  // --menu-shot PAGE OUT.png, --menu-page PAGE
     bool menuCheck = false; // --menu-check
+    bool camCheck = false;  // --camcheck: FUEL's camera and rider functions against emulated test vectors
+    int camView = 0;        // --cam-view N: the player's camera view for --film (5 near chase, 1 first person, 4 far chase)
+    float dropAt = -1, dropHeight = 0;  // --drop T,H: lift the player H metres at T seconds (a jump landing for --film)
     bool settings = false;  // --settings: size, fullscreen, post effects, grass, volume (and data) from the settings file; --game implies it
     // Reference captures (capture.h): --capture-spot NAME renders one spot of the spot list to
     // NAME.png (or --shot FILE), --capture-all DIR every spot to DIR/NAME.png, --spots FILE picks
@@ -234,6 +239,9 @@ Options parseArgs(int argc, const char** argv) {
         else if (a == "--menu-shot") { o.menuShot = next(); o.menuShotOut = next(); }
         else if (a == "--menu-page") o.menuPage = next();
         else if (a == "--menu-check") o.menuCheck = true;
+        else if (a == "--camcheck") o.camCheck = true;
+        else if (a == "--cam-view") o.camView = std::stoi(next());
+        else if (a == "--drop") { const std::string v = next(); if (std::sscanf(v.c_str(), "%f,%f", &o.dropAt, &o.dropHeight) != 2) die("bad --drop (use T,H)"); }
         else if (a == "--film") o.film = std::stof(next());
         else if (a == "--vehicle") o.vehicle = next();
         else if (a == "--livery") o.livery = std::stoi(next());
@@ -898,6 +906,55 @@ void writePng(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> te
 }
 
 // Renders one frame to o.shot; returns its GPU time in milliseconds.
+// Rider vectors for --camcheck: the slot table and action properties replayed from the player's FUEL.exe
+// (emulated 0x5d6950 / 0x5d3660, p25 R2/R3) and the sway target 0x5d7d40.
+std::vector<fuel::CamCheckItem> riderCheckItems(const std::string& dataDir) {
+    std::vector<fuel::CamCheckItem> out;
+    std::string err;
+    const auto t = fuel::loadRiderTables((fs::path(dataDir) / "XFinalComponent/FUEL.exe").string(), &err);
+    if (!t) {
+        out.push_back({"Rider tables 0x5d6950/0x5d3660", false, err});
+        return out;
+    }
+    static const int kMbike[47] = {/* engine table removed from the published history; read from FUEL.exe at run time */};
+    bool ok = true;
+    std::string row;
+    for (int k = 0; k < 47; ++k) ok = ok && t->slots[2][size_t(k)] == kMbike[k], row += " " + std::to_string(t->slots[2][size_t(k)]);
+    out.push_back({"Slot table 0x5d6950 MBIKE actions 0..46", ok, "got" + row});
+    static const int kBase[11] = {/* engine table removed from the published history; read from FUEL.exe at run time */};
+    ok = true, row.clear();
+    for (int a = 0; a < 11; ++a) ok = ok && t->slots[size_t(a)][0] == kBase[a], row += " " + std::to_string(t->slots[size_t(a)][0]);
+    out.push_back({"Slot table 0x5d6950 base slots (11 archetypes)", ok, "got" + row});
+    // R3 action properties {group, priority, mode}
+    auto want = [](int k) -> std::array<int, 3> {
+        return {0, 0, 0};  // engine table removed from the published history; read from FUEL.exe at run time
+    };
+    ok = true;
+    int bad = -1;
+    for (int k = 0; k < 47; ++k) {
+        const auto w = want(k);
+        const auto& p = t->props[size_t(k)];
+        if (p.group != w[0] || p.priority != w[1] || p.mode != w[2]) ok = false, bad = bad < 0 ? k : bad;
+    }
+    out.push_back({"Action props 0x5d3660 (47 actions)", ok, ok ? "all 47 records" : "first difference at action " + std::to_string(bad)});
+    const auto s1 = fuel::RiderAnimator::swayTarget({0, 0, 0, 1}, {0, 0, 5}), s2 = fuel::RiderAnimator::swayTarget({0, 0, 0, 1}, {30, 0, 0});
+    const bool sOk = std::fabs(s1[1] - 0.025f) < 1e-7f && std::fabs(s2[1] - 0.05f) < 1e-7f && s1[0] == 0 && s1[2] == 0 && s2[0] == 0 && s2[2] == 0;
+    char b[96];
+    std::snprintf(b, sizeof b, "got (0,%.7g,0) (0,%.7g,0)", s1[1], s2[1]);
+    out.push_back({"Rider sway target 0x5d7d40", sOk, b});
+    return out;
+}
+
+// --camcheck: FUEL's camera (and rider) functions against the emulated test vectors (p25 §P4, p27).
+int runCamCheck(const std::string& dataDir) {
+    std::vector<std::function<std::vector<fuel::CamCheckItem>()>> extra;
+    extra.push_back([&] { return riderCheckItems(dataDir); });
+    const fuel::CamCheckResult r = fuel::runCameraVectors(extra);
+    std::printf("%s", r.report.c_str());
+    std::printf("camcheck: %d of %d vectors match\n", r.matched, r.total);
+    return r.matched == r.total ? 0 : 1;
+}
+
 double renderShot(id<MTLDevice> device, fuel::MeshRenderer& renderer, const Options& o, const fuel::OrbitCamera& cam) {
     id<MTLCommandQueue> queue = [device newCommandQueue];
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kColorFormat
@@ -1368,6 +1425,7 @@ int main(int argc, const char** argv) {
     @autoreleasepool {
         Options opt = parseArgs(argc, argv);
         if (opt.menuCheck) return fuel::ui::runMenuCheck(opt.dataDir, fuel::loadSettings().language);
+        if (opt.camCheck) return runCamCheck(opt.dataDir);
         if (!opt.menuShot.empty()) {
             fuel::Settings ms = fuel::loadSettings();
             ms.dataDir = opt.dataDir;

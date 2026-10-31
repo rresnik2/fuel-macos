@@ -39,6 +39,9 @@ add_library(fuelcore STATIC
   src/core/assembly.cpp
   src/core/sound.cpp
   src/core/rider.cpp
+  src/core/camera_params.cpp
+  src/core/rider_tables.cpp
+  src/core/rider_anim.cpp
   src/core/settings.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
@@ -115,7 +118,8 @@ FetchContent_MakeAvailable(JoltPhysics)
 # FUEL's own vehicle model (decoded from FUEL.exe, notes p23/p24), the world around it (Jolt only for the
 # static objects, props and ray/sphere queries) and the opponents' driver AI.
 add_library(fuelphysics STATIC src/physics/vehicle_physics.cpp src/physics/race_ai.cpp
-  src/physics/fuel_contacts.cpp src/physics/fuel_vehicle.cpp src/physics/fuel_vehicle_control.cpp)
+  src/physics/fuel_contacts.cpp src/physics/fuel_vehicle.cpp src/physics/fuel_vehicle_control.cpp
+  src/physics/fuel_camera.cpp src/physics/camcheck.cpp)
 target_link_libraries(fuelphysics PUBLIC fuelcore Jolt)
 
 # The decode's test vectors (emulated on FUEL.exe) run through the port's functions.

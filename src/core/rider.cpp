@@ -162,6 +162,11 @@ Rider::Rider(const DpcFile& pilot) : dpc_(pilot) {
     if (skelE == nullptr) throw std::runtime_error("rider Skel_Z missing");
     skel_ = parseSkelBody(pilot.body(*skelE).value());
     for (size_t i = 0; i < skel_.bones.size(); ++i) boneByName_[skel_.bones[i].name] = i;
+    for (const Bone& b : skel_.bones) {
+        Mat4 bind;
+        for (size_t k = 0; k < 16; ++k) bind[k] = b.world[k];
+        invBind_.push_back(invertAffine(bind));
+    }
     for (uint32_t id : pilot.ids(cls::Material)) materialByName_.insert({linkName(pilot, *pilot.find(id)), id});
     for (uint32_t id : pilot.ids(cls::MaterialAnim)) {
         const DpcFile::Entry* e = pilot.find(id);
@@ -186,7 +191,7 @@ const Rider::Animation& Rider::animation(int slot) const {
     Animation a;
     a.duration = r.f32();
     r.u32();
-    r.u16();
+    a.loop = (r.u16() & 1) != 0;  // flags (+0x14 at run time): bit 0 = loop (0x7c02a0)
     r.u16();
     const uint32_t nrot = r.count();
     const uint8_t* rotData = r.raw(size_t(nrot) * 12);
@@ -307,16 +312,91 @@ uint32_t Rider::liveryMaterial(const std::string& name) const {
     return it == liveryByName_.end() ? 0 : it->second;
 }
 
-BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int livery) const {
-    const std::vector<Mat4> world = pose(slot, time);
-    // skin matrix per bone: inverse(bind world) * pose world
-    std::vector<Mat4> skinM(world.size());
-    for (size_t i = 0; i < world.size(); ++i) {
-        Mat4 bind;
-        for (size_t k = 0; k < 16; ++k) bind[k] = skel_.bones[i].world[k];
-        skinM[i] = mul(invertAffine(bind), world[i]);
-    }
+float Rider::duration(int slot) const { return animation(slot).duration; }
+bool Rider::loops(int slot) const { return animation(slot).loop; }
 
+int Rider::bone(const std::string& name) const {
+    const auto it = boneByName_.find(asoboCrc(name));
+    return it == boneByName_.end() ? -1 : int(it->second);
+}
+
+std::vector<Rider::BoneTRS> Rider::bindLocal() const {
+    std::vector<BoneTRS> out(skel_.bones.size());
+    for (size_t i = 0; i < skel_.bones.size(); ++i) {
+        const Bone& b = skel_.bones[i];
+        out[i].q = {b.localQuat[0], b.localQuat[1], b.localQuat[2], b.localQuat[3]};
+        out[i].t = {b.localT[0], b.localT[1], b.localT[2]};
+        out[i].s = {b.localScale[0], b.localScale[1], b.localScale[2]};
+    }
+    return out;
+}
+
+void Rider::sampleLocal(int slot, double time, std::vector<BoneTRS>& out, std::vector<uint8_t>* has) const {
+    const Animation& a = animation(slot);
+    out = bindLocal();
+    if (has) has->assign(skel_.bones.size(), 0);
+    for (size_t i = 0; i < skel_.bones.size(); ++i) {
+        const auto it = a.tracks.find(skel_.bones[i].name);
+        if (it == a.tracks.end()) continue;
+        sampleKeys(it->second.rotation, time, &out[i].q);
+        sampleKeys(it->second.translation, time, &out[i].t);
+        sampleKeys(it->second.scale, time, &out[i].s);
+        if (has) (*has)[i] = 1;
+    }
+}
+
+std::vector<Mat4> Rider::worlds(const std::vector<BoneTRS>& local) const {
+    std::vector<Mat4> world(skel_.bones.size());
+    for (size_t i = 0; i < skel_.bones.size(); ++i) {
+        const Mat4 m = localMatrix(local[i].s, local[i].q, local[i].t);
+        const int p = skel_.bones[i].parent;
+        world[i] = p >= 0 ? mul(m, world[size_t(p)]) : m;
+    }
+    return world;
+}
+
+BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int livery) const {
+    const SkinTemplate t = prepareSkin(head, chest, legs, livery);
+    BakedMesh out = t.mesh;
+    skin(t, pose(slot, time), out.vertices);
+    return out;
+}
+
+void Rider::skin(const SkinTemplate& t, const std::vector<Mat4>& world, std::vector<uint8_t>& vertices) const {
+    std::vector<Mat4> skinM(world.size());
+    for (size_t i = 0; i < world.size(); ++i) skinM[i] = mul(invBind_[i], world[i]);
+    vertices.resize(t.verts.size() * BakedMesh::kStride);
+    for (size_t vi = 0; vi < t.verts.size(); ++vi) {
+        const SkinTemplate::V& v = t.verts[vi];
+        double p[3] = {0, 0, 0}, n[3] = {0, 0, 0}, tg[3] = {0, 0, 0};
+        for (int k = 0; k < 4; ++k) {
+            if (v.w[k] <= 0) continue;
+            const Mat4& M = skinM[size_t(v.bone[k])];
+            const double w = v.w[k];
+            for (size_t c = 0; c < 3; ++c) {
+                p[c] += w * (v.pos[0] * M[c] + v.pos[1] * M[4 + c] + v.pos[2] * M[8 + c] + M[12 + c]);
+                n[c] += w * (v.nrm[0] * M[c] + v.nrm[1] * M[4 + c] + v.nrm[2] * M[8 + c]);
+                tg[c] += w * (v.tan[0] * M[c] + v.tan[1] * M[4 + c] + v.tan[2] * M[8 + c]);
+            }
+        }
+        auto norm = [](double* a) {
+            const double l = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+            if (l > 0)
+                for (int c = 0; c < 3; ++c) a[c] /= l;
+        };
+        norm(n);
+        norm(tg);
+        uint8_t* o = &vertices[vi * BakedMesh::kStride];
+        const uint8_t* src = &t.mesh.vertices[vi * BakedMesh::kStride];
+        const float pf[3] = {float(p[0]), float(p[1]), float(p[2])};
+        std::memcpy(o, pf, 12);
+        o[12] = packUnit(tg[2]), o[13] = packUnit(tg[1]), o[14] = packUnit(tg[0]), o[15] = src[15];
+        o[16] = packUnit(n[2]), o[17] = packUnit(n[1]), o[18] = packUnit(n[0]), o[19] = 255;
+        std::memcpy(o + 20, src + 20, 16);
+    }
+}
+
+Rider::SkinTemplate Rider::prepareSkin(int head, int chest, int legs, int livery) const {
     char buf[48];
     const std::string partNames[3] = {"Head" + std::to_string(head), "Chest" + std::to_string(chest), "Legs" + std::to_string(legs)};
     std::map<uint32_t, std::string> liveryOf;  // part material name CRC -> livery material name
@@ -330,7 +410,8 @@ BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int 
     std::snprintf(buf, sizeof buf, "LIVERY_%02d_BODY1", livery);
     liveryOf[asoboCrc("LIVERY_XX_BODY")] = buf;
 
-    BakedMesh out;
+    SkinTemplate st;
+    BakedMesh& out = st.mesh;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint32_t> materialIndex;
     for (const std::string& part : partNames) {
         const uint32_t nameCrc = asoboCrc(part);
@@ -382,11 +463,10 @@ BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int 
             const std::set<uint32_t> used(tris.begin(), tris.end());
             std::map<uint32_t, uint32_t> remap;
             for (uint32_t vi : used) {
-                remap[vi] = out.vertexCount();
+                remap[vi] = uint32_t(st.verts.size());
                 const uint8_t* v = &vb.data.at(size_t(vi) * vb.stride);
-                float pos[3], uv[2];
-                std::memcpy(pos, v, 12);
-                std::memcpy(uv, v + 20, 8);
+                SkinTemplate::V sv{};
+                std::memcpy(sv.pos, v, 12);
                 float idx[4] = {0, 0, 0, 0}, wt[4] = {1, 0, 0, 0};
                 if (vb.stride == 60) {
                     std::memcpy(idx, v + 28, 16);
@@ -396,34 +476,23 @@ BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int 
                     std::memcpy(wt, v + 44, 4);
                 }
                 // D3DCOLOR bytes are B, G, R, A: x = R, y = G, z = B.
-                const double nrm[3] = {v[18] / 127.5 - 1.0, v[17] / 127.5 - 1.0, v[16] / 127.5 - 1.0};
-                const double tan[3] = {v[14] / 127.5 - 1.0, v[13] / 127.5 - 1.0, v[12] / 127.5 - 1.0};
-                double p[3] = {0, 0, 0}, n[3] = {0, 0, 0}, t[3] = {0, 0, 0};
+                sv.nrm[0] = float(v[18] / 127.5 - 1.0), sv.nrm[1] = float(v[17] / 127.5 - 1.0), sv.nrm[2] = float(v[16] / 127.5 - 1.0);
+                sv.tan[0] = float(v[14] / 127.5 - 1.0), sv.tan[1] = float(v[13] / 127.5 - 1.0), sv.tan[2] = float(v[12] / 127.5 - 1.0);
                 for (int k = 0; k < 4; ++k) {
+                    sv.w[k] = wt[k] > 0 ? wt[k] : 0;
+                    sv.bone[k] = 0;
                     if (wt[k] <= 0) continue;
                     const int slotIdx = int(idx[k]) / 6;  // 6 shader registers per palette slot
                     const int bone = slotIdx >= 0 && size_t(slotIdx) < kPaletteSlots ? palette[size_t(slotIdx)] : -1;
                     if (bone < 0) throw std::runtime_error("rider vertex uses an empty palette slot");
-                    const Mat4& M = skinM[size_t(bone)];
-                    const double w = wt[k];
-                    for (size_t c = 0; c < 3; ++c) {
-                        p[c] += w * (pos[0] * M[c] + pos[1] * M[4 + c] + pos[2] * M[8 + c] + M[12 + c]);
-                        n[c] += w * (nrm[0] * M[c] + nrm[1] * M[4 + c] + nrm[2] * M[8 + c]);
-                        t[c] += w * (tan[0] * M[c] + tan[1] * M[4 + c] + tan[2] * M[8 + c]);
-                    }
+                    sv.bone[k] = bone;
                 }
-                auto norm = [](double* a) {
-                    const double l = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-                    if (l > 0)
-                        for (int c = 0; c < 3; ++c) a[c] /= l;
-                };
-                norm(n);
-                norm(t);
+                st.verts.push_back(sv);
                 uint8_t o[BakedMesh::kStride] = {};
-                const float pf[3] = {float(p[0]), float(p[1]), float(p[2])};
-                std::memcpy(o, pf, 12);
-                o[12] = packUnit(t[2]), o[13] = packUnit(t[1]), o[14] = packUnit(t[0]), o[15] = v[15];
-                o[16] = packUnit(n[2]), o[17] = packUnit(n[1]), o[18] = packUnit(n[0]), o[19] = 255;
+                std::memcpy(o, sv.pos, 12);
+                o[15] = v[15];
+                float uv[2];
+                std::memcpy(uv, v + 20, 8);
                 std::memcpy(o + 20, uv, 8);
                 out.vertices.insert(out.vertices.end(), o, o + sizeof o);
             }
@@ -435,7 +504,7 @@ BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int 
             out.batches.push_back(bb);
         }
     }
-    return out;
+    return st;
 }
 
 }  // namespace fuel
