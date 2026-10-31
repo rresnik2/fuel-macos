@@ -786,7 +786,11 @@ WorldStreamer::GroundTile WorldStreamer::buildGroundTile(int level, simd_float3 
             for (uint32_t j = k; j < n; j += threads)
                 for (uint32_t i = 0; i < n; ++i) {
                     const double x = t.originX + (i + 0.5) * sp, z = t.originZ + (j + 0.5) * sp;
-                    const fuel::GroundPoint p = ground_->at(x, z);
+                    // Without the road blend: roads are the port's textured ribbons (tan dirt), and the
+                    // decoded road colour under them would show as grey shoulders beside every road
+                    // (the 60 m colour map is built without roads too).
+                    fuel::GroundPoint p = ground_->at(x, z);
+                    p.road = 0;
                     // The 6 m palette-half noise is taken at the point (1 m) or averaged over the texel (4 m).
                     const fuel::GroundColours c = ground_->colours(x, z, p, level == 0 ? -1.0f : ground_->meanT0(x, z, sp, 2));
                     uint8_t* px = &t.rgba[(size_t(j) * n + i) * 4];
