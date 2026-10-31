@@ -476,16 +476,29 @@ void FuelVehicle::tyreCoefficients() {  // 0x52cce0
     }
 }
 
-void FuelVehicle::updateGround(Environment& env) {  // 0x5c9e80 (per wheel in the port)
+void FuelVehicle::updateGround(Environment& env) {  // 0x5c9e80
+    // veh+0x1a48 == 0 (Inferred: every vehicle the port drives): one query (0x4572d0) at the mean of the
+    // wheel points, redone only after moving 5 m horizontally, copied to every wheel (p23 7.4).
+    double mx = 0, mz = 0;
+    for (int w = 0; w < nWheels_; ++w) mx += double(wheels_[size_t(w)].hubW.x), mz += double(wheels_[size_t(w)].hubW.z);
+    if (nWheels_ > 0) mx = mx / nWheels_ + env.originX, mz = mz / nWheels_ + env.originZ;
+    const double dqx = mx - groundAt_[0], dqz = mz - groundAt_[1];
+    if (!groundQueried_ || dqx * dqx + dqz * dqz >= 25.0) {
+        groundQueried_ = true, groundAt_[0] = mx, groundAt_[1] = mz;
+        float f[kGroundClasses] = {};
+        groundSink_ = 0;
+        if (env.groundClasses)
+            env.groundClasses(mx, mz, f, groundSink_);
+        else
+            f[3] = 1;
+        for (int k = 0; k < kGroundClasses; ++k) groundFrac_[size_t(k)] = f[k];
+    }
     for (int w = 0; w < nWheels_; ++w) {
         const WheelRec& r = wheels_[size_t(w)];
         const double x = double(r.hubW.x) + env.originX, z = double(r.hubW.z) + env.originZ;
-        float frac[kGroundClasses] = {};
-        float sink = 0;
-        if (env.groundClasses)
-            env.groundClasses(x, z, frac, sink);
-        else
-            frac[3] = 1;
+        float frac[kGroundClasses];
+        for (int k = 0; k < kGroundClasses; ++k) frac[k] = groundFrac_[size_t(k)];
+        const float sink = groundSink_;
         const float water = env.waterDepthAt ? env.waterDepthAt(x, z) : 0.0f;
         waterDepth_[size_t(w)] = std::max(water, sink);
         const float wet = clampf(100 * waterDepth_[size_t(w)] + 0.0f, 0, 1);  // + weather wetness (none)

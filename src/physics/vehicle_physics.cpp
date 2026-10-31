@@ -78,6 +78,11 @@ SurfaceQuery& defaultSurfaceQuery() {
     return q;
 }
 
+DriveWorld::ClassQuery& defaultClassQuery() {
+    static DriveWorld::ClassQuery q;
+    return q;
+}
+
 DriveWorld::WaterDepthQuery& defaultWaterQuery() {
     static DriveWorld::WaterDepthQuery q;
     return q;
@@ -262,6 +267,7 @@ struct DriveWorld::Impl {
     std::vector<std::unique_ptr<Vehicle>> vehicles;
     float accumulator = 0;
     SurfaceQuery surfaceQuery = defaultSurfaceQuery();
+    DriveWorld::ClassQuery classQuery = defaultClassQuery();
     DriveWorld::WaterDepthQuery waterQuery = defaultWaterQuery();
 
     // FUEL's model runs in local coordinates around an origin (multiple of 1024 m, so the 4 m terrain cells
@@ -297,6 +303,11 @@ struct DriveWorld::Impl {
         env.waterDepthAt = [this](double x, double z) { return waterQuery ? waterQuery(x, z) : 0.0f; };
         env.groundClasses = [this](double x, double z, float frac[fv::kGroundClasses], float& sink) {
             const auto t0 = std::chrono::steady_clock::now();
+            if (classQuery) {
+                classQuery(x, z, frac, sink);
+                groundMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                return;
+            }
             const int t = surfaceQuery ? surfaceQuery(x, z) : -1;
             groundMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
             frac[physicsGroundClass(t)] = 1;
@@ -896,6 +907,7 @@ void DriveWorld::overlapStatics(const std::array<double, 3>& centre, float radiu
 }
 
 void DriveWorld::setSurfaceQuery(SurfaceQuery query) { impl_->surfaceQuery = std::move(query); }
+void DriveWorld::setDefaultClassQuery(ClassQuery query) { defaultClassQuery() = std::move(query); }
 void DriveWorld::setDefaultSurfaceQuery(SurfaceQuery query) { defaultSurfaceQuery() = std::move(query); }
 
 bool DriveWorld::hasPropShape(uint32_t key) const { return impl_->propShapes.count(key) != 0; }

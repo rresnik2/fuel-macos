@@ -14,6 +14,8 @@
 #include "terrain.hpp"
 
 #include <array>
+#include <memory>
+#include <mutex>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -92,6 +94,12 @@ public:
     const Lakes* lakes() const { return lakes_; }
     const RoadSampler* roadSampler() const { return sampler_; }
 
+    // Ground_ClassFractionsCached 0x6b76a0 (via 0x4572d0): the 18 ground-class fractions the tyres and
+    // the wheel effects read, for the 1 m cell around (x, z), and the sink depth (water + soft ground).
+    // `y` is the query height (a point more than 1 m above the ground gets class 0 only).
+    static constexpr int kGroundClasses = 18;
+    void classFractions(double x, double y, double z, float frac[kGroundClasses], float& depth) const;
+
     // Evaluates the point (x, z). With `full` false only what the tree filter needs.
     GroundPoint at(double x, double z, bool full = true) const;
     // The point's colours (needs `p` from at(x, z) with full = true). `t0` overrides the
@@ -150,6 +158,16 @@ private:
     Fractal t0c_, t18_, t24_, t28_;
     Fractal f3f54_;                                 // surface variant noise (0x6a81f0)
     Fractal f0004_, f9e4c_, fcdc8_;                 // colour noises (p16 C8, C11)
+    Fractal f8e78_, fae20_, fbdf4_;                 // clay / chalk / volcano noises (p32)
+    struct ClassCell {
+        float frac[kGroundClasses];
+        float height, water, soft;  // entry +0x18 ground height, +0x1c water level (-10000 dry), +0x20 ctx+0x208
+    };
+    struct ClassCache {  // the 0x400-entry cell cache at G+0x436d4 (the port keeps more cells)
+        std::mutex m;
+        std::unordered_map<uint64_t, ClassCell> cells;
+    };
+    std::shared_ptr<ClassCache> classCache_ = std::make_shared<ClassCache>();
     std::vector<std::array<float, 4>> palette_;    // GenWorld Colors by slot
     std::vector<float> tileWeight_, tileSize_;
     uint32_t grassAtlas_ = 0;  // FUEL.exe 0x9ff02c / 0x9ff04c

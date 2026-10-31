@@ -38,6 +38,11 @@ struct AiTables {
     // Corner speed (m/s) by turn radius in 5 m bins (0..95 m; the last bin also for >= 100 m): the
     // constants IA_RacerInitCornerTable 0x61e540 stores at racer+0x10b0..+0x10fc.
     std::array<float, 20> cornerSpeed{};
+    // Road-route cost contexts of the path manager (0x4efad0 -> 0x4ef600; .data 0xa02c88 + (row-1)*0x40 +
+    // col*0x20): speeds c0..c5 (tarmac, forest/ATV, double/bump, trails 4/5, uphill, downhill) and +0x1c
+    // "type 3 forbidden". The AI racers use row 6 (0x617fc0): col 0 main path, col 1 variant.
+    std::array<std::array<std::array<float, 6>, 2>, 6> roadSpeed{};
+    std::array<std::array<bool, 2>, 6> roadForbid3{};
 };
 std::optional<AiTables> loadAiTables(const std::string& fuelExe, std::string* error = nullptr);
 
@@ -62,6 +67,12 @@ struct RaceLine {
     // Road blocks where both ends of a stretch lie near the road network: `flatHalf(type)` is the road
     // type's flat half-width (AGW_TerraRoad +0xcc), < 0 for types the AI does not route on.
     void routeOnRoads(const struct RoadNetwork& roads, const std::function<float(int type)>& flatHalf);
+    // The same with FUEL's road graph (road_graph.hpp, p32): gate ends snapped within 10 m (0x627400 ->
+    // 0x6d19f0), routed by 0x6d8e20 / 0x6d7f90 with the AI's cost (row 6 col 0; `height` = terrain height for
+    // its slope term). Opt-in (FUEL_AI_ROADGRAPH=1): FUEL's cost prefers the invisible AI trails (types 0-3,
+    // 0.2 / 0.1 / 0.067 per metre), where the port's simulated racers still get stuck (notes p32).
+    void routeOnRoadGraph(const class RoadGraph& graph, const std::function<float(int type)>& flatHalf,
+                      const AiTables* tables, const std::function<float(float x, float z)>& height);
     // Distance along the line of the point (x, z) heading for target `next` (0-based target index).
     float progress(size_t next, double x, double z) const;
     // A point on segment `next` (towards target `next`): the foot of (x, z), moved `ahead` metres
