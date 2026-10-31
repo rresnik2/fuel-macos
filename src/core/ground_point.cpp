@@ -34,6 +34,11 @@ float contrast8(float t) {
     return std::copysign(1 - a4 * a4, t);
 }
 float soft2(float t) { return 0.5f + 0.5f * t * (2 - std::fabs(t)); }
+// S6(u) = 0.5 + 0.5 u (4 - 6|u| + (4 - |u|) u^2)
+float soft6(float u) {
+    const float a = std::fabs(u);
+    return 0.5f + 0.5f * u * (4 - 6 * a + (4 - a) * u * u);
+}
 // S4 contrast of a clamped value, back to 0..1 (0x6a7ae0, 0x6a6650 tails).
 float s4c(float v) { return contrast4(2 * clamp01(v) - 1) * 0.5f + 0.5f; }
 
@@ -46,7 +51,8 @@ float band(float x, float lo, float hi, float soft) {
 }
 
 // The engine rounds these position sums in single precision before taking the byte.
-uint8_t hashByte(const Permutation& p, double v) { return p[size_t(int64_t(std::nearbyint(float(v))) & 255)]; }
+// fistp in FUEL's game threads rounds down (_RC_DOWN, p21 H0).
+uint8_t hashByte(const Permutation& p, double v) { return p[size_t(int64_t(std::floor(float(v))) & 255)]; }
 
 uint64_t cellKey(int64_t cx, int64_t cz) { return (uint64_t(uint32_t(int32_t(cx))) << 32) | uint32_t(int32_t(cz)); }
 constexpr double kSurfaceCell = 64.0;
@@ -227,6 +233,8 @@ GroundGenerator::SurfaceWeights GroundGenerator::surfaceWeights(double x, double
 }
 
 bool GroundGenerator::excludesPlants(double x, double z) const {
+    // 0x7831e0 test 3: BigLake_MaxDepth 0x65a390 > 0.001 (inside a lake below its level).
+    if (lakes_ != nullptr && terrain_ != nullptr && lakes_->depthAbove(x, z, terrain_->smoothHeightAt(x, z)) > 0.001) return true;
     const auto it = surfaceCells_.find(cellKey(int64_t(std::floor(x / kSurfaceCell)), int64_t(std::floor(z / kSurfaceCell))));
     if (it == surfaceCells_.end()) return false;
     for (uint32_t i : it->second) {
@@ -310,7 +318,7 @@ int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float c
     if (!(pop > 0.25f && pop < 0.75f)) return 0;
     const float shift = clamp01(f7ea4_.at(x, z)) * 150.0f;
     const double a = (x + shift) * 0.005, c = (z + shift) * 0.005;
-    const double i = std::nearbyint(a), j = std::nearbyint(c);
+    const double i = std::floor(a), j = std::floor(c);  // fistp rounds down in FUEL's threads (p21 H0)
     const float u = float(a - i), v = float(c - j);
     const double cx = i * 200 + 100, cz = j * 200 + 100;
     const float r = float(hashByte(perm_, cx * 12.317513 + cz * 10.193578)) / 255.0f;
@@ -345,6 +353,10 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     const float v = p.humidity, nxz = std::hypot(p.normal[0], p.normal[2]);
     p.surfaceHumidity = clamp01(v - nxz * clamp01(1 - v * v - (1 - v) * (1 - v)));
     bool nearRoad = false;
+    if (lakes_ != nullptr) {
+        const WaterPoint w = waterAt(*lakes_, x, z, p.height);
+        p.waterDepth = w.depth, p.waterBase = w.base, p.waterFade = w.fade;
+    }
     const SurfaceWeights fs = surfaceWeights(x, z);
     p.cover = fs.cover;
     // Bit 12 (0x6b9bb0): road weight plus the flat surfaces that clear grass.
@@ -387,13 +399,14 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     }
     rockCover(x, z, p, coarse[1]);
     p.field = fieldType(x, z, p, coarse[1], nearRoad, fs.cover, &p.fieldRandom);
+    p.nearRoad = nearRoad;
     if (!full) return p;
 
     // Bit 8 (Point_Grass 0x6ba610).
     const float slope = std::acos(clamp01(p.normal[1]));
     float g = 0, ground = 0;
     const float n10 = s4c(f1fac_.at(x, z));
-    if (!(p.rock > 0.5f) && p.field != 1 && !(p.height > 3000 - 500 * p.normal[2])) {
+    if (!(p.waterDepth > 0) && !(p.rock > 0.5f) && p.field != 1 && !(p.height > 3000 - 500 * p.normal[2])) {
         g = 1 - fs.cut + fs.noise * n10;
         g -= (2 - p.road) * p.road;
         g -= p.junction * (2 - p.junction);
@@ -426,13 +439,26 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     p.groundGrass = clamp01(ground + addAll);
     // Bit 23: grass size.
     p.grassSize = clamp01(clamp01((1 - p.normal[1] - 0.1f) * 10) + s4c(ffd44_.at(x, z)) - (1 - fs.keep));
-    // Bit 24 (0x6b8980), dry land: Stones; Caillou (pebbles) only under water (no water yet).
+    // Bit 24 (0x6b8980): Stones; under water away from roads, Caillou (pebbles) too (water.md 1.8).
     if (p.road <= 0.95f) {
         const float F = ffd44_.at(x, z);
-        const float nst = clamp01(0.5f + 0.5f * contrast8(2 * F * (2 - std::fabs(F)) - 1));
-        const float st = clamp01(nst * band(slope, 30 * kDeg, 45 * kDeg, 5 * kDeg) - p.grass - p.road + p.junction);
-        const float uu = 2 * st - 1, au = std::fabs(uu);
-        p.stones = clamp01(0.5f + 0.5f * uu * (4 - 6 * au + (4 - au) * uu * uu) - p.highGround);
+        float st = 0, pc = 0;
+        if (p.waterDepth > 0 && !p.nearRoad) {
+            const float t = clamp01(10 * p.normal[1] - 5);
+            st = (2 - t) * t;
+            if (st > 0) {
+                const float a = clamp01(1 - F), b = 2 * (2 - a) * a - 1;
+                st *= soft6(b);
+                pc = soft6(2 * edgeA_.at(x, z) - 1);
+            }
+        } else {
+            const float nst = clamp01(0.5f + 0.5f * contrast8(2 * F * (2 - std::fabs(F)) - 1));
+            st = nst * band(slope, 30 * kDeg, 45 * kDeg, 5 * kDeg) - p.grass;
+        }
+        const float v = clamp01(st - p.road + p.junction);
+        const float w = clamp01(soft6(2 * v - 1) - p.highGround);  // - Dune ctx+0x228 (0 without the Dune layer)
+        p.caillou = w * pc;
+        p.stones = w * (1 - pc);
     }
     surfaceTypes(x, z, p);
     return p;
@@ -522,9 +548,12 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     } else {
         X = lerp(L(8, 67), L(7, 66), s);
     }
+    if (p.underWater()) {  // bit 7 under water: palette slot 7 as is
+        X = P(7);
+    }
     const float q = (1 - 0.5f * (1 - p.cover) * p.roadEdge) * occ;
-    if (q < 0.99f) X = lerp(lerp(L(121, 122), L(119, 120), s), X, q);
-    if (burn > 0.01f) {
+    if (q < 0.99f && !p.underWater()) X = lerp(lerp(L(121, 122), L(119, 120), s), X, q);
+    if (burn > 0.01f && !p.underWater()) {
         const float lum = X[0] + X[1] + X[2];  // weights g 0xa066f0 = (1, 1, 1)
         C k;
         for (int i = 0; i < 3; ++i) k[size_t(i)] = (lum + 0.75f * (0.2f - lum)) * (0.75f + 0.25f * occ);
@@ -554,11 +583,18 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     const float k = std::max(f - p.rock, 0.0f);
     const C far = lerp(lerp(A, P(57), k), P(56), 0.1f * p.highGround);
     for (int i = 0; i < 3; ++i) {
-        out.base[i] = A[size_t(i)];
+        out.base[i] = A[size_t(i)] * p.waterFade;  // ctx+0x70 = A * ctx+0x1b8
         out.far[i] = far[size_t(i)];
         out.road[i] = G[size_t(i)];
     }
     out.occlusion = occ;
+    // Water colour ctx+0x60 (0x6b9560): palette slot 0, under water mixed with half the earth colour.
+    for (int i = 0; i < 3; ++i) out.water[i] = P(0)[size_t(i)];
+    if (p.underWater()) {
+        const float wd = p.waterDepth - p.waterBase, kk = clamp01(p.sand + p.rockSlope);
+        const float f = clamp01(wd * 0.1f + (kk + 1) * 0.5f);
+        for (int i = 0; i < 3; ++i) out.water[i] = P(0)[size_t(i)] * f + M1[size_t(i)] * (1 - f) * 0.5f;
+    }
     out.forest = k;
     return out;
 }
@@ -630,7 +666,7 @@ bool GroundGenerator::rejectsPlant(double x, double z) const {
 
 void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std::vector<GrassTuft>& out) const {
     if (terrain_ == nullptr || tileWeight_.size() < 9) return;
-    auto byte64 = [](float v) { return float(std::lround(v * 64.0f) & 255) * 0.015625f; };
+    auto byte64 = [](float v) { return float(int64_t(std::floor(v * 64.0f + 0.5f)) & 255) * 0.015625f; };  // floor: _RC_DOWN
     for (int32_t iz = z0; iz < z1; ++iz)
         for (int32_t ix = x0; ix < x1; ++ix) {
             // Grass_Decide (0x7dddf0): jitter by the permutation nibbles.
@@ -646,7 +682,7 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
             // Grass_EmitTuft (0x7dce50).
             const float r0 = float(hashByte(perm_, z * 10.193578 + x * 12.317513)) / 255.0f, r0s = r0 * r0;
             const float size = std::max(1.0f, (r0s * 0.5f + 0.75f) * scale);
-            auto base = uint32_t(std::lround(kind * 5.9f));
+            auto base = uint32_t(std::floor(kind * 5.9f));  // fistp rounds down
             base = std::min(base, 6u);
             const float w0 = tileWeight_[base], w1 = tileWeight_[base + 1], w2 = tileWeight_[base + 2];
             const float inv = 1.0f / (w0 + w1 + w2);

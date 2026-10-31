@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "core/road_segments.hpp"
+#include "core/water.hpp"
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -153,6 +154,22 @@ int main(int argc, char** argv) {
                     std::printf("  plants: %zu without the ground tests, %zu with\n", before.size(), after.size());
                 } catch (const std::exception& e) {
                     std::printf("  plants: %s\n", e.what());
+                }
+            } else if (a == "--lakes") {
+                // --lakes: the 19 lakes the engine adds from code (read from FUEL.exe), flood-filled.
+                const auto l0 = std::chrono::steady_clock::now();
+                const fuel::Lakes lakes(dpc, [&](double px, double pz) { return double(hf.smoothHeightAt(px, pz)); });
+                std::printf("lakes: %zu (%.2f s)\n", lakes.lakes().size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - l0).count());
+                for (const fuel::Lake& L : lakes.lakes()) {
+                    size_t cells = 0;
+                    for (uint32_t w : L.mask) cells += size_t(__builtin_popcount(w));
+                    // Area under water: 25 m samples inside the mask with B-spline ground below level - 2.
+                    size_t wet = 0;
+                    for (double z = L.minZ; z < L.maxZ; z += 25)
+                        for (double x = L.minX; x < L.maxX; x += 25)
+                            if (L.contains(x, z) && hf.smoothHeightAt(x, z) < L.level - 2) ++wet;
+                    std::printf("  %s x %.2f z %.2f level %.2f R %.0f: %d x %d cells of %.2f m, %zu set, %.1f km2 under water\n",
+                                L.flood ? "basin" : "pond ", L.x, L.z, L.level, L.radius, L.w, L.h, L.cell, cells, double(wet) * 625e-6);
                 }
             } else if (a == "--roads" && i + 3 < argc) {
                 // --roads X Z R: FUEL's road segments, point sampler and height carve around (X, Z)

@@ -9,6 +9,7 @@
 #include "dpc.hpp"
 #include "genworld_noise.hpp"
 #include "road_segments.hpp"
+#include "water.hpp"
 #include "roads.hpp"
 #include "terrain.hpp"
 
@@ -48,6 +49,10 @@ struct GroundPoint {
     float sand = 0;             // ctx+0x220 "SandTexture" (bit 22; from the Dune layer)
     // Surface types (bit 21 = 0x6bb670): the four strongest of the 40 ground textures and their
     // weights (normalised by the sum of every weight > 0.025); type 0xff = none.
+    // Water (bit 6 = 0x6b9560 over the lake query; rivers not yet): ctx+0x1ac, 0x1b0, 0x1b8.
+    float waterDepth = 0, waterBase = 2, waterFade = 1;
+    bool underWater() const { return waterDepth - waterBase > 0; }
+    bool nearRoad = false;      // ctx+0x1bc <= 1 (inside a road band)
     uint8_t surfaceType[4] = {0xff, 0xff, 0xff, 0xff};
     float surfaceWeight[4] = {0, 0, 0, 0};
 };
@@ -60,6 +65,7 @@ struct GroundColours {
     float road[3] = {0, 0, 0};  // ctx+0x50: road colour (tufts on the road); base where road <= 0.025
     float occlusion = 1;        // ctx+0x230 (map 9; the engine also shades it under near trees)
     float forest = 0;           // k: weight of the far band's forest colour (palette 57)
+    float water[3] = {0, 0, 0}; // ctx+0x60: water colour (palette 0 mixed with the earth colour under water)
 };
 
 // One grass tuft as Grass_EmitTuft (0x7dce50) builds it.
@@ -82,6 +88,8 @@ public:
     bool valid() const { return terrain_ != nullptr; }
     // FUEL's road segments (point bit 12 reads them); without it the port's road widths are used.
     void setRoadSampler(const RoadSampler* s) { sampler_ = s; }
+    void setLakes(const Lakes* l) { lakes_ = l; }
+    const Lakes* lakes() const { return lakes_; }
     const RoadSampler* roadSampler() const { return sampler_; }
 
     // Evaluates the point (x, z). With `full` false only what the tree filter needs.
@@ -132,6 +140,7 @@ private:
     const Heightfield* terrain_ = nullptr;
     const RoadNetwork* roads_ = nullptr;
     const RoadSampler* sampler_ = nullptr;
+    const Lakes* lakes_ = nullptr;
     Permutation perm_{};
     std::array<Raster, 31> maps_{};
     std::vector<Surface> surfaces_;

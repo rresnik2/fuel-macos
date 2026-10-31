@@ -139,6 +139,8 @@ public:
     void setSurfaces(fuel::SurfaceQuery q) { surfaces_ = std::move(q); }
     // The road network (plant filters near roads). Roads are drawn by the terrain (decals).
     void setRoads(const fuel::RoadNetwork* roads) { roads_ = roads; }
+    // Lake water meshes around the player (needs setGround).
+    void setLakes(const fuel::Lakes* lakes) { lakes_ = lakes; }
     // Call every frame; refreshes after the player has moved a little.
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
     // Waits for every worker job, then rebuilds everything (objects, plants, roads, grass,
@@ -182,13 +184,18 @@ private:
     fuel::SurfaceQuery surfaces_;
     static constexpr float kClutterRadius = 150.0f;
     const fuel::RoadNetwork* roads_ = nullptr;
+    const fuel::Lakes* lakes_ = nullptr;
     // Plants are rebuilt on a worker thread (they took ~6 ms
     // per update on the main thread); the renderer gets them when ready.
     struct Background {
+        std::vector<fuel::MeshRenderer::WaterVertex> water;
+        std::vector<uint32_t> waterIndices;
+        bool haveWater = false;
         std::vector<fuel::MeshInstance> plants;
         std::vector<std::array<double, 16>> trunks;  // solid cylinders for nearby trees (row-vector matrices)
     };
     Background buildBackground(simd_float3 player) const;
+    void buildWater(simd_float3 player, Background& bg) const;
     void applyBackground(Background&& bg, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
     void pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
     void applySolids(fuel::DriveWorld& physics);

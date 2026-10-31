@@ -1452,6 +1452,7 @@ int main(int argc, const char** argv) {
         std::unique_ptr<fuel::Vegetation> vegetation;
         std::unique_ptr<fuel::RoadNetwork> roads;
         std::unique_ptr<fuel::RoadSampler> roadSampler;  // p22: declared before `ground`, which points at it
+        std::unique_ptr<fuel::Lakes> lakes;
         std::unique_ptr<fuel::GroundGenerator> ground;  // p14: grass and the trees' ground tests
         std::unique_ptr<WorldStreamer> streamer;  // after what its worker reads, so it is destroyed (and waits) first
         std::unique_ptr<Garage> garage;
@@ -1564,6 +1565,24 @@ int main(int argc, const char** argv) {
                                 }
                             } catch (const std::exception& e) {
                                 std::fprintf(stderr, "fuelview: roads: %s\n", e.what());
+                            }
+                            // p22: the lakes the engine adds from code (FUEL.exe table, flood-filled on
+                            // the bare height map) and their water meshes.
+                            try {
+                                const fuel::Heightfield bare = fuel::loadWorldHeightfield(*f);
+                                lakes = std::make_unique<fuel::Lakes>(*f, [&bare](double x, double z) { return double(bare.smoothHeightAt(x, z)); });
+                                if (lakes->valid()) {
+                                    ground->setLakes(lakes.get());
+                                    streamer->setLakes(lakes.get());
+                                    const std::vector<float> wc = fuel::readEngineFloats(*f, 0xa26880, 32);  // WaterConstant_Z defaults
+                                    if (wc.size() == 32) {
+                                        std::array<simd_float4, 8> c;
+                                        for (int k = 0; k < 8; ++k) c[size_t(k)] = simd_make_float4(wc[size_t(4 * k)], wc[size_t(4 * k + 1)], wc[size_t(4 * k + 2)], wc[size_t(4 * k + 3)]);
+                                        renderer.setWaterLook(c, *f);
+                                    }
+                                }
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "fuelview: lakes: %s\n", e.what());
                             }
                             streamer->setGround(ground.get());
                             renderer.setGrassAtlas(ground->grassAtlas());

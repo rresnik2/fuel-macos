@@ -172,6 +172,20 @@ public:
     void setGroundTile(int level, double originX, double originZ, float extent, const std::vector<uint8_t>& rgba,
                        const std::vector<uint16_t>& types, const std::vector<float>& decal);
     static constexpr int kGroundTileLevels = 3;
+    // Lake water (Paysage_BuildWaterMesh 0x7fbc10 rules, ground_water.phl ph_water): position,
+    // colour (BGRA bytes as the engine packs them, alpha 0/10/40), uv = world xz, and the
+    // depth of water above the ground at the vertex (port: stands in for the depth buffer read).
+    struct WaterVertex {  // 32 bytes, matches the shader's packed layout
+        float position[3];
+        uint32_t colour;
+        float uv[2];
+        float depth;
+        float pad = 0;
+    };
+    void setWater(const std::vector<WaterVertex>& vertices, const std::vector<uint32_t>& indices);
+    // The water constants (WaterConstant_Z, 8 float4 from FUEL.exe .data 0xa26880) and the
+    // water material's foam (slot 0) and normal (slot 5) maps.
+    void setWaterLook(const std::array<simd_float4, 8>& constants, const DpcFile& world);
     // Road decal textures by slot: the GenWorld texture enums the road table uses (T[+0xa8]):
     // 0x2a..0x2e Road01..05 -> 0..4, 0x34 Dirt01 -> 5; -1 for none.
     static constexpr int kDecalSlots = 6;
@@ -282,6 +296,12 @@ private:
     id<MTLTexture> heightTex_, groundColour_, groundSurface_, groundDetail_;
     id<MTLTexture> groundFine_;  // 3-slice arrays (setGroundTile): colour, surface types, road decal
     id<MTLTexture> groundTypes_, groundDecal_;
+    id<MTLRenderPipelineState> waterPipeline_;
+    id<MTLBuffer> waterVertices_, waterIndices_;
+    uint32_t waterIndexCount_ = 0;
+    std::array<simd_float4, 8> waterConst_{};
+    bool haveWaterLook_ = false;
+    id<MTLTexture> waterFoam_, waterNormal_;
     id<MTLTexture> decalTex_[kDecalSlots] = {};
     id<MTLCommandQueue> blitQueue_;  // mipmaps for the fine tiles
     simd_float4 groundFineRect_[kGroundTileLevels] = {};  // origin x, z, extent, 1 when loaded

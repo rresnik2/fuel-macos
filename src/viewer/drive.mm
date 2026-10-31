@@ -483,7 +483,88 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
             bg.plants.push_back({p.meshId, simd_matrix(col(0), col(1), col(2), simd_make_float4(p.position[0], p.position[1], p.position[2], 1))});
         }
     }
+    if (lakes_ && ground_ && terrain_) buildWater(player, bg);
     return bg;
+}
+
+// Lake water around the player, by Paysage_BuildWaterMesh's rules (0x7fbc10, water.md 3.1) on
+// one 8 m grid (the engine builds it per terrain chunk at the chunk's vertex spacing).
+void WorldStreamer::buildWater(simd_float3 player, Background& bg) const {
+    constexpr int n = 257;
+    constexpr double sp = 8.0, half = sp * (n - 1) / 2;
+    const double ox = std::round(player.x / 64.0) * 64.0 - half, oz = std::round(player.z / 64.0) * 64.0 - half;
+    bg.haveWater = true;
+    bool any = false;
+    for (const fuel::Lake& L : lakes_->lakes())
+        if (L.maxX >= ox && L.minX <= ox + 2 * half && L.maxZ >= oz && L.minZ <= oz + 2 * half) any = true;
+    if (!any) return;
+    struct P {
+        float y, W, S;
+        bool flag;
+        float c60[3], c70[3];
+    };
+    std::vector<P> pts(size_t(n) * n);
+    for (int r = 0; r < n; ++r)
+        for (int c = 0; c < n; ++c) {
+            const double x = ox + c * sp, z = oz + r * sp;
+            P& p = pts[size_t(r) * n + c];
+            p.y = float(terrain_->smoothHeightAt(x, z));
+            const fuel::WaterPoint w = fuel::waterAt(*lakes_, x, z, p.y);
+            p.flag = w.depth - w.base > 0.001f;
+            p.W = p.flag ? p.y + (w.depth - w.base) : p.y;
+            p.S = std::max(p.y, p.W);
+            if (w.depth > 0) {  // the colours are needed near water only
+                const fuel::GroundPoint gp = ground_->at(x, z);
+                const fuel::GroundColours gc = ground_->colours(x, z, gp);
+                for (int i = 0; i < 3; ++i) p.c60[i] = gc.water[i], p.c70[i] = gc.base[i];
+            } else {
+                for (int i = 0; i < 3; ++i) p.c60[i] = p.c70[i] = 0;
+            }
+        }
+    std::vector<uint8_t> alpha(pts.size(), 0);
+    bg.water.resize(pts.size());
+    for (int r = 0; r < n; ++r)
+        for (int c = 0; c < n; ++c) {
+            const P& p = pts[size_t(r) * n + c];
+            float W = p.W, S = p.S;
+            const float* c60 = p.c60;
+            if (S <= p.y + 0.01f) {  // dry: a wet diagonal neighbour's level (last one wins)
+                for (int rr = std::max(r - 1, 0); rr <= std::min(r + 1, n - 1); ++rr)
+                    for (int cc = std::max(c - 1, 0); cc <= std::min(c + 1, n - 1); ++cc) {
+                        if (rr == r || cc == c) continue;
+                        const P& q = pts[size_t(rr) * n + cc];
+                        if (q.y + 0.01f < q.S) W = q.W, S = q.S, c60 = q.c60;
+                    }
+            }
+            auto pack = [](const float* v, float scale) {  // BGRA bytes; 0x7fd280 packs floor(v * 128)
+                uint32_t out = 0;
+                for (int i = 0; i < 3; ++i) out |= uint32_t(std::clamp(int(std::floor(v[2 - i] * scale)), 0, 255)) << (8 * i);
+                return out;
+            };
+            uint32_t col;
+            uint8_t a;
+            if (S - p.y < 0.01f) col = pack(c60, 128.0f), a = 0;
+            else if (W - p.y <= 0.01f) col = pack(p.c70, 255.0f), a = 10;
+            else {
+                const float m[3] = {(p.c70[0] + c60[0]) * 0.5f, (p.c70[1] + c60[1]) * 0.5f, (p.c70[2] + c60[2]) * 0.5f};
+                col = pack(m, 128.0f), a = 40;
+            }
+            alpha[size_t(r) * n + c] = a;
+            fuel::MeshRenderer::WaterVertex& v = bg.water[size_t(r) * n + c];
+            const float x = float(ox + c * sp), z = float(oz + r * sp);
+            v.position[0] = x, v.position[1] = S, v.position[2] = z;
+            v.colour = col | uint32_t(a) << 24;
+            v.uv[0] = x, v.uv[1] = z;
+            v.depth = S - p.y;
+        }
+    for (int r = 1; r < n; ++r)
+        for (int c = 1; c < n; ++c) {
+            const uint32_t v = uint32_t(r * n + c), a = v - n - 1, b = v - n, l = v - 1;
+            if (alpha[a] || alpha[b] || alpha[v]) bg.waterIndices.insert(bg.waterIndices.end(), {a, b, v});
+            if (alpha[a] || alpha[v] || alpha[l]) bg.waterIndices.insert(bg.waterIndices.end(), {a, v, l});
+        }
+    if (bg.waterIndices.empty()) bg.water.clear();
+    if (std::getenv("FUEL_STREAM_TRACE")) std::printf("water: %zu triangles\n", bg.waterIndices.size() / 3);
 }
 
 // A unit cylinder (radius 1, y from 0 to 1) for tree trunks.
@@ -515,6 +596,7 @@ void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& rendere
     std::vector<fuel::MeshInstance> draw = cellDraw_;
     draw.insert(draw.end(), plantDraw_.begin(), plantDraw_.end());
     renderer.setWorldInstances(draw);
+    if (bg.haveWater) renderer.setWater(bg.water, bg.waterIndices);
 }
 
 void WorldStreamer::pollBackground(fuel::MeshRenderer& renderer, fuel::DriveWorld& physics) {

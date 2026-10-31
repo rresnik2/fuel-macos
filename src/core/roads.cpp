@@ -116,7 +116,7 @@ RoadNetwork loadRoads(const DpcFile& world) {
     return net;
 }
 
-uint32_t genWorldEnumTexture(const DpcFile& world, uint32_t e) {
+uint32_t genWorldEnumTexture(const DpcFile& world, uint32_t e, int slot) {
     const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
     if (gens.empty()) return 0;
     const auto gen = world.body(*world.find(gens.front()));
@@ -128,7 +128,9 @@ uint32_t genWorldEnumTexture(const DpcFile& world, uint32_t e) {
     const DpcFile::Entry* me = world.find(rd32(*gen, p + 4 + size_t(e) * 4));
     const auto mb = me ? world.body(*me) : std::nullopt;
     try {
-        return mb ? parseMaterialBody(*mb).textures[0] : 0;
+        if (!mb) return 0;
+        const auto t = parseMaterialBody(*mb).textures;
+        return slot >= 0 && size_t(slot) < t.size() ? t[size_t(slot)] : 0;
     } catch (const std::exception&) {
         return 0;
     }

@@ -624,6 +624,79 @@ fragment float4 fsTerrain(TerrainOut in [[stage_in]], constant FrameUniforms& f 
     return float4(haze(rgb, in.world, f), 1.0);
 }
 
+
+// ---- Lake water: ground_water.vhl / .phl (vh_water_anim, ph_water), notes p22 / water.md 3.3.
+// Port: no scene-colour copy or depth texture; the refraction lerps are done by blending
+// (refraction unperturbed) and the water depth comes from the vertices.
+struct WaterVertex {
+    packed_float3 position;
+    uchar4 colour;  // B, G, R, A bytes
+    float2 uv;
+    float depth;
+    float pad;
+};
+
+struct WaterOut {
+    float4 position [[position]];
+    float3 world;
+    float4 colour;
+    float4 uv;
+    float depth;
+    float4 sunPos;
+};
+
+vertex WaterOut vsWater(uint vid [[vertex_id]], const device WaterVertex* v [[buffer(0)]], constant FrameUniforms& f [[buffer(1)]],
+                        constant float4* W [[buffer(2)]], constant float& t [[buffer(3)]]) {
+    WaterOut o;
+    float3 w = float3(v[vid].position);
+    // Wave: y -= W3.y (sin(-x W3.x + W3.z t) 0.5 + 0.5).
+    w.y -= W[3].y * (sin(-w.x * W[3].x + W[3].z * t) * 0.5 + 0.5);
+    o.position = f.viewProj * float4(w, 1.0);
+    o.world = w;
+    o.colour = float4(float3(v[vid].colour.zyx), float(v[vid].colour.w)) / 255.0;
+    const float2 uv = v[vid].uv;
+    o.uv = float4(uv * W[1].z + W[1].xy * t, uv * W[2].z + W[2].xy * t);
+    o.depth = v[vid].depth;
+    o.sunPos = f.sunViewProj * float4(w, 1.0);
+    return o;
+}
+
+fragment float4 fsWater(WaterOut in [[stage_in]], constant FrameUniforms& f [[buffer(1)]], constant float4* W [[buffer(2)]],
+                        texture2d<float> foamTex [[texture(0)]], texture2d<float> normalTex [[texture(1)]],
+                        depth2d<float> shadowMap [[texture(7)]]) {
+    constexpr sampler rep(coord::normalized, filter::linear, mip_filter::linear, address::repeat, max_anisotropy(4));
+    const float4 S0 = W[4], S1 = W[5], S2 = W[6], S3 = W[7];
+    const float3 V = normalize(f.eye.xyz - in.world);
+    // Depth of water along the view ray (the engine reads the depth buffer), x Settings1.z.
+    const float waterDepth = max(in.depth, 0.0) / max(abs(V.y), 0.1) * S1.z;
+    float3 n = (normalTex.sample(rep, in.uv.xy).xyw * 2.0 - 1.0) + (normalTex.sample(rep, in.uv.zw).xyw * 2.0 - 1.0);
+    const float3 ns = normalize(float3(n.x, n.y * S3.x * 3.0, n.z));
+    n = normalize(float3(n.x, n.y * S0.w * 0.2, n.z));
+    const float fog = saturate(1.0 - exp(-waterDepth * 0.1 * S2.z * in.colour.a));
+    const float shadow = shadowFactor(shadowMap, in.sunPos);
+    // Light = shadow * sunlight + skylight (scattering terms of the engine; port sun and sky).
+    const float3 L = normalize(f.sunDir.xyz);
+    const float3 light = kSunColour * f.sunDir.w * shadow * 0.6 + skyColor(float3(0, 1, 0), L) * 0.6;
+    const float3 wc = in.colour.rgb * light * S0.x;
+    // c = refr * k + K, tracked through the shader's lerps with the refraction.
+    float k = 1.0 - fog;
+    float3 K = wc * fog;
+    const float3 r = reflect(-V, n);
+    const float3 env = skyColor(float3(r.x, abs(r.y), r.z), L) * (0.25 + 0.75 * shadow);
+    const float F = saturate(pow(1.0 - saturate(dot(V, n)), 5.0) * (1.0 - saturate(S1.w)) + S1.w) * S2.y;
+    k *= 1.0 - F;
+    K = K * (1.0 - F) + env * F;
+    const float spec = pow(max(1e-4, dot(reflect(-V, ns), L)), S3.y * 2.0) * S3.z * 0.3;
+    K += light * spec;
+    const float fo = saturate(1.1 - waterDepth * 0.002 * S2.x);
+    const float ff = fo * fo * foamTex.sample(rep, in.uv.xy - n.xz * 0.5).a;
+    k *= 1.0 - ff;
+    K = K * (1.0 - ff) + light * ff;
+    const float b = saturate(waterDepth * 0.02 * S2.x);
+    // out = lerp(refr, c, b): premultiplied, blended One / OneMinusSourceAlpha.
+    return float4(haze(K, in.world, f) * b, b * (1.0 - k));
+}
+
 struct SkyOut {
     float4 position [[position]];
     float2 ndc;
@@ -1137,6 +1210,22 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         return ps;
     };
     terrainPipeline_ = makeSimple(@"vsTerrain", @"fsTerrain");
+    {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [shaders_ newFunctionWithName:@"vsWater"];
+        d.fragmentFunction = [shaders_ newFunctionWithName:@"fsWater"];
+        d.rasterSampleCount = sampleCount_;
+        d.colorAttachments[0].pixelFormat = kRenderColorFormat;
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+        d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+        d.depthAttachmentPixelFormat = kRenderDepthFormat;
+        NSError* e = nil;
+        waterPipeline_ = [device newRenderPipelineStateWithDescriptor:d error:&e];
+        if (waterPipeline_ == nil) [NSException raise:@"pipeline" format:@"%@", e];
+    }
     {
         MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
         d.vertexFunction = [shaders_ newFunctionWithName:@"vsMarker"];
@@ -1961,6 +2050,25 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
     drawPass(0);
     drawPass(1);
     if (terrain) encodeGrass(enc);
+    if (terrain && waterVertices_ != nil && waterIndexCount_ > 0 && haveWaterLook_) {
+        [enc setRenderPipelineState:waterPipeline_];
+        [enc setDepthStencilState:depthNoWrite_];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setTriangleFillMode:MTLTriangleFillModeFill];
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - grassEpoch_).count();
+        [enc setVertexBuffer:waterVertices_ offset:0 atIndex:0];
+        [enc setVertexBytes:waterConst_.data() length:sizeof(waterConst_) atIndex:2];
+        [enc setVertexBytes:&t length:sizeof t atIndex:3];
+        [enc setFragmentBytes:waterConst_.data() length:sizeof(waterConst_) atIndex:2];
+        [enc setFragmentTexture:waterFoam_ != nil ? waterFoam_ : white_ atIndex:0];
+        [enc setFragmentTexture:waterNormal_ != nil ? waterNormal_ : white_ atIndex:1];
+        [enc setFragmentTexture:shadowMap_ atIndex:7];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:waterIndexCount_
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:waterIndices_
+                 indexBufferOffset:0];
+    }
     if (!terrain && showGround) {
         [enc setRenderPipelineState:groundPipeline_];
         [enc setDepthStencilState:depthWrite_];
@@ -2153,6 +2261,23 @@ void MeshRenderer::setGroundTile(int level, double originX, double originZ, floa
     [blit endEncoding];
     [cb commit];
     groundFineRect_[level] = simd_make_float4(float(originX), float(originZ), extent, 1);
+}
+
+void MeshRenderer::setWater(const std::vector<WaterVertex>& vertices, const std::vector<uint32_t>& indices) {
+    waterIndexCount_ = uint32_t(indices.size());
+    waterVertices_ = vertices.empty() ? nil : [device_ newBufferWithBytes:vertices.data() length:vertices.size() * sizeof(WaterVertex)
+                                                                  options:MTLResourceStorageModeShared];
+    waterIndices_ = indices.empty() ? nil : [device_ newBufferWithBytes:indices.data() length:indices.size() * 4
+                                                                options:MTLResourceStorageModeShared];
+}
+
+void MeshRenderer::setWaterLook(const std::array<simd_float4, 8>& constants, const DpcFile& world) {
+    waterConst_ = constants;
+    uint8_t alpha = 0;
+    const uint32_t foam = genWorldEnumTexture(world, 0x37, 0), normal = genWorldEnumTexture(world, 0x37, 5);
+    if (const DpcFile::Entry* e = foam ? world.find(foam) : nullptr) waterFoam_ = uploadBitmap(world, *e, false, &alpha);
+    if (const DpcFile::Entry* e = normal ? world.find(normal) : nullptr) waterNormal_ = uploadBitmap(world, *e, false, &alpha);
+    haveWaterLook_ = true;
 }
 
 void MeshRenderer::setGrassAtlas(uint32_t bitmapId) {
