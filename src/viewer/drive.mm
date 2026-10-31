@@ -3,6 +3,8 @@
 
 #include <filesystem>
 
+#include "core/weather.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -278,6 +280,9 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
     if (!gEffectsTables || !gEffectsTables->ok) return;
     if (!sys_) sys_ = std::make_unique<fuel::sfx::System>(*gEffectsTables);
     if (dt <= 0) return;
+    float rain = 0;
+    if (const auto wf = fuel::weatherFieldsCached((fs::path(gEffectsDataDir) / "CommonComponent" / "WORLD" / "USA1.DPC").string()))
+        rain = wf->sample(eye.x, eye.y, eye.z).rain;
     // The feed of 0x5ceb60, per vehicle and wheel: a wheel emits while loaded (> 0.01) and within 200 m.
     std::vector<fuel::sfx::System::WheelFeed> feeds;
     for (int v = 0; v < drive.vehicleCount(); ++v) {
@@ -299,7 +304,7 @@ void DustSystem::update(float dt, const DriveSession& drive, simd_float3 eye) {
             if (groundColour) in.groundColour = groundColour(fx.contact[0], fx.contact[2]);
             const simd_float3 c = simd_make_float3(in.contact[0], in.contact[1], in.contact[2]);
             in.cameraDistance = simd_distance(c, eye);
-            in.rain = 0;  // WeatherManager rain (no weather fields in the port yet)
+            in.rain = rain;  // WeatherManager +0xb8 at the camera (core/weather.hpp)
             for (int k = 0; k < 6; ++k) in.intensity[size_t(k)] = VP(671 + k);
             if (noFx & (1 << int(w))) continue;
             f.active = fx.load > 0.01f && in.cameraDistance <= 200.0f;

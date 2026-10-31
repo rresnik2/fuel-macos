@@ -4,6 +4,7 @@
 
 #include "core/genworld_noise.hpp"
 #include "core/vehicle.hpp"
+#include "core/weather.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -1080,6 +1081,88 @@ fragment float4 fsSfx(SfxOut in [[stage_in]], depth2d<float> depth [[texture(0)]
     return float4(max(c.rgb, 0.0), saturate(c.a));
 }
 
+// ---- Weather tanks (rain.vhl vh_rain, snow.vhl vh_snow, drawn with ph_sfxBase; p30-effects.md 6): N drops in a
+// [-1, 1]^3 tank of half size TankScale whose centre sits ahead of the camera, wrapped by MapTankCoordinate.
+
+struct TankParams {
+    float4 user[8];  // C_USER0..7 as the tank's constants function writes them (0x5e21a0 rain, 0x5dffc0 snow)
+    float4 mode;     // x 0 rain / 1 snow
+    float4 uv;       // atlas rect of the tank (u0, v0, du, dv)
+};
+
+struct TankOut {
+    float4 position [[position]];
+    float4 diffuse;
+    float2 uv;
+    float viewZ;
+};
+
+float3 mapTankCoordinate(float3 position, float3 tankPosition, float tankScale) {
+    const float3 p = position - tankPosition / tankScale;  // (sic: the shader divides only the tank position)
+    const float3 sp = sign(p);
+    return (fmod(p + sp, 2.0) - sp) * tankScale + tankPosition;
+}
+
+vertex TankOut vsTank(uint vid [[vertex_id]], uint iid [[instance_id]], const device float4* drops [[buffer(0)]],
+                      constant FrameUniforms& f [[buffer(1)]], constant TankParams& t [[buffer(2)]]) {
+    const float4 d = drops[iid];
+    const float2 corner = float2(vid & 1, vid >> 1) * 2.0 - 1.0;
+    const float3 fwd = cross(f.camUp.xyz, f.camRight.xyz);
+    TankOut o;
+    float3 world;
+    if (t.mode.x < 0.5) {  // vh_rain
+        const float4 RainColor = t.user[0];
+        const float3 Speed = t.user[1].xyz;
+        const float TankScale = t.user[1].w;
+        const float WidthFar = t.user[2].x, WidthNear = t.user[2].y, Height = t.user[2].z, Individual = t.user[2].w;
+        const float AlphaNear = t.user[3].x, AlphaFar = t.user[3].y;
+        const float3 position = mapTankCoordinate(d.xyz + t.user[5].xyz, t.user[4].xyz, TankScale);
+        const float speedz = fract(d.w), speedx = d.w / 1000.0;
+        const float2 individual = float2(speedx - 0.5, speedz - 0.5) * 2.0;
+        const float2 xz = (Speed.xz + individual * Individual) * -corner.y;
+        world = float3(position.x + xz.x, position.y + Height * corner.y, position.z + xz.y);
+        const float depth = abs(dot(world - f.eye.xyz, fwd) / TankScale);
+        world += f.camRight.xyz * (mix(WidthNear, WidthFar, depth) * corner.x);  // view-space x
+        o.diffuse = float4(RainColor.rgb, mix(AlphaNear, AlphaFar, depth));
+        // u: the quad's two corner columns are the drop's own quarter column of the atlas rect (0x5e2490)
+        const float col = floor(fract(d.w * 7.31) * 4.0);
+        const float u = t.uv.x + col * t.uv.z * 0.25 + t.uv.z * 0.0625 + (corner.x > 0.0 ? t.uv.z * 0.125 : 0.0);
+        o.uv = float2(u, corner.y > 0.0 ? t.uv.y : t.uv.y + t.uv.w);
+    } else {  // vh_snow
+        const float4 SnowColor = float4(t.user[0].rgb, 0.3);
+        const float3 Speed = t.user[1].xyz * 0.6;
+        const float TankScale = t.user[1].w;
+        const float ParticleScale = t.user[2].x, WaveAmplitude = t.user[2].y, WaveFrequency = t.user[2].z;
+        const float scaleRatio = t.user[3].x;
+        const float3 current = d.xyz + Speed;
+        float3 position = mapTankCoordinate(current, t.user[4].xyz, TankScale);
+        const float angle = WaveFrequency * length(current) + WaveFrequency * d.w;
+        const float s = sin(angle), c = cos(angle);
+        position += WaveAmplitude * float3(c - s, s - c, s + c);
+        const float depth = abs(dot(position - f.eye.xyz, fwd) / TankScale);
+        const float scale = ParticleScale * (1.0 + scaleRatio * depth);
+        world = position + (f.camRight.xyz * corner.x + f.camUp.xyz * corner.y) * scale;
+        o.diffuse = SnowColor;
+        o.uv = float2(corner.x < 0.0 ? t.uv.x : t.uv.x + t.uv.z, corner.y > 0.0 ? t.uv.y : t.uv.y + t.uv.w);
+    }
+    o.position = f.viewProj * float4(world, 1.0);
+    o.viewZ = dot(world - f.eye.xyz, fwd);
+    return o;
+}
+
+// ph_sfxBase: rgb = vcol x tex x 2, a = vcol.a x tex.a, clip at 0.01; hidden behind the scene (resolved depth).
+fragment float4 fsTank(TankOut in [[stage_in]], depth2d<float> depth [[texture(0)]], texture2d<float> atlas [[texture(1)]],
+                       constant FrameUniforms& f [[buffer(1)]]) {
+    constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    const float4 tex = atlas.sample(smp, in.uv);
+    float4 c = float4(in.diffuse.rgb * tex.rgb * 2.0, in.diffuse.a * tex.a);
+    if (c.a < 0.01) discard_fragment();
+    const float d = depth.read(uint2(in.position.xy));
+    const float scene = f.fog.z * f.fog.w / (d + f.fog.w);
+    if (in.viewZ > scene) discard_fragment();
+    return float4(c.rgb, saturate(c.a));
+}
+
 // ---- FUEL's HDR post chain (fx.phl; p26-work/post.md P3): 128 x 128 scene shrink, log luminance,
 // 2 x 2 reductions to 1 x 1, eye adaptation, bright pass, 11-tap gaussian, two star streaks, tone map
 // (blue shift, exposure, bloom + star, x + x^2 + x^3 + x^4 curve, tint), radial speed blur.
@@ -1594,6 +1677,7 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
         return ps;
     };
     dustPipeline_ = makePost(@"vsSfx", @"fsSfx", kRenderColorFormat, 1);
+    tankPipeline_ = makePost(@"vsTank", @"fsTank", kRenderColorFormat, 1);
     shrinkPipeline_ = makePost(@"vsFull", @"fsShrink", kRenderColorFormat, 0);
     lumLogPipeline_ = makePost(@"vsFull", @"fsLumLog", MTLPixelFormatR32Float, 0);
     lumAvgPipeline_ = makePost(@"vsFull", @"fsLumAvg", MTLPixelFormatR32Float, 0);
@@ -1626,6 +1710,12 @@ void MeshRenderer::setGround(const GroundMaps& maps, const DpcFile& world) {
     if (!engineSettingsRead_) {
         engineSettingsRead_ = true;
         loadSfxAtlas(world);
+        {
+            std::string err;
+            auto atlas = sfx::replayAtlas(engineExePath(world), &err);
+            if (!atlas.empty()) sfxTables_ = std::make_shared<const std::vector<sfx::AtlasEntry>>(std::move(atlas));
+        }
+        weatherFields_ = weatherFieldsFor(world);
         const std::string exe = engineExePath(world);
         readEngineRenderSettings(exe.c_str(), postDefaults_, shadowSettings_);
         const std::filesystem::path pp = std::filesystem::path(world.path()).parent_path().parent_path().parent_path() / "CommonComponent" /
@@ -2276,6 +2366,12 @@ void MeshRenderer::fillAtmosphere(FrameUniforms& fu, simd_float3 eye, const simd
     AtmosphereInput in;
     in.timeOfDay = timeOfDay();
     in.weather = weather;
+    // FUEL's weather at the camera (WeatherManager_G 0x5b89e0 -> apply 0x5bba30 -> hook 0x6409d0), unless --weather.
+    if (weatherFromWorld && weatherFields_ && weatherFields_->valid()) {
+        weatherNow_ = weatherFields_->sample(eye.x, eye.y, eye.z);
+        const Weather h = weatherHook(weatherNow_);
+        in.weather.cloud = h.cloud, in.weather.fog = h.fog, in.weather.wet = h.wet;
+    }
     in.brightness = brightness;
     in.camera = {eye.x, eye.y, eye.z};
     atmo_ = computeAtmosphere(in);
@@ -2765,7 +2861,7 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
     frameCb_ = nil;
     frameRp_ = nil;
 
-    if (lastFrame_ && !dust_.sprites.empty()) encodeDust(cb);
+    if (lastFrame_) encodeDust(cb);
     encodePost(cb, target);
     ++frame_;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
@@ -2785,6 +2881,8 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
 
 void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     if (sfxAtlas_ == nil) return;
+    encodeTanks(cb);
+    if (dust_.sprites.empty()) return;
     // Back to front from the camera (FUEL sorts its 32-particle buckets by depth, 0x5fee80; the port sorts sprites).
     const simd_float3 eye = lastFrame_->eye.xyz;
     const std::vector<SfxSprite>& sp = dust_.sprites;
@@ -2821,6 +2919,107 @@ void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     [enc setFragmentTexture:depth_ atIndex:0];
     [enc setFragmentTexture:sfxAtlas_ atIndex:1];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:order.size()];
+    [enc endEncoding];
+}
+
+// FUEL's rain and snow tanks (SpecialEffectsRainTank_G 0x5e1920 / SnowTank_G 0x5dfbd0, started by the weather apply
+// 0x5bba30 with 1024 x 12 rain drops and 12000 flakes; drawn count = floor(amount x N) 0x5de850).
+void MeshRenderer::encodeTanks(id<MTLCommandBuffer> cb) {
+    const WeatherAmounts& w = weatherNow_;
+    if (std::getenv("FUEL_SFX_DEBUG") && frame_ % 30 == 0)
+        std::fprintf(stderr, "weather at camera: cloud %.2f rain %.2f snow %.2f fog %.2f wind %.1f\n", w.cloud, w.rain, w.snow, w.fog, w.windSpeed);
+    if (!weatherFields_ || (w.rain <= 0 && w.snow <= 0)) {
+        tankClock_ = std::chrono::steady_clock::now(), haveTankClock_ = false;
+        return;
+    }
+    auto P = [&](int n) { return weatherFields_->P(n); };
+    const auto now = std::chrono::steady_clock::now();
+    float dt = haveTankClock_ ? std::min(0.25f, std::chrono::duration<float>(now - tankClock_).count()) : 0.0f;
+    if (exposureDt >= 0) dt = exposureDt;
+    tankClock_ = now, haveTankClock_ = true;
+    const simd_float3 eye = lastFrame_->eye.xyz;
+    const simd_float3 fwd = simd_cross(lastFrame_->camUp.xyz, lastFrame_->camRight.xyz);
+    // Rain velocity (0x5e1fc0): the player's velocity smoothed 0.25 per frame, x PP5043, + 0.3 wind, at most PP5042.
+    // Port: the camera's velocity stands in for the player vehicle's (it follows it), no wind vector (U).
+    simd_float3 v = haveTankEye_ && dt > 0 ? (eye - tankEye_) / dt : simd_make_float3(0, 0, 0);
+    if (simd_length(v) > 200.0f) v = 0;
+    tankEye_ = eye, haveTankEye_ = true;
+    rainSmooth_ += (v - rainSmooth_) * 0.25f;
+    simd_float3 rv = rainSmooth_ * P(5043);
+    const float rl = simd_length(rv);
+    if (P(5042) < rl) rv *= P(5042) / rl;
+    const simd_float3 half = simd_make_float3(rv.x * 0.5f, rv.y + P(5058), rv.z * 0.5f);  // +0xb4..+0xbc (0x5e1cb0)
+    rainShift_ += half * dt;
+    // Snow drift (0x5e0240): 0.5 wind + a fall of lerp(PP5027, PP5026, drawn / N).
+    const int rainN = 1024 * 12, snowN = 12000;
+    const int rainDrawn = int(std::floor(w.rain * float(rainN))), snowDrawn = int(std::floor(w.snow * float(snowN)));
+    snowShift_ += simd_make_float3(0, P(5027) + (P(5026) - P(5027)) * (float(snowDrawn) / float(snowN)), 0) * dt;
+    auto ensure = [&](__strong id<MTLBuffer>& buf, int n, bool rain) {
+        if (buf != nil) return;
+        std::vector<simd_float4> d(static_cast<size_t>(n));
+        uint32_t r = rain ? 0x2545f491u : 0x9e3779b9u;  // port RNG (FUEL fills the buffer with rand 0x6460f0)
+        auto u = [&]() {
+            r ^= r << 13, r ^= r >> 17, r ^= r << 5;
+            return float(r >> 8) / 16777216.0f;
+        };
+        for (auto& q : d) {
+            q.x = u() * 2 - 1, q.y = u() * 2 - 1, q.z = u() * 2 - 1;
+            q.w = rain ? float(int(u() * 1000.0f) + 1) + u() : u();  // vh_rain: x speed = w / 1000, z speed = frac(w)
+        }
+        buf = [device_ newBufferWithBytes:d.data() length:d.size() * sizeof(simd_float4) options:MTLResourceStorageModeShared];
+    };
+    struct TankParams {
+        simd_float4 user[8];
+        simd_float4 mode, uv;
+    };
+    auto atlasRect = [&](int i) {
+        if (!sfxTables_ || size_t(i) >= sfxTables_->size()) return simd_make_float4(0, 0, 1, 1);
+        const auto& e = (*sfxTables_)[size_t(i)];
+        return simd_make_float4(e.u0, e.v0, e.du, e.dv);
+    };
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = hdr_;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:tankPipeline_];
+    [enc setVertexBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentTexture:depth_ atIndex:0];
+    [enc setFragmentTexture:sfxAtlas_ atIndex:1];
+    if (rainDrawn > 0) {  // 0x5e21a0
+        ensure(rainDrops_, rainN, true);
+        TankParams t{};
+        t.user[0] = simd_make_float4(P(5040), P(5040), P(5040), 0);
+        t.user[1] = simd_make_float4(rv.x, rv.y + P(5058), rv.z, 30.0f);  // tank scale .rdata 0x9dbf90 (30)
+        t.user[2] = simd_make_float4(P(5044), P(5045), P(5046), 0.3f);
+        t.user[3] = simd_make_float4(P(5047), P(5048), P(5048), P(5048));
+        // Centre: camera + camera rotation x (0.5 vx, 0.5 (vy + PP5058), 0.5 vz + PP5049) (tank +0x38 = PP5049).
+        const simd_float3 local = simd_make_float3(half.x, half.y * 0.5f, half.z + P(5049));
+        t.user[4] = simd_make_float4(eye + lastFrame_->camRight.xyz * local.x + lastFrame_->camUp.xyz * local.y + fwd * local.z, 0);
+        t.user[5] = simd_make_float4(rainShift_, 1);
+        t.mode = simd_make_float4(0, 0, 0, 0);
+        t.uv = atlasRect(50);  // the splash tank's rain sub-tank: atlas 0x32
+        [enc setVertexBuffer:rainDrops_ offset:0 atIndex:0];
+        [enc setVertexBytes:&t length:sizeof t atIndex:2];
+        [enc setFragmentBytes:&t length:sizeof t atIndex:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:NSUInteger(rainDrawn)];
+    }
+    if (snowDrawn > 0) {  // 0x5dffc0
+        ensure(snowDrops_, snowN, false);
+        TankParams t{};
+        const float scale = P(5009);  // snow tank +0x38
+        t.user[0] = simd_make_float4(P(5001), P(5001), P(5001), P(5004));
+        t.user[1] = simd_make_float4(snowShift_, scale);
+        t.user[2] = simd_make_float4(P(5005), P(5006), P(5007), P(5008));
+        t.user[3] = simd_make_float4(P(5002), 0, 0, 0);
+        t.user[4] = simd_make_float4(eye + fwd * scale, 0);
+        t.mode = simd_make_float4(1, 0, 0, 0);
+        t.uv = atlasRect(49);  // 0x31
+        [enc setVertexBuffer:snowDrops_ offset:0 atIndex:0];
+        [enc setVertexBytes:&t length:sizeof t atIndex:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:NSUInteger(snowDrawn)];
+    }
     [enc endEncoding];
 }
 

@@ -14,6 +14,8 @@
 #include <simd/simd.h>
 
 #include "core/atmosphere.hpp"
+#include "core/weather.hpp"
+#include "core/sfx.hpp"
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
 #include "core/ground.hpp"
@@ -191,7 +193,9 @@ public:
     bool timeFromCommandLine = false;  // --time given: capture spots keep it
     double gameClock = -1;         // elapsed game seconds; < 0: wall time since the renderer started
     float clockScale = 96.0f;      // PP371, read from pp001.tsc by setGround when present
-    Weather weather;               // clear and dry unless set (the port has no weather fields yet)
+    Weather weather;               // --weather: fixed inputs of the atmosphere hook 0x6409d0
+    bool weatherFromWorld = true;  // the world's weather fields at the camera (core/weather.hpp) replace `weather`
+    const WeatherAmounts& weatherAmounts() const { return weatherNow_; }  // of the last frame
     float brightness = 1.0f;       // the Brightness option (0.5..2), default 1 (U2)
     // Seconds the auto exposure adapts over in the next frame (< 0: wall time since the last frame).
     float exposureDt = -1;
@@ -256,6 +260,13 @@ private:
     void encode(id<MTLRenderCommandEncoder> enc, float aspect, const OrbitCamera& cam);
     void ensureTargets(NSUInteger width, NSUInteger height);
     void encodeDust(id<MTLCommandBuffer> cb);
+    void encodeTanks(id<MTLCommandBuffer> cb);  // rain / snow (weather tanks)
+    id<MTLRenderPipelineState> tankPipeline_;
+    id<MTLBuffer> rainDrops_ = nil, snowDrops_ = nil;
+    simd_float3 rainSmooth_ = {0, 0, 0}, rainShift_ = {0, 0, 0}, snowShift_ = {0, 0, 0}, tankEye_ = {0, 0, 0};
+    bool haveTankEye_ = false, haveTankClock_ = false;
+    std::chrono::steady_clock::time_point tankClock_;
+    std::shared_ptr<const std::vector<sfx::AtlasEntry>> sfxTables_;  // the FX atlas (0x8e6ae0 replay)
     void encodePost(id<MTLCommandBuffer> cb, id<MTLTexture> target);
     // ---- Grass tufts (p14)
     void createGrassPipeline();
@@ -427,6 +438,8 @@ private:
     SfxFrame dust_;
     id<MTLTexture> sfxAtlas_ = nil;
     std::unique_ptr<DpcFile> sfxShared_;
+    std::shared_ptr<const WeatherFields> weatherFields_;
+    WeatherAmounts weatherNow_;
     void loadSfxAtlas(const DpcFile& world);
     std::shared_ptr<FrameUniforms> lastFrame_;  // the uniforms of the last encode, for dust and the post pass
     std::atomic<double> gpuMs_{0};

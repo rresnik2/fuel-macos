@@ -4,6 +4,7 @@
 
 #include "core/atmosphere.hpp"
 #include "core/sfx.hpp"
+#include "core/weather.hpp"
 #import "renderer.h"
 
 #include <algorithm>
@@ -401,6 +402,49 @@ int runRenderCheck(const std::string& dataDir) {
                     }
                 }
             }
+        }
+    }
+
+    // ---- Weather fields (0x5b89e0): the altitude split and the generator maps at a few places
+    std::printf("Weather amounts (0x5b89e0; maps 24 cloud, 23 precipitation, 22 fog, 21 wind, 16 sand)\n");
+    {
+        namespace fs = std::filesystem;
+        try {
+            DpcFile usa1((fs::path(dataDir) / "CommonComponent" / "WORLD" / "USA1.DPC").string());
+            const auto wf = weatherFieldsFor(usa1);
+            if (!wf || !wf->valid()) {
+                std::printf("  FAIL weather maps missing\n");
+                ++gFail;
+            } else {
+                const float a = wf->P(5440), b = wf->P(5441);
+                // Halfway between PP5440 and PP5441: half rain, half snow of the precipitation (p26 3.1 vector).
+                const WeatherAmounts mid = wf->sample(-39570, (a + b) * 0.5f, -28068);
+                const float split[2] = {mid.precip > 0 ? mid.rain / mid.precip : 0.5f, mid.precip > 0 ? mid.snow / mid.precip : 0.5f};
+                const float sw[2] = {0.5f, 0.5f};
+                check("rain / snow split at (PP5440 + PP5441) / 2", split, sw, 2, 1e-5f);
+                if (std::getenv("FUEL_WEATHER_SCAN")) {  // where the weather is (diagnostics)
+                    float best[3] = {0, 0, 0};
+                    double at[3][2] = {};
+                    for (double x = -68000; x <= 68000; x += 1000)
+                        for (double z = -68000; z <= 68000; z += 1000) {
+                            const WeatherAmounts w = wf->sample(x, 500, z);
+                            const float v[3] = {w.precip, w.cloud, w.fog};
+                            for (int k = 0; k < 3; ++k)
+                                if (v[k] > best[k]) best[k] = v[k], at[k][0] = x, at[k][1] = z;
+                        }
+                    std::printf("  info max precip %.3f at (%.0f, %.0f), cloud %.3f at (%.0f, %.0f), fog %.3f at (%.0f, %.0f)\n", best[0], at[0][0],
+                                at[0][1], best[1], at[1][0], at[1][1], best[2], at[2][0], at[2][1]);
+                }
+                const double spots[][3] = {{-39570, 864, -28068}, {-20000, 900, 15000}, {30000, 1500, -30000}, {0, 3000, 0}, {40000, 400, 40000}};
+                for (const auto& sp : spots) {
+                    const WeatherAmounts w = wf->sample(sp[0], sp[1], sp[2]);
+                    std::printf("  info at (%.0f, %.0f, %.0f): cloud %.3f precip %.3f rain %.3f snow %.3f fog %.3f wind %.1f m/s sand %.3f\n", sp[0],
+                                sp[1], sp[2], w.cloud, w.precip, w.rain, w.snow, w.fog, w.windSpeed, w.sand);
+                }
+            }
+        } catch (const std::exception& e) {
+            std::printf("  FAIL weather: %s\n", e.what());
+            ++gFail;
         }
     }
 

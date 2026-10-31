@@ -107,6 +107,7 @@ struct Options {
     float driveTime = 4.0f;
     double timeOfDay = -1;     // --time HH.MM: FUEL's ForceDayTime (seconds of the day); < 0 the running clock
     float cloud = 0, fog = 0, wet = 0;  // --weather C,F,W: inputs of World_SetWeatherAtmosphere (0..1)
+    bool weatherGiven = false;          // else the world's weather fields at the camera (core/weather.hpp)
     bool renderCheck = false;  // --rendercheck: the renderer's test vectors (no game data needed)
     bool haveAt = false;
     float atX = 0, atZ = 0, atYaw = 0;
@@ -210,6 +211,7 @@ Options parseArgs(int argc, const char** argv) {
         }
         else if (a == "--weather") {
             if (std::sscanf(next().c_str(), "%f,%f,%f", &o.cloud, &o.fog, &o.wet) < 1) die("bad --weather (use CLOUD,FOG,WET in 0..1)");
+            o.weatherGiven = true;
         }
         else if (a == "--rendercheck") o.renderCheck = true;
         else if (a == "--mesh") { o.meshId = uint32_t(std::stoul(next(), nullptr, 16)); o.haveMeshId = true; }
@@ -1570,6 +1572,7 @@ int main(int argc, const char** argv) {
         renderer.timeFromCommandLine = opt.timeOfDay >= 0;
         renderer.forcedTimeOfDay = opt.timeOfDay;  // --time: ForceDayTime; else 08:00 + the game clock x PP371
         renderer.weather.cloud = opt.cloud, renderer.weather.fog = opt.fog, renderer.weather.wet = opt.wet;
+        renderer.weatherFromWorld = !opt.weatherGiven;
         fuel::Settings playerSettings;
         if (opt.settings) {
             playerSettings = fuel::loadSettings();
