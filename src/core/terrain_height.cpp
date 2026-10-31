@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -159,6 +160,7 @@ constexpr double kRoadCell = 64.0;
 TerrainDetail::~TerrainDetail() = default;
 
 TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std::move(base)), id_(gNextId++) {
+    if (const char* e = std::getenv("FUEL_TERRAIN_SKIP")) skip_ = std::atoi(e);  // diagnostics: bit 0 roads, 1 flats, 2 gulches, 3 rock, 4 fractals
     const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
     if (gens.empty()) throw std::runtime_error(world.path() + ": no GenWorld_Z");
     const auto body = world.body(*world.find(gens.front()));
@@ -447,8 +449,8 @@ double TerrainDetail::detailOnly(double x, double z, GroundSample* out) const {
         const double t = f * 2 - 1;
         return (2 - std::fabs(t)) * t * 0.5;  // S2(t) - 0.5
     };
-    const double h2 = h0 + curve(f1_.at(x, z)) * a1 + curve(f2_.at(x, z)) * a2;
-    const double R = rockLattice(x, z);
+    const double h2 = (skip_ & 16) ? h0 : h0 + curve(f1_.at(x, z)) * a1 + curve(f2_.at(x, z)) * a2;
+    const double R = (skip_ & 8) ? 0.0 : rockLattice(x, z);
     const double H = h2 + R;
     const double v = floorLevel(x, z, h0);
     const double T = (H > v + double(0.01f)) ? 0.0 : (H > v ? 0.0 : v - H);
@@ -599,13 +601,17 @@ GroundSample TerrainDetail::sample(double x, double z) const {
     GroundSample s;
     double y = detailOnly(x, z, &s);
     // 0x64d550 (flags 0).
-    const double g = gulchDepth(x, z);
+    const double g = (skip_ & 4) ? 0.0 : gulchDepth(x, z);
     if (g > 0) y -= g;
-    const double a = (g > 0 ? 1.0 : 0.0) + combineFlats(false, x, z, y);
+    s.gulch = y;
+    const double a = (g > 0 ? 1.0 : 0.0) + ((skip_ & 2) ? 0.0 : combineFlats(false, x, z, y));
+    s.flatA = y;
     const double c = clamp01(a);
     double r = 0;
-    r = roads_ ? roads_(x, z, y, 1 - c, 1 - s.w18) : roadCarve(x, z, y, 1 - c, 1 - s.w18);
-    combineFlats(true, x, z, y);
+    if (!(skip_ & 1)) r = roads_ ? roads_(x, z, y, 1 - c, 1 - s.w18) : roadCarve(x, z, y, 1 - c, 1 - s.w18);
+    s.road = y;
+    if (!(skip_ & 2)) combineFlats(true, x, z, y);
+    s.flatB = y;
     // Work bumps (0x79cfa0) exist only inside procedural mode-3 TerraFlat surfaces (not ported).
     // High ground (snow) lift: 0x4de850 at (x, h0, z) with the base normal.
     const double hg0 = clamp01(s.h0 - (2500.0 - (-s.nz) * 250.0));
@@ -804,6 +810,24 @@ double TerrainDetail::farHeight(double x, double z, float n[3]) const {
 }
 
 double TerrainDetail::height(double x, double z) const { return sample(x, z).ground; }
+
+double TerrainDetail::ground(double x, double z) const {
+    struct Entry {
+        int32_t ix = INT32_MIN, iz = INT32_MIN;
+        uint32_t owner = 0;
+        float h = 0;
+    };
+    thread_local std::vector<Entry> cache(1 << 16);
+    auto at = [&](int32_t ix, int32_t iz) {
+        Entry& e = cache[size_t(((uint32_t(iz) & 255) << 8) | (uint32_t(ix) & 255))];
+        if (e.ix != ix || e.iz != iz || e.owner != id_) e.ix = ix, e.iz = iz, e.owner = id_, e.h = float(height(ix, iz));
+        return double(e.h);
+    };
+    const double fx0 = std::floor(x), fz0 = std::floor(z);
+    const auto ix = int32_t(fx0), iz = int32_t(fz0);
+    const double u = x - fx0, v = z - fz0;
+    return (1 - v) * ((1 - u) * at(ix, iz) + u * at(ix + 1, iz)) + v * ((1 - u) * at(ix, iz + 1) + u * at(ix + 1, iz + 1));
+}
 double TerrainDetail::detailHeight(double x, double z) const { return detailOnly(x, z, nullptr); }
 
 void TerrainDetail::normal(double x, double z, double e, float out[3]) const {

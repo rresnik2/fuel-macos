@@ -38,7 +38,7 @@ float Heightfield::heightAt(float x, float z) const {
 }
 
 float Heightfield::smoothHeightAt(double x, double z) const {
-    return detail ? float(detail->height(x, z)) : baseHeightAt(x, z);
+    return detail ? float(detail->ground(x, z)) : baseHeightAt(x, z);
 }
 
 float Heightfield::baseHeightAt(double x, double z) const {

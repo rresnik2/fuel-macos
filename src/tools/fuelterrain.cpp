@@ -85,6 +85,8 @@ int main(int argc, char** argv) {
                         if (l > 0.5f) (dn > 0 ? aboveNew : belowNew)++;
                         if (l < 50) sumAbsNew += l, sumAbsRaw += std::min(r, 50.0f);
                         devNew.push_back(dn);
+                        if (std::getenv("FUEL_FLOAT_LIST") && l > 0.5f)
+                            std::printf("off %08x %.1f %.2f %.1f %+.2f map %+.2f\n", pm.meshId, x, y, z, dn, dr);
                     }
                 const double qs = std::chrono::duration<double>(std::chrono::steady_clock::now() - q0).count();
                 std::printf("placements: %zu fixed + %zu FITTOGROUND (%.1f us per height)\n", total, fit, qs * 1e6 / double(std::max<size_t>(total, 1)));
@@ -235,6 +237,7 @@ int main(int argc, char** argv) {
                     const fuel::GroundSample g = hf.detail->sample(x, z);
                     std::printf("height at (%.1f, %.1f) = %.3f m (map %.3f, n.y %.3f, detail %.3f, rock %.3f, floor %.3f, w18 %.3f, before finish %.3f)\n",
                                 x, z, g.ground, g.h0, g.ny, g.h2 - g.h0, g.rock, g.floor, g.w18, g.detail);
+                    std::printf("    after gulch %.3f, flats A %.3f, roads %.3f, flats B %.3f\n", g.gulch, g.flatA, g.road, g.flatB);
                 } else {
                     std::printf("height at (%.1f, %.1f) = %.3f m (map B-spline)\n", x, z, hf.baseHeightAt(x, z));
                 }

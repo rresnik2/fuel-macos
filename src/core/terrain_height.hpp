@@ -46,6 +46,7 @@ struct GroundSample {
     double floor = 0;          // canyon floor level v (h0 - 100 when none)
     double w18 = 0;            // map slot 18 weight back to h0
     double detail = 0;         // height before the finishing pass (0x64a2a0 flags 3)
+    double gulch = 0, flatA = 0, road = 0, flatB = 0;  // height after each finishing step
     double ground = 0;         // final height
 };
 
@@ -55,7 +56,11 @@ public:
     TerrainDetail(const DpcFile& world, MapSampler base);
     ~TerrainDetail();
 
-    double height(double x, double z) const;            // flags 0: the ground
+    double height(double x, double z) const;            // flags 0: the ground at a point
+    // The engine's ground query (0x64e810, used by FITTOGROUND and gameplay): the ground at
+    // the four integer-metre points around (x, z), bilinearly interpolated (cached per thread
+    // like 0x63ea40).
+    double ground(double x, double z) const;
     double detailHeight(double x, double z) const;      // flags 3: no gulches/flats/roads/snow
     GroundSample sample(double x, double z) const;
     double baseHeight(double x, double z) const { return base_.value(x, z); }
@@ -116,6 +121,7 @@ private:
     Fractal b3f54_;  // bank +0x3f54 (road height noise)
     RoadCarver roads_;
     uint32_t id_ = 0;  // for the per-thread lattice caches
+    int skip_ = 0;     // FUEL_TERRAIN_SKIP diagnostics
 };
 
 // Builds the detail for a world DPC (WORLD/USA1.DPC) from its GenWorld_Z maps, flat
