@@ -1,6 +1,7 @@
 #include "ground_point.hpp"
 #include "ground.hpp"
 #include "resources.hpp"
+#include "terrain_height.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -332,10 +333,16 @@ void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarse
     p.rockSlope = clamp01(rockSlope - p.highGround);
 }
 
-// The coarse normal of the point context (ctx+0xe0, bit 26 / 0x45de10 on G+0xcc4).
-// APPROXIMATED by a 15 m central difference of the ground.
+// The coarse normal of the point context (ctx+0xe0): Point_BaseNormal (bit 26, 0x6b9a40) takes the
+// analytic normal of the base altitude map from 0x6ac460 / 0x45de10 (G+0xcc4), not a difference of
+// the detailed ground. TerrainDetail::baseNormal is that sampler (terrain_mesh.cpp uses it for the
+// chunk morph normals). Without FUEL's terrain detail (bare map) a 15 m difference stands in.
 void GroundGenerator::coarseNormal(double x, double z, float n[3]) const {
     const Heightfield& t = *terrain_;
+    if (t.detail) {
+        t.detail->baseNormal(x, z, n);
+        return;
+    }
     const double e = 15.0;
     const double dx = (t.smoothHeightAt(x + e, z) - t.smoothHeightAt(x - e, z)) / (2 * e);
     const double dz = (t.smoothHeightAt(x, z + e) - t.smoothHeightAt(x, z - e)) / (2 * e);
