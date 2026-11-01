@@ -155,6 +155,11 @@ public:
         if (tileJob_.valid()) tileJob_.wait();
     }
     size_t placementCount() const { return placed_.size(); }
+    // FUEL's sub-world streaming (p35, decode P31 out-F): with the WorldRef table, only the two
+    // nearest regions within 5000 m and the course of the running mission are drawn and solid;
+    // without it every sub-world is. `mission` = the event id ("" = free roam: no course).
+    void setSubWorlds(std::vector<fuel::SubWorldRef> refs);
+    void setMission(const std::string& mission);
     // Procedural trees and bushes (drawn; tree trunks solid within kCollideRadius).
     void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain);
     // Surface types for ground clutter (grass tufts, stones); must be thread-safe.
@@ -231,7 +236,16 @@ private:
         uint32_t meshId;
         std::array<float, 16> world;  // row-vector convention
         bool fitToGround = false, groundNormal = false;
+        uint16_t sub = 0;  // index into subFiles_
     };
+    std::vector<std::string> subFiles_;  // the sub-world DPC file names, in constructor order
+    std::vector<fuel::SubWorldRef> refs_;
+    std::vector<int> subRef_;            // per sub-world file: index into refs_ (-1 = not streamed)
+    std::vector<char> subActive_;        // per sub-world file
+    std::string mission_;
+    bool streamed_ = false;              // refs_ set: stream regions / courses like FUEL
+    bool refreshActive(simd_float3 player);  // true when the loaded set changed
+    bool active(const Placed& p) const { return subActive_.empty() || subActive_[p.sub]; }
     // Movable props, keyed by placement index. A prop keeps its state until it is far away.
     struct Prop {
         std::array<float, 16> world;  // current transform (row-vector convention)

@@ -1,11 +1,13 @@
 #include "world.hpp"
 
 #include "assembly.hpp"
+#include "reader.hpp"
 #include "resources.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 namespace fuel {
@@ -74,6 +76,71 @@ std::vector<PlacedMesh> collectPlacedMeshes(const DpcFile& dpc, const std::vecto
         }
     }
     return out;
+}
+
+std::vector<SubWorldRef> loadSubWorldRefs(const DpcFile& usa1) {
+    const uint32_t kWorldRef = asoboCrc("WorldRef_Z");
+    std::vector<SubWorldRef> out;
+    std::unordered_map<uint32_t, size_t> byId;
+    for (uint32_t id : usa1.ids(kWorldRef)) {
+        try {
+            const DpcFile::Entry& e = *usa1.find(id);
+            const std::vector<uint8_t> link = usa1.link(e);
+            const auto body = usa1.body(e);
+            if (!body || link.size() < 96) continue;
+            SubWorldRef r;
+            r.id = id;
+            std::memcpy(&r.flags, &link[92], 4);  // object flags (P31 out-F: 0x001ffc3c / 0x005ffc3c / 0x00dffc3c)
+            ByteReader b(*body);
+            b.raw(32);                          // embedded member (8 u32)
+            b.raw(size_t(b.count(1u << 20)) * 64);  // OBBs
+            for (int k = 0; k < 4; ++k) b.f32();    // xmin, zmin, xmax, zmax
+            r.cx = b.f32(), r.cz = b.f32();
+            b.raw(size_t(b.count(1u << 20)) * 8);   // outline polygon
+            const uint32_t len = b.count(1u << 16);
+            const char* c = reinterpret_cast<const char*>(b.raw(len));
+            const std::string cmd(c, strnlen(c, len));
+            // "OpenBF WORLD\USA1_CR31_343CC3A6;LoadWorldRef DB:>...;CloseBF"
+            if (const size_t at = cmd.find("WORLD\\"); at != std::string::npos) {
+                const size_t end = cmd.find(';', at);
+                r.file = cmd.substr(at + 6, end == std::string::npos ? std::string::npos : end - at - 6) + ".DPC";
+            }
+            r.kind = r.file.empty() ? SubWorldRef::Resident : (r.flags & 0x800000) ? SubWorldRef::Region : SubWorldRef::Course;
+            byId[id] = out.size();
+            out.push_back(std::move(r));
+        } catch (const std::exception&) {
+            // A body that does not parse is not a sub-world the port can stream.
+        }
+    }
+    // The mission that streams a course in: the UserDefine of the USA1 node holding the WorldRef.
+    for (uint32_t nodeId : usa1.ids(kNodeClass)) {
+        try {
+            const auto body = usa1.body(*usa1.find(nodeId));
+            if (!body) continue;
+            const Node node = parseNodeBody(*body);
+            auto it = byId.find(node.object);
+            if (it == byId.end() || node.userDefine == 0) continue;
+            const DpcFile::Entry* ud = usa1.find(node.userDefine);
+            if (ud == nullptr || ud->classCrc != kUserDefineClass) continue;
+            const auto udBody = usa1.body(*ud);
+            if (!udBody) continue;
+            for (const std::string& line : parseUserDefineBody(*udBody))
+                if (line.rfind("STREAM_M_TELEPORT ", 0) == 0) out[it->second].mission = line.substr(18);
+        } catch (const std::exception&) {
+        }
+    }
+    return out;
+}
+
+std::vector<size_t> nearestRegions(const std::vector<SubWorldRef>& refs, double x, double z) {
+    std::vector<std::pair<float, size_t>> d;
+    for (size_t i = 0; i < refs.size(); ++i)
+        if (refs[i].kind == SubWorldRef::Region) d.push_back({float(std::sqrt((refs[i].cx - x) * (refs[i].cx - x) + (refs[i].cz - z) * (refs[i].cz - z))), i});
+    std::sort(d.begin(), d.end());  // 0x57d770
+    std::vector<size_t> keep;
+    for (size_t k = 0; k < std::min<size_t>(2, d.size()); ++k)
+        if (d[k].first <= 5000.0f) keep.push_back(d[k].second);  // [0x9dc3f8] = 5000, equality loads
+    return keep;
 }
 
 CollisionMesh loadCollisionMesh(const std::vector<const DpcFile*>& lookup, uint32_t meshId) {

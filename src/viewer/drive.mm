@@ -9,6 +9,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <strings.h>
 #include <thread>
 
 #include "core/resources.hpp"
@@ -355,15 +356,52 @@ uint64_t cellKey(int64_t cx, int64_t cz) { return (uint64_t(uint32_t(int32_t(cx)
 
 WorldStreamer::WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup)
     : lookup_(lookup) {
-    for (const fuel::DpcFile* sub : subWorlds)
+    for (const fuel::DpcFile* sub : subWorlds) {
+        const auto subIndex = uint16_t(subFiles_.size());
+        subFiles_.push_back(std::filesystem::path(sub->path()).filename().string());
         for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, lookup)) {
             const float x = pm.world[12], z = pm.world[14];
             if (std::fabs(x) < 50 && std::fabs(z) < 50) continue;  // stray objects at the origin
             const auto index = uint32_t(placed_.size());
-            placed_.push_back({pm.meshId, pm.world, pm.fitToGround, pm.groundNormal});
+            placed_.push_back({pm.meshId, pm.world, pm.fitToGround, pm.groundNormal, subIndex});
             cells_[cellKey(int64_t(std::floor(x / kCell)), int64_t(std::floor(z / kCell)))].push_back(index);
             addObstacle(pm);
         }
+    }
+}
+
+void WorldStreamer::setSubWorlds(std::vector<fuel::SubWorldRef> refs) {
+    refs_ = std::move(refs);
+    subRef_.assign(subFiles_.size(), -1);
+    for (size_t f = 0; f < subFiles_.size(); ++f)
+        for (size_t r = 0; r < refs_.size(); ++r)
+            if (strcasecmp(refs_[r].file.c_str(), subFiles_[f].c_str()) == 0) subRef_[f] = int(r);
+    subActive_.assign(subFiles_.size(), 1);
+    streamed_ = true;
+    last_ = {1e30f, 0, 0};  // rebuild on the next update
+}
+
+void WorldStreamer::setMission(const std::string& mission) {
+    if (strcasecmp(mission.c_str(), mission_.c_str()) == 0) return;
+    mission_ = mission;  // M_TELEPORT of the new mission / M_END of the old one (0x513630)
+    last_ = {1e30f, 0, 0};
+}
+
+bool WorldStreamer::refreshActive(simd_float3 player) {
+    if (!streamed_) return false;
+    const std::vector<size_t> regions = fuel::nearestRegions(refs_, player.x, player.z);
+    bool changed = false;
+    for (size_t f = 0; f < subFiles_.size(); ++f) {
+        const int r = subRef_[f];
+        bool on = true;  // files without a WorldRef: not streamed by FUEL, keep the old behaviour
+        if (r >= 0 && refs_[size_t(r)].kind == fuel::SubWorldRef::Region)
+            on = std::find(regions.begin(), regions.end(), size_t(r)) != regions.end();
+        else if (r >= 0 && refs_[size_t(r)].kind == fuel::SubWorldRef::Course)
+            on = !mission_.empty() && strcasecmp(refs_[size_t(r)].mission.c_str(), mission_.c_str()) == 0;
+        changed = changed || subActive_[f] != char(on);
+        subActive_[f] = char(on);
+    }
+    return changed;
 }
 
 void WorldStreamer::setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) {
@@ -719,6 +757,17 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
     updateGrass(player, renderer, force);
     updateGroundTiles(player, renderer, force);
     pollBackground(renderer, physics);
+    if (refreshActive(player)) {
+        force = true;
+        for (auto it = props_.begin(); it != props_.end();) {  // detached sub-worlds take their props along
+            if (active(placed_[it->first])) {
+                ++it;
+                continue;
+            }
+            if (it->second.body) physics.removeProp(it->first);
+            it = props_.erase(it);
+        }
+    }
     if (!force && simd_distance(player, last_) < 40.0f) {
         updateProps(renderer, physics, false);
         return;
@@ -735,7 +784,7 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
             for (uint32_t i : it->second) {
                 const Placed& p = placed_[i];
                 const float d = std::hypot(p.world[12] - player.x, p.world[14] - player.z);
-                if (d > kDrawRadius) continue;
+                if (d > kDrawRadius || !active(p)) continue;
                 if (props_.count(i)) continue;  // drawn from the prop list
                 if (d <= kPropRadius) {
                     // Small objects become movable props (cached radius per mesh).
@@ -841,7 +890,7 @@ std::vector<WorldStreamer::GroundGap> WorldStreamer::groundGaps(double x, double
             if (it == cells_.end()) continue;
             for (uint32_t i : it->second) {
                 const Placed& p = placed_[i];
-                if (std::hypot(p.world[12] - x, p.world[14] - z) > radius) continue;
+                if (std::hypot(p.world[12] - x, p.world[14] - z) > radius || !active(p)) continue;
                 const float gap = p.world[13] - terrain_->smoothHeightAt(p.world[12], p.world[14]);
                 if (std::fabs(gap) >= minGap) out.push_back({p.meshId, simd_make_float3(p.world[12], p.world[13], p.world[14]), gap});
             }

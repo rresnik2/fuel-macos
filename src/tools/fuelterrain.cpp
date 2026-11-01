@@ -388,6 +388,11 @@ int main(int argc, char** argv) {
                     for (size_t k = 0x40; k < f.raw.size(); ++k) std::printf("%s%02x", (k & 3) ? "" : " ", f.raw[k]);
                     std::printf("\n");
                 }
+            } else if (a == "--subworlds") {  // p35: USA1's WorldRef_Z table (kind, file, centre, mission)
+                for (const fuel::SubWorldRef& r : fuel::loadSubWorldRefs(dpc))
+                    std::printf("subworld %08x %-8s flags %08x %-40s centre (%.0f, %.0f) %s\n", r.id,
+                                r.kind == fuel::SubWorldRef::Region ? "region" : r.kind == fuel::SubWorldRef::Course ? "course" : "resident", r.flags,
+                                r.file.c_str(), r.cx, r.cz, r.mission.c_str());
             } else if (a == "--resident") {  // p35: USA1.DPC's own mesh placements away from the origin library
                 size_t n = 0, far = 0;
                 std::unordered_map<uint32_t, size_t> perMesh;
