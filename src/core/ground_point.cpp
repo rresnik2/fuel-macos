@@ -567,7 +567,9 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
 
     // Burnt ground (bit 7): Incinerated map 13.
     const float burnI = mapAt(13, x, z);
-    const float burn = std::min(contrast8(2 * burnI - 1) * 0.5f + 0.5f, 0.9f);
+    // ctx+0x22c is written 0 on the under-water branch (0x6b9f40: ctx+0x1ac - ctx+0x1b0 > 0), so bit 8's
+    // dry term and bit 9's burn tint see 0 there.
+    const float burn = p.underWater() ? 0.0f : std::min(contrast8(2 * burnI - 1) * 0.5f + 0.5f, 0.9f);
 
     // Mixer 1 (0x6b0750): M1 earth, M2 road dirt.
     C c4[4];
@@ -731,7 +733,7 @@ void GroundGenerator::classFractions(double x, double y, double z, float frac[kG
         if (p.waterDepth <= p.waterBase + 0.01f) {  // ctx+0x1ac <= ctx+0x1b0 + 0.01: dry
             e.water = -10000.0f;
             // Grass weight ctx+0x1d0 = clamp(Grass - 0.8 dry) (bit 8; burn ctx+0x22c is 0 under water).
-            const float burn = std::min(contrast8(2 * mapAt(13, double(ix), double(iz)) - 1) * 0.5f + 0.5f, 0.9f);
+            const float burn = p.underWater() ? 0.0f : std::min(contrast8(2 * mapAt(13, double(ix), double(iz)) - 1) * 0.5f + 0.5f, 0.9f);
             const float dry = clamp01(1 - 2 * clamp01((p.surfaceHumidity - 0.33f) * 1.5625f + burn));
             const float g = clamp01(p.grass - 0.8f * dry);
             const float A = (1 - cr) * (1 - r);
