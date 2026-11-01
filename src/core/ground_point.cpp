@@ -320,6 +320,14 @@ void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarse
     if (p.height > 3000 - 500 * p.normal[2]) rock = rockSlope = 1;
     rock = clamp01(rock - p.cover - p.road - p.junction);
     rockSlope = clamp01(rockSlope - p.cover - p.road - p.junction);
+    if (p.waterDepth > 0) {
+        // Lake / river bed (ctx+0x1ac > 0, 0x6b8d80): ctx+0x1e4 = (1 - t) (S2(w) + ctx+0x1e4) with
+        // w = 2 (1 - ctx+0x248) ctx+0x198 - 1 (ctx+0x248 = Dune layer = 0 here) and
+        // t = clamp(10 n.y - 5); applied after the cover / road / junction clamp, before high ground.
+        const float w = 2 * p.surfaceHumidity - 1;
+        const float t = clamp01(10 * p.normal[1] - 5);
+        rockSlope = (1 - t) * (soft2(w) + rockSlope);
+    }
     p.rock = clamp01(rock - p.highGround);  // - water (ctx+0x228, not ported)
     p.rockSlope = clamp01(rockSlope - p.highGround);
 }
