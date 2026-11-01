@@ -153,6 +153,20 @@ Heightfield loadLevelledHeightfield(const DpcFile& world) {
                 auto rs = std::make_shared<RoadSampler>(world, std::move(types), [d](double x, double z) { return d->detailHeight(x, z); });
                 const_cast<TerrainDetail*>(d)->setRoadCarver(
                     [rs](double x, double z, double& y, double c, double w) { return rs->carve(x, z, y, c, w); });
+                // Road queries of the procedural flat surfaces (0x799910): 0x6fb320 / 0x6fb240.
+                auto hit = [](const RoadSampler& r, const RoadSampler::Nearest& n) {
+                    TerrainDetail::RoadHit h;
+                    h.edge = n.edge;
+                    if (n.seg) {
+                        h.found = true;
+                        h.px = n.px, h.pz = n.pz, h.dx = n.seg->dx, h.dz = n.seg->dz;
+                        h.c8 = r.types().types[n.seg->type].at(0xc8);
+                    }
+                    return h;
+                };
+                const RoadSampler* rp = rs.get();
+                const_cast<TerrainDetail*>(d)->setRoadQueries([rp, hit](double x, double z) { return hit(*rp, rp->nearestBigRoad(x, z)); },
+                                                              [rp, hit](double x, double z, double r) { return hit(*rp, rp->nearestRoad(x, z, r)); });
                 hf.roads = std::move(rs);
             }
         } catch (const std::exception&) {

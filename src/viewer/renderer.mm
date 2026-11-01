@@ -853,7 +853,7 @@ struct WaterVertex {
     uchar4 colour;  // B, G, R, A bytes
     float2 uv;
     float depth;
-    float pad;
+    float kind;  // 0 lake (category 0xe), 1 river (0xf)
 };
 
 struct WaterOut {
@@ -864,19 +864,24 @@ struct WaterOut {
     float depth;
     float3 ext;   // scattering() at the vertex (ground_water.vhl)
     float3 insc;
+    float kind;
 };
 
 vertex WaterOut vsWater(uint vid [[vertex_id]], const device WaterVertex* v [[buffer(0)]], constant FrameUniforms& f [[buffer(1)]],
                         constant float4* W [[buffer(2)]], constant float& t [[buffer(3)]]) {
     WaterOut o;
     float3 w = float3(v[vid].position);
-    // Wave: y -= W3.y (sin(-x W3.x + W3.z t) 0.5 + 0.5).
-    w.y -= W[3].y * (sin(-w.x * W[3].x + W[3].z * t) * 0.5 + 0.5);
+    const bool river = v[vid].kind > 0.5;
+    // Wave (vh_water_anim, lakes): y -= W3.y (sin(-x W3.x + W3.z t) 0.5 + 0.5). Rivers
+    // (vh_water_noanim) have none.
+    if (!river) w.y -= W[3].y * (sin(-w.x * W[3].x + W[3].z * t) * 0.5 + 0.5);
+    o.kind = river ? 1.0 : 0.0;
     o.position = f.viewProj * float4(w, 1.0);
     o.world = w;
     o.colour = float4(float3(v[vid].colour.zyx), float(v[vid].colour.w)) / 255.0;
     const float2 uv = v[vid].uv;
     o.uv = float4(uv * W[1].z + W[1].xy * t, uv * W[2].z + W[2].xy * t);
+    if (river) o.uv.yw += 0.25 * t;  // C_QUARTER flow
     o.depth = v[vid].depth;
     const Scatter sc = fuelScattering(f, w);
     o.ext = sc.ext;
@@ -894,7 +899,9 @@ fragment float4 fsWater(WaterOut in [[stage_in]], constant FrameUniforms& f [[bu
     const float waterDepth = max(in.depth, 0.0) / max(abs(V.y), 0.1) * S1.z;
     float3 n = (normalTex.sample(rep, in.uv.xy).xyw * 2.0 - 1.0) + (normalTex.sample(rep, in.uv.zw).xyw * 2.0 - 1.0);
     const float3 ns = normalize(float3(n.x, n.y * S3.x * 3.0, n.z));
-    n = normalize(float3(n.x, n.y * S0.w * 0.2, n.z));
+    const bool river = in.kind > 0.5;
+    // ph_water_river: n.y *= S0.w (lakes: S0.w * 0.2), spec floor 0.001, no foam, own border.
+    n = normalize(float3(n.x, n.y * S0.w * (river ? 1.0 : 0.2), n.z));
     const float fog = saturate(1.0 - exp(-waterDepth * 0.1 * S2.z * in.colour.a));
     const float shadow = fuelShadow(shadowMap, in.world, f);
     // light = shadow * sunlight + skylight (scattering(): DLIGHT_COLOR * SC1.z and DSKY_COLOR).
@@ -910,13 +917,14 @@ fragment float4 fsWater(WaterOut in [[stage_in]], constant FrameUniforms& f [[bu
     const float F = saturate(pow(1.0 - saturate(dot(V, n)), 5.0) * (1.0 - saturate(S1.w)) + S1.w) * S2.y;
     k *= 1.0 - F;
     K = K * (1.0 - F) + env * F;
-    const float spec = pow(max(1e-4, dot(reflect(-V, ns), L)), S3.y * 2.0) * S3.z * 0.3;
+    const float spec = pow(max(river ? 0.001 : 1e-4, dot(reflect(-V, ns), L)), S3.y * 2.0) * S3.z * 0.3;
     K += light * spec;
     const float fo = saturate(1.1 - waterDepth * 0.002 * S2.x);
-    const float ff = fo * fo * foamTex.sample(rep, in.uv.xy - n.xz * 0.5).a;
+    const float ff = river ? 0.0 : fo * fo * foamTex.sample(rep, in.uv.xy - n.xz * 0.5).a;
     k *= 1.0 - ff;
     K = K * (1.0 - ff) + light * ff;
-    const float b = saturate(waterDepth * 0.02 * S2.x);
+    const float b = river ? saturate(saturate(waterDepth * 0.01 * S2.x) - length(f.eye.xyz - in.world) * 0.002)
+                          : saturate(waterDepth * 0.02 * S2.x);
     // out = lerp(refr, c, b): premultiplied, blended One / OneMinusSourceAlpha.
     return float4((K * in.ext + in.insc) * b, b * (1.0 - k));
 }

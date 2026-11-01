@@ -1,4 +1,5 @@
 #include "water.hpp"
+#include "terrain_height.hpp"
 
 #include "genworld_noise.hpp"
 
@@ -151,12 +152,32 @@ WaterPoint waterAt(const Lakes& lakes, double x, double z, double h) {
     WaterPoint w;
     w.depth = float(lakes.depthAbove(x, z, h));
     w.base = 2.0f;
+    w.fade = waterFade(w.depth, w.base);
+    return w;
+}
+
+float waterFade(float depth, float base) {
     // 0x6b9560 tail: wet-shore fade.
-    if (w.depth <= 0 || w.depth <= w.base - 1) w.fade = 1;
+    if (depth <= 0 || depth <= base - 1) return 1;
+    const float u = (depth - (base - 1)) * 2;
+    return u > 1 ? 0.66999996f : 1 - 0.33f * u;
+}
+
+WaterPoint waterAt(const Lakes* lakes, const TerrainDetail* detail, double x, double z, double h) {
+    // 0x6acf80: (h1, A, flagR) = river 0x7a07d0; (h2, B = 2, flagL = 0) = lakes 0x65a480.
+    WaterPoint w;
+    TerrainDetail::River r;
+    if (detail) r = detail->river(x, z, h);
+    const double h2 = lakes ? lakes->depthAbove(x, z, h) : 0.0;
+    const double A = r.flag ? r.bed : 0.0;
+    w.base = float(std::max(A, 2.0));
+    w.depth = float(std::max(r.flag ? r.depth : 0.0, h2));
+    if (!r.flag) w.riverShare = 0;
     else {
-        const float u = (w.depth - (w.base - 1)) * 2;
-        w.fade = u > 1 ? 0.66999996f : 1 - 0.33f * u;
+        const double dA = std::max(r.depth - A, 0.0), dB = std::max(h2 - 2.0, 0.0);
+        w.riverShare = dA + dB > double(1e-4f) ? float(dA / (dA + dB)) : 1.0f;
     }
+    w.fade = waterFade(w.depth, w.base);
     return w;
 }
 

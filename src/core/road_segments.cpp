@@ -1,6 +1,7 @@
 #include "road_segments.hpp"
 
 #include "ground.hpp"
+#include "terra_cells.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -732,6 +733,53 @@ void RoadSampler::segmentsNear(double x, double z, std::vector<const Segment*>& 
         }
     }
 }
+
+// 0x6fac40 / 0x6fb0c0 (+ the closest point of 0x6fb240 / 0x6fb320, 0x6f0e30). Candidates come
+// from the TerraRoad grid in the engine (ascending pool index after sort + dedup); the port walks
+// the records of the 64 m cells under the box in record order. Comparisons are strict (first wins).
+RoadSampler::Nearest RoadSampler::nearest(double x, double z, double r, bool big) const {
+    Nearest out;
+    std::vector<uint32_t> recs;
+    const int32_t x0 = int32_t(std::floor((x - r) / kCell)), x1 = int32_t(std::floor((x + r) / kCell));
+    const int32_t z0 = int32_t(std::floor((z - r) / kCell)), z1 = int32_t(std::floor((z + r) / kCell));
+    for (int32_t cx = x0; cx <= x1; ++cx)
+        for (int32_t cz = z0; cz <= z1; ++cz) {
+            const auto it = cells_.find(cellKey(cx, cz));
+            if (it != cells_.end()) recs.insert(recs.end(), it->second.begin(), it->second.end());
+        }
+    std::sort(recs.begin(), recs.end());
+    recs.erase(std::unique(recs.begin(), recs.end()), recs.end());
+    float best = 10000.0f;  // signed edge (0x6fac40) or centreline distance (0x6fb0c0)
+    const float fx = float(x), fz = float(z);
+    for (uint32_t rec : recs) {
+        const RoadType& T = types_.types[recs_[rec].type];
+        if (big && T.byte(0x1fc) == 0) continue;
+        for (const Segment& s : segmentsOf(rec)) {
+            if (!(s.len > 0)) continue;
+            const CellBox b = terra::segmentBox(s.ax, s.az, s.bx, s.bz, s.dx, s.dz, s.w);
+            if (!terra::overlaps(b, x, z, r)) continue;
+            const float t = (s.tx * fx + s.tz * fz) - s.c34;
+            float d;
+            if (t <= 0) d = std::sqrt((fx - s.ax) * (fx - s.ax) + (fz - s.az) * (fz - s.az));
+            else if (t >= 1) d = std::sqrt((fx - s.bx) * (fx - s.bx) + (fz - s.bz) * (fz - s.bz));
+            else d = std::fabs((s.dz * fx - s.dx * fz) - s.c30);
+            const float edge = d - T.at(0xbc);
+            const float key = big ? d : edge;
+            if (key < best) best = key, out.seg = &s;
+            out.edge = std::min(out.edge, std::max(0.0f, edge));
+        }
+    }
+    if (out.seg) {
+        const Segment& s = *out.seg;
+        const float t = (s.tx * fx + s.tz * fz) - s.c34;
+        const float a = std::clamp(t * s.len, 0.0f, s.len);
+        out.px = s.ax + s.dx * a, out.pz = s.az + s.dz * a;
+    }
+    return out;
+}
+
+RoadSampler::Nearest RoadSampler::nearestRoad(double x, double z, double r) const { return nearest(x, z, r, false); }
+RoadSampler::Nearest RoadSampler::nearestBigRoad(double x, double z) const { return nearest(x, z, 50.0, true); }
 
 namespace {
 

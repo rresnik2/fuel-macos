@@ -95,6 +95,7 @@ int main(int argc, char** argv) {
                     }
                 const double qs = std::chrono::duration<double>(std::chrono::steady_clock::now() - q0).count();
                 std::printf("placements: %zu fixed + %zu FITTOGROUND (%.1f us per height)\n", total, fit, qs * 1e6 / double(std::max<size_t>(total, 1)));
+                std::printf("procedural flat surfaces built: %zu, work bumps: %zu\n", ground.detail->proceduralFlatCount(), ground.detail->workBumpCount());
                 std::printf("within 0.5 m: map %zu, FUEL ground %zu; within 2 m: map %zu, FUEL ground %zu\n", onRaw, onNew, nearRaw, nearNew);
                 if (a == "--float") {
                     std::printf("float: off by > 0.5 m: map %zu, FUEL ground %zu (%zu above, %zu below); > 4 m: map %zu, FUEL ground %zu\n",
@@ -105,6 +106,53 @@ int main(int argc, char** argv) {
                                     devNew[devNew.size() / 10], devNew[devNew.size() / 4], devNew[devNew.size() / 2], devNew[devNew.size() * 3 / 4],
                                     devNew[devNew.size() * 9 / 10], sumAbsRaw / double(total), sumAbsNew / double(total));
                 }
+            } else if (a == "--rivers" && i + 3 < argc) {  // --rivers X Z R: river water (0x7a07d0) on an 8 m grid
+                const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr), R = std::strtod(argv[i + 3], nullptr);
+                i += 3;
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                size_t riverPts = 0, wetPts = 0;
+                double bx = 0, bz = 0, bd = 0;
+                for (double z = Z - R; z <= Z + R; z += 8)
+                    for (double x = X - R; x <= X + R; x += 8) {
+                        if (!ground.detail->river(x, z, 0).flag) continue;
+                        ++riverPts;
+                        const double h = ground.smoothHeightAt(x, z);
+                        const fuel::WaterPoint w = fuel::waterAt(nullptr, ground.detail.get(), x, z, h);
+                        if (w.under()) {
+                            ++wetPts;
+                            if (w.depth - w.base > bd) bd = w.depth - w.base, bx = x, bz = z;
+                        }
+                    }
+                std::printf("rivers within %.0f m of (%.0f, %.0f): %zu carve points, %zu under water; deepest %.2f m at (%.0f, %.0f)\n", R, X, Z, riverPts,
+                            wetPts, bd, bx, bz);
+            } else if (a == "--sand" && i + 3 < argc) {  // --sand X Z R: Dune / SandTexture / zone on a 4 m grid (p34)
+                const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr), R = std::strtod(argv[i + 3], nullptr);
+                i += 3;
+                const fuel::Heightfield levelled = fuel::loadLevelledHeightfield(dpc);
+                fuel::GroundGenerator gen(dpc, levelled, nullptr);
+                if (levelled.roads) gen.setRoadSampler(levelled.roads.get());
+                fuel::Lakes lakes(dpc, [&](double x, double z) { return levelled.baseHeightAt(x, z); });
+                gen.setLakes(&lakes);
+                size_t n = 0, dune = 0, sand = 0, zone = 0, wet = 0, types[40] = {};
+                double sumDune = 0;
+                for (double z = Z - R; z <= Z + R; z += 4)
+                    for (double x = X - R; x <= X + R; x += 4) {
+                        const fuel::GroundPoint p = gen.at(x, z);
+                        ++n, dune += p.dune > 0.01f, sand += p.sand > 0.01f, zone += p.zone != 0, wet += p.underWater(), sumDune += p.dune;
+                        for (int k = 0; k < 4; ++k)
+                            if (p.surfaceType[k] < 40 && p.surfaceWeight[k] > 0) types[p.surfaceType[k]]++;
+                    }
+                std::printf("sand around (%.0f, %.0f) r %.0f: %zu points, Dune > 0.01 at %zu (mean %.3f), SandTexture > 0.01 at %zu, zone at %zu, under water %zu\n",
+                            X, Z, R, n, dune, sumDune / double(std::max<size_t>(n, 1)), sand, zone, wet);
+                std::printf("  points with SAND/SAND2 %zu/%zu, WETSAND/WETSAND2 %zu/%zu, ROUGHSAND/2 %zu/%zu\n", types[6], types[7], types[36], types[37],
+                            types[38], types[39]);
+            } else if (a == "--flats" && i + 3 < argc) {  // --flats X Z R: procedural flat surfaces (0x799910) near
+                const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr), R = std::strtod(argv[i + 3], nullptr);
+                i += 3;
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                for (const auto& f : ground.detail->proceduralFlats(X, Z, R))
+                    std::printf("flat c (%.1f, %.2f, %.1f) L2 %.1f D %.1f dir (%.3f, %.3f) n (%.3f, %.3f) margin %.1f k %.1f mode %d; ground at c %.2f\n", f.cx, f.cy,
+                                f.cz, f.lenX, f.lenZ, f.ax, f.az, f.nx, f.nz, f.margin, f.strength, f.mode, ground.smoothHeightAt(f.cx, f.cz));
             } else if (a == "--near" && i + 3 < argc) {  // --near X Z R: placed objects and the ground under them
                 const float X = std::strtof(argv[i + 1], nullptr), Z = std::strtof(argv[i + 2], nullptr), R = std::strtof(argv[i + 3], nullptr);
                 i += 3;

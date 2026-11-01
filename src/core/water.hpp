@@ -7,7 +7,7 @@
 // The lake positions are read from the player's FUEL.exe at run time (the floats the
 // generator 0x6ffdd0 loads), never copied into the port.
 // Rivers (GULCH lines) also hold water, at a level that depends on the gulch carve of the
-// terrain height (P21's TerrainDetail); they are not built here yet.
+// terrain height (TerrainDetail::river, 0x7a07d0); waterAt combines both (0x6acf80).
 #pragma once
 
 #include "dpc.hpp"
@@ -56,5 +56,11 @@ struct WaterPoint {
     bool under() const { return depth - base > 0; }
 };
 WaterPoint waterAt(const Lakes& lakes, double x, double z, double h);
+// GenWorld_WaterQuery 0x6acf80 with rivers (water.md 1.2-1.5): river first (0x7a07d0 over the
+// gulch carve, TerrainDetail::river), then the lakes. Either pointer may be null.
+class TerrainDetail;
+WaterPoint waterAt(const Lakes* lakes, const TerrainDetail* detail, double x, double z, double h);
+// 0x6b9560 tail: the wet-shore fade ctx+0x1b8 from ctx+0x1ac / ctx+0x1b0.
+float waterFade(float depth, float base);
 
 }  // namespace fuel

@@ -1,6 +1,7 @@
 #include "terrain_height.hpp"
 #include "terrain.hpp"
 #include "road_types.hpp"
+#include "terra_cells.hpp"
 
 #include <cstdio>
 
@@ -116,6 +117,33 @@ struct TerrainDetail::Flat {
     uint8_t priority;
     bool ellipse;
     bool listB;  // file +0x81 != 0 (applied after the roads)
+    // Procedural surfaces (0x799910): +0xa6 dirt bumps on the plane, +0xa2 mode, +0xa9 = 1.
+    bool bumps = false;
+    bool procedural = false;
+    uint8_t mode = 0;
+    CellBox box;  // u16 cell box (SetShape 0x79c330: centre and the four corners)
+};
+
+struct TerrainDetail::FlatCell {
+    std::once_flag once;
+    std::vector<Flat> flats;
+    // Port index: every procedural flat (of this and the 8 neighbouring cells) whose box
+    // overlaps this cell, built on first use.
+    std::once_flag coverOnce;
+    std::vector<const Flat*> cover;
+};
+
+struct TerrainDetail::BumpSeg {
+    double ax, az, bx, bz, dx, dz, tx, tz, c30, c34, R;
+    CellBox box;
+    uint8_t mode;  // +0x50: 3 or 1 (the ground's zone byte, not the height)
+};
+
+struct TerrainDetail::BumpCell {
+    std::once_flag once;
+    std::vector<BumpSeg> segs;
+    std::once_flag coverOnce;
+    std::vector<const BumpSeg*> cover;  // bumps of this and the 8 neighbouring cells reaching it
 };
 
 struct TerrainDetail::GulchLine {
@@ -127,6 +155,8 @@ struct TerrainDetail::GulchSeg {
     double ux, uz, invLen;  // unit direction, 1/length
     double R;
     double minX, minZ, maxX, maxZ;
+    CellBox box;  // 0x6f0ef0
+    double hA, hB;  // +0x44 / +0x48: 0x64a2a0 flags 3 at the ends
 };
 
 struct TerrainDetail::RoadLine {
@@ -153,7 +183,12 @@ constexpr double kRoadCell = 64.0;
 
 }  // namespace
 
-TerrainDetail::~TerrainDetail() = default;
+TerrainDetail::~TerrainDetail() {
+    if (flatCells2_)
+        for (int32_t i = 0; i < kFlatCells * kFlatCells; ++i) delete flatCells2_[size_t(i)].load();
+    if (bumpCells_)
+        for (int32_t i = 0; i < kBumpCells * kBumpCells; ++i) delete bumpCells_[size_t(i)].load();
+}
 
 TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std::move(base)), id_(gNextId++) {
     if (const char* e = std::getenv("FUEL_TERRAIN_SKIP")) skip_ = std::atoi(e);  // diagnostics: bit 0 roads, 1 flats, 2 gulches, 3 rock, 4 fractals
@@ -178,6 +213,7 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
         m.scale = 1.0f / r.maxValue;
         m.raw = std::move(r.raw);
     };
+    loadMap(8, map08_);
     loadMap(10, map10_);
     loadMap(11, map11_);
     loadMap(12, map12_);
@@ -238,6 +274,11 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
         s.priority = b[r + 0x7d];
         s.ellipse = b[r + 0x82] != 0;
         s.listB = b[r + 0x81] != 0;
+        s.box = terra::boxAt(s.cx, s.cz);
+        for (int k = 0; k < 4; ++k) {
+            const double sx = (k & 1) ? -1 : 1, sz = (k & 2) ? -1 : 1;
+            terra::extend(s.box, s.cx + sx * s.ax + sz * s.bx, s.cz + sx * s.az + sz * s.bz);
+        }
         // +0x78 height map index and +0x7f noise flag: none in USA1 (all 0xffff / 0).
         const auto idx = uint32_t(flats_.size());
         flats_.push_back(s);
@@ -331,6 +372,8 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
     roadOnce_ = std::make_unique<std::once_flag[]>(roadLines_.size());
     roadBuilt_.resize(roadLines_.size());
     gulchSegs_.resize(gulchLines_.size());
+    flatCells2_.reset(new std::atomic<FlatCell*>[size_t(kFlatCells) * kFlatCells]());
+    bumpCells_.reset(new std::atomic<BumpCell*>[size_t(kBumpCells) * kBumpCells]());
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +528,8 @@ const std::vector<TerrainDetail::GulchSeg>& TerrainDetail::gulchSegments(uint32_
             s.R = R;
             s.minX = std::min(s.ax, s.bx) - R, s.maxX = std::max(s.ax, s.bx) + R;
             s.minZ = std::min(s.az, s.bz) - R, s.maxZ = std::max(s.az, s.bz) + R;
+            s.box = terra::segmentBox(s.ax, s.az, s.bx, s.bz, s.ux, s.uz, R);
+            s.hA = terra::f32down(h[i]), s.hB = terra::f32down(h[i + 1]);
             segs.push_back(s);
             R = std::sqrt(R * R + 10.0);
         }
@@ -494,9 +539,16 @@ const std::vector<TerrainDetail::GulchSeg>& TerrainDetail::gulchSegments(uint32_
 }
 
 // AGW_Gulches 0x7a00e0: depth of the river bed at (x, z), 0 outside.
-double TerrainDetail::gulchDepth(double x, double z) const {
+double TerrainDetail::gulchDepth(double x, double z) const { return gulchProfile(x, z, nullptr, nullptr); }
+
+// 0x7a00e0 with its water outputs (water.md 1.3): sh / sw = sum over segments with D < r of
+// (lerp(hA, hB, t unclamped) - 1.5)(r - D) and (r - D); the river surface is sh / sw.
+double TerrainDetail::gulchProfile(double x, double z, double* shOut, double* swOut) const {
+    if (shOut) *shOut = 0;
+    if (swOut) *swOut = 0;
     const auto it = gulchCells_.find(cellKey(int32_t(std::floor(x / kCell)), int32_t(std::floor(z / kCell))));
     if (it == gulchCells_.end()) return 0;
+    double Sh = 0, Sw = 0;
     bool have = false;
     double N = 0, B = 0, C = 0, E = 0, M = 0;
     auto P8 = [](double t) { return t <= 0 ? std::pow(t + 1, 8) - 1 : 1 - std::pow(1 - t, 8); };
@@ -531,17 +583,59 @@ double TerrainDetail::gulchDepth(double x, double z) const {
                 const double d = (double(0.66f) * G * f4 + double(0.33f) * (1 - G) * S2(2 * f - 1)) * (double(1.25f) * (E - q) + 1) * r *
                                  (0.25 * N + 0.75);
                 M = std::max(M, d);
+                Sh += ((1 - t) * s.hA + t * s.hB - 1.5) * (r - D);
+                Sw += r - D;
             }
         }
     }
+    if (shOut) *shOut = Sh;
+    if (swOut) *swOut = Sw;
     return M;
 }
 
+// Gulches_WaterQuery 0x7a07d0: river carve depth D (0 = no river) and the bed level output
+// A = max(0.5, min(D, y + D - sh / sw)) of 0x7a00e0 (y = the finished ground height).
+TerrainDetail::River TerrainDetail::river(double x, double z, double y) const {
+    River r;
+    if (skip_ & 4) return r;
+    double sh = 0, sw = 0;
+    const double D = gulchProfile(x, z, &sh, &sw);
+    if (!(D >= double(0.001f))) return r;
+    r.depth = D;
+    r.flag = true;
+    if (sw > 0) {
+        const double a = std::min(y + D - sh / sw, D);
+        r.bed = a <= 0.5 ? 0.5 : a;
+    }
+    return r;
+}
+
+// 0x6ef6f0: J = 0.5 (F 0x11cec + F 0x5efc); the flat-surface jitter is 5 J.
+double TerrainDetail::jitterJ(double x, double z) const { return 0.5 * (double(b11cec_.at(x, z)) + double(b5efc_.at(x, z))); }
+
+// FlatSurface_InsideDistance 0x799020 (p31 out-C sec. 3): distance inside the rectangle or
+// ellipse minus `jitter`; rectangles lose their -Z corners (v < 0) by up to 15 m.
+double TerrainDetail::insideDistance(const Flat& s, double x, double z, double jitter) const {
+    const double dx = x - s.cx, dz = z - s.cz;
+    const double u = (dx * s.ax + dz * s.az) / (s.lenX * s.lenX), v = (dx * s.bx + dz * s.bz) / (s.lenZ * s.lenZ);
+    double d;
+    if (s.ellipse) {
+        const double rr = std::hypot(u, v);
+        if (rr == 0) return std::hypot(s.lenX, s.lenZ);  // +0x70, no jitter (0x799020 r == 0 branch)
+        const double ex = s.cx + s.ax * (u / rr) + s.bx * (v / rr) - x, ez = s.cz + s.az * (u / rr) + s.bz * (v / rr) - z;
+        d = std::hypot(ex, ez);
+        if (rr > 1) d = -d;
+    } else {
+        const double eX = std::max(0.0, 1 - std::fabs(u)) * s.lenX, eZ = std::max(0.0, 1 - std::fabs(v)) * s.lenZ;
+        d = std::min(eX, eZ);
+        if (v < 0) d -= std::max(0.0, 15.0 - std::hypot(eX, eZ));
+    }
+    return d - jitter;
+}
+
 // FlatSurface_CombineHeight 0x79b870 over list A or B; edits y, returns min(d, 1) of the
-// last covering surface (0 when none).
+// last covering surface (0 when none). List A (0x79aa40) also holds the procedural surfaces.
 double TerrainDetail::combineFlats(bool listB, double x, double z, double& y) const {
-    const auto it = flatCells_.find(cellKey(int32_t(std::floor(x / kCell)), int32_t(std::floor(z / kCell))));
-    if (it == flatCells_.end()) return 0;
     struct Hit {
         const Flat* s;
         double d;
@@ -550,38 +644,31 @@ double TerrainDetail::combineFlats(bool listB, double x, double z, double& y) co
     size_t nh = 0;
     double jitter = 0;
     bool haveJitter = false;
-    for (uint32_t i : it->second) {
-        const Flat& s = flats_[i];
-        if (s.listB != listB) continue;
-        const double dx = x - s.cx, dz = z - s.cz;
-        // The engine lists surfaces whose bounding box holds the point (2.442 m cells).
-        if (std::fabs(dx) > std::fabs(s.ax) + std::fabs(s.bx) + 2.5 || std::fabs(dz) > std::fabs(s.az) + std::fabs(s.bz) + 2.5) continue;
-        const double u = (dx * s.ax + dz * s.az) / (s.lenX * s.lenX), v = (dx * s.bx + dz * s.bz) / (s.lenZ * s.lenZ);
-        if (!haveJitter) jitter = 5.0 * 0.5 * (double(b11cec_.at(x, z)) + double(b5efc_.at(x, z))), haveJitter = true;
-        double d;
-        if (s.ellipse) {
-            const double rr = std::hypot(u, v);
-            if (rr == 0) {
-                d = std::min(s.lenX, s.lenZ);
-            } else {
-                const double ex = s.cx + s.ax * (u / rr) + s.bx * (v / rr) - x, ez = s.cz + s.az * (u / rr) + s.bz * (v / rr) - z;
-                d = std::hypot(ex, ez);
-                if (rr > 1) d = -d;
-            }
-        } else {
-            const double eX = std::max(0.0, 1 - std::fabs(u)) * s.lenX, eZ = std::max(0.0, 1 - std::fabs(v)) * s.lenZ;
-            d = std::min(eX, eZ);
-            if (v < 0) d -= std::max(0.0, 15.0 - std::hypot(eX, eZ));  // the -Z corners are rounded off
-        }
-        d -= jitter;
+    auto consider = [&](const Flat& s) {
+        if (!haveJitter) jitter = 5.0 * jitterJ(x, z), haveJitter = true;
+        const double d = insideDistance(s, x, z, jitter);
         if (d > 0 && nh < 64) hits[nh++] = {&s, d};
-    }
+    };
+    const auto it = flatCells_.find(cellKey(int32_t(std::floor(x / kCell)), int32_t(std::floor(z / kCell))));
+    if (it != flatCells_.end())
+        for (uint32_t i : it->second) {
+            const Flat& s = flats_[i];
+            if (s.listB != listB) continue;
+            // The engine lists surfaces whose u16 cell box holds the point (2.442 m cells).
+            const double dx = x - s.cx, dz = z - s.cz;
+            if (std::fabs(dx) > std::fabs(s.ax) + std::fabs(s.bx) + 2.5 || std::fabs(dz) > std::fabs(s.az) + std::fabs(s.bz) + 2.5) continue;
+            consider(s);
+        }
+    if (!listB && !(skip_ & 32) && bigRoad_)
+        for (const Flat* f : flatsCovering(x, z))
+            if (terra::holds(f->box, x, z)) consider(*f);
     if (nh == 0) return 0;
     std::sort(hits, hits + nh, [](const Hit& a, const Hit& c) {
         return a.s->priority != c.s->priority ? a.s->priority < c.s->priority : a.s->cx < c.s->cx;
     });
     double ret = 0, acc = 0, wsum = 0;
     int group = 0;
+    double bumps = -1;
     for (size_t k = 0; k < nh; ++k) {
         const Flat& s = *hits[k].s;
         if (int(s.priority) != group) {
@@ -591,14 +678,386 @@ double TerrainDetail::combineFlats(bool listB, double x, double z, double& y) co
         }
         const double d = hits[k].d;
         ret = std::min(d, 1.0);
-        const double P = s.cy - (s.nx * (x - s.cx) + s.nz * (z - s.cz));
+        double P = s.cy - (s.nx * (x - s.cx) + s.nz * (z - s.cz));
         const double t = clamp01(d * s.invMargin), e = 2 * t - 1;
         const double cv = e <= 0 ? std::pow(e + 1, 1.25) - 1 : 1 - std::pow(1 - e, 1.25);
         const double wt = (0.5 + 0.5 * cv) * s.strength;
+        if (s.bumps) {  // +0xa6: 0.1 x DirtBumps 0x6f0430 on the plane
+            if (bumps < 0) {
+                const double v = clamp01((double(b3f54_.at(x, z)) - 1.1) * 10.0);
+                bumps = (2 - v) * v;
+            }
+            P += 0.1 * bumps;
+        }
         acc += wt * ((1 - wt) * y + wt * P);
         wsum += wt;
     }
     if (wsum > double(0.01f)) y = acc / wsum;
+    return ret;
+}
+
+const std::vector<const TerrainDetail::Flat*>& TerrainDetail::flatsCovering(double x, double z) const {
+    static const std::vector<const Flat*> none;
+    const int32_t cx = int32_t(std::floor(x / 450.0)), cz = int32_t(std::floor(z / 450.0));
+    FlatCell* c = const_cast<FlatCell*>(flatCell(cx, cz));
+    if (!c) return none;
+    std::call_once(c->coverOnce, [&] {
+        const double x0 = cx * 450.0, z0 = cz * 450.0;
+        const CellBox cb{terra::q(x0), terra::q(z0), terra::q(x0 + 450), terra::q(z0 + 450)};
+        for (int32_t i = cx - 1; i <= cx + 1; ++i)
+            for (int32_t j = cz - 1; j <= cz + 1; ++j)
+                if (const FlatCell* n = flatCell(i, j))
+                    for (const Flat& f : n->flats)
+                        if (f.box.minX <= cb.maxX && cb.minX <= f.box.maxX && f.box.minZ <= cb.maxZ && cb.minZ <= f.box.maxZ) c->cover.push_back(&f);
+    });
+    return c->cover;
+}
+
+void TerrainDetail::setRoadQueries(BigRoadQuery big, NearRoadQuery near) {
+    bigRoad_ = std::move(big);
+    nearRoad_ = std::move(near);
+}
+
+size_t TerrainDetail::proceduralFlatCount() const { return procCount_.load(); }
+std::vector<TerrainDetail::ProcFlatInfo> TerrainDetail::proceduralFlats(double x, double z, double r) const {
+    std::vector<ProcFlatInfo> out;
+    for (int32_t i = int32_t(std::floor((x - r - 450) / 450.0)); i <= int32_t(std::floor((x + r + 450) / 450.0)); ++i)
+        for (int32_t j = int32_t(std::floor((z - r - 450) / 450.0)); j <= int32_t(std::floor((z + r + 450) / 450.0)); ++j)
+            if (const FlatCell* c = flatCell(i, j))
+                for (const Flat& f : c->flats)
+                    if (std::hypot(f.cx - x, f.cz - z) <= r)
+                        out.push_back({f.cx, f.cy, f.cz, f.lenX, f.lenZ, f.ax / f.lenX, f.az / f.lenX, f.nx, f.nz, 1.0 / f.invMargin, f.strength, f.mode});
+    return out;
+}
+
+void TerrainDetail::proceduralFlatsAt(double x, double z, double jitter, const std::function<void(double, double)>& fn) const {
+    if (!bigRoad_ || (skip_ & 32)) return;
+    for (const Flat* f : flatsCovering(x, z))
+        if (terra::holds(f->box, x, z)) fn(insideDistance(*f, x, z, jitter), f->invMargin);
+}
+
+double TerrainDetail::duneRelief(double x, double z, double h, double h0) const {
+    const double L = floorLevel(x, z, h0);
+    const double r = L - h0;
+    return (h <= L + double(0.01f) && r > 0) ? r : 0.0;
+}
+
+uint8_t TerrainDetail::workBumpZone(double x, double z) const {
+    if (!bigRoad_ || (skip_ & 32)) return 0;
+    const BumpCell* c = bumpCell(int32_t(std::floor(x / 400.0)), int32_t(std::floor(z / 400.0)));
+    if (!c) return 0;
+    double workBumpsDummy = 0;
+    workBumps(x, z, workBumpsDummy);  // builds the cell's cover list
+    uint8_t zone = 0;
+    double best = 1e8;
+    for (const BumpSeg* sp : c->cover) {
+        const BumpSeg& s = *sp;
+        if (!terra::holds(s.box, x, z)) continue;
+        const double t = (s.tx * x + s.tz * z) - s.c34;
+        double D;
+        if (t <= 0) D = std::hypot(x - s.ax, z - s.az);
+        else if (t >= 1) D = std::hypot(x - s.bx, z - s.bz);
+        else D = std::fabs((s.dz * x - s.dx * z) - s.c30);
+        if (!(D < s.R)) continue;
+        const double d = std::hypot(s.bx - x, s.bz - z);  // point +0x40 = B (the jittered lattice point)
+        if (d < best) best = d, zone = s.mode;
+    }
+    return zone;
+}
+
+size_t TerrainDetail::workBumpCount() const { return bumpCount_.load(); }
+
+// 0x64a2a0 with flags 5: bit 0 skips the gulches, flat surfaces and work bumps of 0x64d550;
+// roads get cover 1 (a = 0) and the snow lift is added.
+double TerrainDetail::roadHeight(double x, double z) const {
+    GroundSample s;
+    double y = detailOnly(x, z, &s);
+    double r = 0;
+    if (!(skip_ & 1)) r = roads_ ? roads_(x, z, y, 1.0, 1 - s.w18) : roadCarve(x, z, y, 1.0, 1 - s.w18);
+    const double hg0 = clamp01(s.h0 - (2500.0 - (-s.nz) * 250.0));
+    const double hb = clamp01(hg0 - (1 - s.ny) * 2.0);
+    const double t = hb * 2 - 1;
+    const double hg = t <= 0 ? 0.5 + (std::pow(t + 1, 8) - 1) * 0.5 : 0.5 + (1 - std::pow(1 - t, 8)) * 0.5;
+    return y + std::max(0.0, double(0.3f) * hg - r);
+}
+
+// Gulches_AnySegmentNear 0x79fe80: a gulch segment whose u16 box overlaps p +- r (0x7a9e60 box
+// query, then 0x6f0c40). Box tests only, no capsule distance.
+bool TerrainDetail::gulchNear(double x, double z, double r) const {
+    for (int32_t cz = int32_t(std::floor((z - r) / kCell)); cz <= int32_t(std::floor((z + r) / kCell)); ++cz)
+        for (int32_t cx = int32_t(std::floor((x - r) / kCell)); cx <= int32_t(std::floor((x + r) / kCell)); ++cx) {
+            const auto it = gulchCells_.find(cellKey(cx, cz));
+            if (it == gulchCells_.end()) continue;
+            for (uint32_t line : it->second)
+                for (const GulchSeg& s : gulchSegments(line))
+                    if (terra::overlapsQuery(s.box, x, z, r) && terra::overlaps(s.box, x, z, r)) return true;
+        }
+    return false;
+}
+
+// The engine builds terraform cells around the moving focus and each new procedural flat must
+// not overlap one already built (0x79b130), so its result depends on the build order. The port
+// builds cells on first use in a fixed order that the engine could also have used: phase =
+// (cx mod 3) + 3 (cz mod 3); a cell is built after every cell of a lower phase within two cells
+// (flats of cells three or more apart cannot touch: centre <= ~220 m outside its cell, box
+// r <= 100 m, half extent <= 141 m). See notes p34 F3.
+const TerrainDetail::FlatCell* TerrainDetail::flatCell(int32_t cx, int32_t cz) const {
+    const int32_t i = cx + kFlatCells / 2, j = cz + kFlatCells / 2;
+    if (i < 0 || j < 0 || i >= kFlatCells || j >= kFlatCells) return nullptr;
+    std::atomic<FlatCell*>& slot = flatCells2_[size_t(i) * kFlatCells + size_t(j)];
+    FlatCell* c = slot.load(std::memory_order_acquire);
+    if (!c) {
+        auto* fresh = new FlatCell;
+        if (slot.compare_exchange_strong(c, fresh, std::memory_order_acq_rel)) c = fresh;
+        else delete fresh;
+    }
+    std::call_once(c->once, [&] { buildFlatCell(cx, cz, *c); });
+    return c;
+}
+
+namespace {
+int32_t mod3(int32_t v) { return ((v % 3) + 3) % 3; }
+int32_t flatPhase(int32_t cx, int32_t cz) { return mod3(cx) + 3 * mod3(cz); }
+}  // namespace
+
+// AGW_TerraFlat::GenerateCell 0x799910 (asm 0x799910-0x79a835, notes p34 F1/F2).
+void TerrainDetail::buildFlatCell(int32_t cx, int32_t cz, FlatCell& cell) const {
+    if (!bigRoad_ || (skip_ & 32)) return;
+    const int32_t phase = flatPhase(cx, cz);
+    std::vector<const FlatCell*> earlier;
+    for (int32_t i = cx - 2; i <= cx + 2; ++i)
+        for (int32_t j = cz - 2; j <= cz + 2; ++j)
+            if (flatPhase(i, j) < phase)
+                if (const FlatCell* c = flatCell(i, j)) earlier.push_back(c);
+    // 0x79b130: a procedural surface (+0xa9) whose box overlaps the box centre +- r.
+    auto blocked = [&](double x, double z, double r) {
+        for (const Flat& f : cell.flats)
+            if (terra::overlapsQuery(f.box, x, z, r)) return true;
+        for (const FlatCell* c : earlier)
+            for (const Flat& f : c->flats)
+                if (terra::overlapsQuery(f.box, x, z, r)) return true;
+        return false;
+    };
+    const Permutation& RT = perm_;
+    const double kx = double(12.317513f), kz = double(10.193578f);
+    const double X0 = double(float(cx) * 450.0f), X1 = double(float(cx + 1) * 450.0f);
+    const double Z0 = double(float(cz) * 450.0f), Z1 = double(float(cz + 1) * 450.0f);
+    for (double x = X0; x < X1; x += 100.0) {
+        for (double z = Z0; z < Z1; z += 100.0) {
+            const double pop = clamp01(map08_.value(x, z));  // 0x458e60 Population (slot 8)
+            if (map18_.value(x, z) > 0.5) continue;           // 0x646730
+            // (0x64a2a0 at the lattice point: its value is not used.)
+            const double zk = terra::f32down(z * kz);
+            const double r = terra::f32down(RT[size_t(int64_t(std::floor(terra::f32down(x * kx + z * kz))) & 255)] * double(0.003921569f));
+            if (!(pop >= 0.5 || (r <= 0.75 && (pop >= 0.1 || r <= 0.5)))) continue;
+            const RoadHit road = bigRoad_(x, z);  // 0x6fb320
+            if (!(road.edge < 50.0) || !road.found) continue;
+            const double rpx = road.px, rpz = road.pz, dx = road.dx, dz = road.dz;
+            // Toward the road (xz) and perp = dir x up = (-dz, 0, dx), turned toward the road.
+            double px = -dz, pz = dx;
+            const double pl = px * px + pz * pz;
+            if (pl > 1e-6) px /= std::sqrt(pl), pz /= std::sqrt(pl);
+            if (px * (rpx - x) + pz * (rpz - z) < 0) px = -px, pz = -pz;
+            const double hR = terra::f32down(roadHeight(rpx, rpz));
+            const double r2 = terra::f32down(RT[size_t(int64_t(std::floor(terra::f32down((r * double(931.9283f) + x) * kx + zk))) & 255)] *
+                                             double(0.003921569f));
+            double thr = pop > 0.5 ? 0.2 : 0.1;
+            if (pop > 0.75) thr = double(0.8f);
+            const double E = thr <= r2 ? 30.0 : (thr * double(0.1f) <= r2 ? 50.0 : 100.0);
+            // Probes: f = min(5 / (|hR - h| + 1e-4), 1) shrinks each length; S = max f |dh|.
+            double S = 0;
+            auto probe = [&](double qx, double qz, double& h) {
+                h = terra::f32down(roadHeight(qx, qz));
+                const double dh = std::fabs(hR - h);
+                const double f = std::min(5.0 / (dh + double(1e-4f)), 1.0);
+                S = std::max(S, f * dh);
+                return f;
+            };
+            double h1, h2, h3, h4;
+            const double q1x = rpx - dx * E, q1z = rpz - dz * E;
+            const double L = terra::f32down(probe(q1x, q1z, h1) * E);
+            if (!(L > 10)) continue;
+            const double q2x = rpx + dx * L, q2z = rpz + dz * L;
+            const double L2 = terra::f32down(probe(q2x, q2z, h2) * L);
+            if (!(L2 > 10)) continue;
+            const double D1 = terra::f32down(probe(rpx - dx * L2 - px * 2 * E, rpz - dz * L2 - pz * 2 * E, h3) * E);
+            if (!(D1 > 10)) continue;
+            double D = terra::f32down(probe(rpx + dx * L2 - px * 2 * D1, rpz + dz * L2 - pz * 2 * D1, h4) * D1);
+            if (!(D > 10)) continue;
+            if (pop < r2 && D > 19) D = 19;
+            double m = L2 > D ? D : L2;
+            if (2 * S < m) m = 2 * S;
+            if (!(m > 5)) m = 5;
+            const double off = terra::f32down(D + road.c8 - m - 2);
+            const double ccx = terra::f32down(rpx - px * off), ccz = terra::f32down(rpz - pz * off);
+            // 0x6fb240: the nearest road (any type) to the centre must be > 0.99 off away.
+            const RoadHit nr = nearRoad_(ccx, ccz, off);
+            if (nr.found && !(std::hypot(ccx - nr.px, ccz - nr.pz) > off * double(0.99f))) continue;
+            const double rr = std::max(L2, D);
+            if (gulchNear(ccx, ccz, rr) || blocked(ccx, ccz, rr)) continue;
+            // New surface: SetShape 0x79c330(centre, X = dir / L2, Z = perp / D, margin m).
+            Flat f{};
+            f.cx = ccx, f.cy = hR, f.cz = ccz;
+            f.ax = dx * L2, f.az = dz * L2, f.lenX = L2;
+            f.bx = px * D, f.bz = pz * D, f.lenZ = D;
+            f.invMargin = terra::f32down(1.0 / std::max(m, double(0.1f)));
+            f.strength = double(0.8f);
+            f.priority = 0x80;  // constructor 0x74cb50
+            f.ellipse = false;
+            f.listB = false;
+            f.bumps = true;
+            f.procedural = true;
+            double nx = 0, ny = 1, nz = 0;
+            auto plane = [&] {  // n = normalize((q2 - q1) x perp) (0x4adfe0, 0x530b40), n.y >= 0
+                const double vx = q2x - q1x, vy = h2 - h1, vz = q2z - q1z;
+                nx = vz * 0 - vy * pz, ny = vx * pz - vz * px, nz = vy * px - vx * 0;
+                const double l = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (l * l > 1e-6) nx /= l, ny /= l, nz /= l;
+                if (ny < 0) nx = -nx, ny = -ny, nz = -nz;
+            };
+            if (D > 25) {
+                if (pop > double(0.9f) || L2 > 20) {
+                    f.strength = 1.0, f.mode = 1, f.bumps = false;
+                } else {
+                    plane();
+                    f.mode = 3;
+                }
+            } else {
+                plane();
+                f.mode = 2;
+            }
+            f.nx = nx, f.nz = nz;
+            f.box = terra::boxAt(f.cx, f.cz);
+            for (int k = 0; k < 4; ++k) {
+                const double sx = (k & 1) ? -1 : 1, sz = (k & 2) ? -1 : 1;
+                terra::extend(f.box, f.cx + sx * f.ax + sz * f.bx, f.cz + sx * f.az + sz * f.bz);
+            }
+            if (std::getenv("FUEL_FLAT_DEBUG"))
+                std::fprintf(stderr, "flat lattice (%.0f,%.0f) pop %.2f r %.3f r2 %.3f road (%.2f,%.2f) edge %.2f dir (%.3f,%.3f) hR %.2f E %.0f L %.2f L2 %.2f D1 %.2f D %.2f S %.2f m %.2f c8 %.2f off %.2f h1..4 %.2f %.2f %.2f %.2f\n",
+                             x, z, pop, r, r2, rpx, rpz, road.edge, dx, dz, hR, E, L, L2, D1, D, S, m, road.c8, off, h1, h2, h3, h4);
+            cell.flats.push_back(f);
+            procCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+const TerrainDetail::BumpCell* TerrainDetail::bumpCell(int32_t cx, int32_t cz) const {
+    const int32_t i = cx + kBumpCells / 2, j = cz + kBumpCells / 2;
+    if (i < 0 || j < 0 || i >= kBumpCells || j >= kBumpCells) return nullptr;
+    std::atomic<BumpCell*>& slot = bumpCells_[size_t(i) * kBumpCells + size_t(j)];
+    BumpCell* c = slot.load(std::memory_order_acquire);
+    if (!c) {
+        auto* fresh = new BumpCell;
+        if (slot.compare_exchange_strong(c, fresh, std::memory_order_acq_rel)) c = fresh;
+        else delete fresh;
+    }
+    std::call_once(c->once, [&] { buildBumpCell(cx, cz, *c); });
+    return c;
+}
+
+// AGW_WorkBumps::GenerateCell 0x79c980 (asm 0x79c980-0x79ce3b, notes p34 F4): a 40 m lattice in
+// 400 m cells, each point jittered by up to 12 x 0.8 m; inside the nearest fully covering flat
+// surface (0x79bfd0) when that is a procedural mode-3 one with more than 15 m inside it.
+void TerrainDetail::buildBumpCell(int32_t cx, int32_t cz, BumpCell& cell) const {
+    if (!bigRoad_ || (skip_ & 32)) return;
+    const double X0 = double(float(cx) * 400.0f), X1 = double(float(cx + 1) * 400.0f) - 0.5;
+    const double Z0 = double(float(cz) * 400.0f), Z1 = double(float(cz + 1) * 400.0f) - 0.5;
+    // Procedural mode-3 flats near the cell (a cheap early out; only they can make bumps).
+    std::vector<const FlatCell*> fc;
+    bool any3 = false;
+    for (int32_t i = int32_t(std::floor((X0 - 450) / 450.0)); i <= int32_t(std::floor((X1 + 450) / 450.0)); ++i)
+        for (int32_t j = int32_t(std::floor((Z0 - 450) / 450.0)); j <= int32_t(std::floor((Z1 + 450) / 450.0)); ++j)
+            if (const FlatCell* c = flatCell(i, j)) {
+                fc.push_back(c);
+                for (const Flat& f : c->flats) any3 |= f.mode == 3;
+            }
+    if (!any3) return;
+    const Permutation& RT = perm_;
+    const double kx = double(12.317513f), kz = double(10.193578f);
+    for (double x = X0; x < X1; x += 40.0) {
+        const double xk = terra::f32down(x * kx);
+        for (double z = Z0; z < Z1; z += 40.0) {
+            const uint8_t b = RT[size_t(int64_t(std::floor(terra::f32down(z * kz + xk + double(37.82f))))) & 255];
+            const double px = terra::f32down(x + double(b & 15) * double(0.8000001f));
+            const double pz = terra::f32down(z + double(b >> 4) * double(0.8000001f));
+            // 0x79bfd0 over 0x79b7a0: every surface (both lists, file and procedural) whose box
+            // holds the point and with d(5 J) > margin; the nearest centre (xz) wins.
+            const double jit = 5.0 * jitterJ(px, pz);
+            const Flat* best = nullptr;
+            double bestD = 1e8;
+            auto consider = [&](const Flat& f) {
+                if (!(1.0 / f.invMargin < insideDistance(f, px, pz, jit))) return;
+                const double d = std::hypot(f.cx - px, f.cz - pz);
+                if (d < bestD) bestD = d, best = &f;
+            };
+            const auto it = flatCells_.find(cellKey(int32_t(std::floor(px / kCell)), int32_t(std::floor(pz / kCell))));
+            if (it != flatCells_.end())
+                for (uint32_t i : it->second)
+                    if (terra::holds(flats_[i].box, px, pz)) consider(flats_[i]);
+            for (const Flat* f : flatsCovering(px, pz))
+                if (terra::holds(f->box, px, pz)) consider(*f);
+            if (!best || best->mode != 3 || !(insideDistance(*best, px, pz, 0) > 15.0)) continue;
+            const double zk2 = pz * kz;
+            const double r2 = RT[size_t(int64_t(std::floor(terra::f32down(zk2 + px * kx))) & 255)] * double(0.003921569f);
+            BumpSeg s{};
+            s.mode = r2 <= 0.5 ? 3 : 1;
+            const double r3 =
+                terra::f32down(RT[size_t(int64_t(std::floor(terra::f32down((r2 * double(931.9283f) + px) * kx + terra::f32down(zk2)))) & 255)] *
+                               double(0.003921569f));
+            // Direction: (p - c) x up = (-(pz - cz), (px - cx)), normalised; length/half width R.
+            double ax = -(pz - best->cz), az = px - best->cx;
+            const double l2 = ax * ax + az * az;
+            if (l2 > 1e-6) ax /= std::sqrt(l2), az /= std::sqrt(l2);
+            const double half = (best->lenZ + best->lenX) * 0.5;
+            const double R = terra::f32down(std::max(5.0, half * double(0.02f) + double(0.05f) * half * r3));
+            // Segment 0x6f10c0 from A = p + R a to B = p.
+            s.ax = terra::f32down(px + ax * R), s.az = terra::f32down(pz + az * R), s.bx = px, s.bz = pz, s.R = R;
+            const double ddx = s.bx - s.ax, ddz = s.bz - s.az, len = std::sqrt(ddx * ddx + ddz * ddz);
+            if (!(len > 0)) continue;
+            s.dx = ddx / len, s.dz = ddz / len, s.tx = s.dx / len, s.tz = s.dz / len;
+            s.c30 = s.dz * s.ax - s.dx * s.az, s.c34 = s.tx * s.ax + s.tz * s.az;
+            s.box = terra::segmentBox(s.ax, s.az, s.bx, s.bz, s.dx, s.dz, R);
+            cell.segs.push_back(s);
+            bumpCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+// 0x79cfa0 (after list B in 0x648400): each bump whose box holds the point adds
+// 0.5 R S2(1 - 2 De / R) with De = D - 2 S2(2 J - 1). Returns 1 if any bump applied.
+double TerrainDetail::workBumps(double x, double z, double& y) const {
+    if (!bigRoad_ || (skip_ & 32)) return 0;
+    const int32_t cx = int32_t(std::floor(x / 400.0)), cz = int32_t(std::floor(z / 400.0));
+    double ret = 0, J = -1;
+    BumpCell* c = const_cast<BumpCell*>(bumpCell(cx, cz));
+    if (!c) return 0;
+    std::call_once(c->coverOnce, [&] {
+        const double x0 = cx * 400.0, z0 = cz * 400.0;
+        const CellBox cb{terra::q(x0), terra::q(z0), terra::q(x0 + 400), terra::q(z0 + 400)};
+        for (int32_t i = cx - 1; i <= cx + 1; ++i)
+            for (int32_t j = cz - 1; j <= cz + 1; ++j)
+                if (const BumpCell* n = bumpCell(i, j))
+                    for (const BumpSeg& s : n->segs)
+                        if (s.box.minX <= cb.maxX && cb.minX <= s.box.maxX && s.box.minZ <= cb.maxZ && cb.minZ <= s.box.maxZ) c->cover.push_back(&s);
+    });
+    {
+            for (const BumpSeg* sp : c->cover) {
+                const BumpSeg& s = *sp;
+                if (!terra::holds(s.box, x, z)) continue;
+                const double t = (s.tx * x + s.tz * z) - s.c34;
+                double D;
+                if (t <= 0) D = std::hypot(x - s.ax, z - s.az);
+                else if (t >= 1) D = std::hypot(x - s.bx, z - s.bz);
+                else D = std::fabs((s.dz * x - s.dx * z) - s.c30);
+                D = terra::f32down(D);
+                if (J < 0) J = jitterJ(x, z);
+                const double De = D - S2(2 * J - 1) * 2.0;
+                if (De < s.R) {
+                    y += S2((s.R - De) / s.R * 2 - 1) * s.R * 0.5;
+                    ret = 1;
+                }
+            }
+        }
     return ret;
 }
 
@@ -617,7 +1076,8 @@ GroundSample TerrainDetail::sample(double x, double z) const {
     s.road = y;
     if (!(skip_ & 2)) combineFlats(true, x, z, y);
     s.flatB = y;
-    // Work bumps (0x79cfa0) exist only inside procedural mode-3 TerraFlat surfaces (not ported).
+    // Work bumps (0x79cfa0), only inside procedural mode-3 TerraFlat surfaces.
+    workBumps(x, z, y);
     // High ground (snow) lift: 0x4de850 at (x, h0, z) with the base normal.
     const double hg0 = clamp01(s.h0 - (2500.0 - (-s.nz) * 250.0));
     const double hb = clamp01(hg0 - (1 - s.ny) * 2.0);
