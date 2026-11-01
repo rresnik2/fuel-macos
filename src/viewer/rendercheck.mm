@@ -5,6 +5,7 @@
 #include "core/atmosphere.hpp"
 #include "core/sfx.hpp"
 #include "core/weather.hpp"
+#include "core/clouds.hpp"
 #import "renderer.h"
 
 #include <algorithm>
@@ -316,7 +317,7 @@ int runRenderCheck(const std::string& dataDir) {
                     F3 d = dirs[k];
                     const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
                     for (float& c : d) c /= l;
-                    const float t2 = 20000.0f / std::max(std::max(std::fabs(d[0]), std::fabs(d[1])), std::max(std::fabs(d[2]), 1e-4f));
+                    const float t2 = 0.9f * 50000.0f;  // the sky dome radius (0x7e1610: 0.9 x far, far forced to 50000)
                     F3 ext, insc;
                     scattering(b, e, {e[0] + d[0] * t2, e[1] + d[1] * t2, e[2] + d[2] * t2}, ext, insc);
                     std::snprintf(name, sizeof name, "%s GPU sky along direction %d", when, k);
@@ -438,13 +439,83 @@ int runRenderCheck(const std::string& dataDir) {
                 const double spots[][3] = {{-39570, 864, -28068}, {-20000, 900, 15000}, {30000, 1500, -30000}, {0, 3000, 0}, {40000, 400, 40000}};
                 for (const auto& sp : spots) {
                     const WeatherAmounts w = wf->sample(sp[0], sp[1], sp[2]);
-                    std::printf("  info at (%.0f, %.0f, %.0f): cloud %.3f precip %.3f rain %.3f snow %.3f fog %.3f wind %.1f m/s sand %.3f\n", sp[0],
-                                sp[1], sp[2], w.cloud, w.precip, w.rain, w.snow, w.fog, w.windSpeed, w.sand);
+                    std::printf("  info at (%.0f, %.0f, %.0f): cloud %.3f precip %.3f rain %.3f snow %.3f fog %.3f wind %.1f m/s (%.2f, %.2f) sand %.3f humidity %.3f\n",
+                                sp[0], sp[1], sp[2], w.cloud, w.precip, w.rain, w.snow, w.fog, w.windSpeed, w.wind[0], w.wind[2], w.sand, w.humidity);
                 }
             }
         } catch (const std::exception& e) {
             std::printf("  FAIL weather: %s\n", e.what());
             ++gFail;
+        }
+    }
+
+    // ---- Sky dome, cloud tank, hook arguments (p37-sky-clouds.md): emulated vectors notes/p37-work/v1.cmd
+    std::printf("Sky and clouds: cloud tank 0x5fdbf0 / 0x5fde90 / 0x5fe370 (emulated FUEL.exe), vh_cloud on the GPU, hook arguments\n");
+    {
+        namespace fs = std::filesystem;
+        const sfx::Tables t = sfx::loadTables((fs::path(dataDir) / "XFinalComponent" / "FUEL.exe").string(),
+                                              (fs::path(dataDir) / "CommonComponent" / "Param" / "pp001.tsc").string());
+        if (!t.ok) {
+            std::printf("  FAIL tables: %s\n", t.error.c_str());
+            ++gFail;
+        } else {
+            auto well = std::make_shared<sfx::Well512>(t.wellSeed);
+            clouds::Params cp = clouds::Params::fromPP(t.pp);
+            check1("cloud tank sight PP5206", cp.sight, 3000, 0);
+            clouds::Tank tank(cp, [well]() { return well->uniform(); }, []() { return 0.5f; });
+            tank.placeAt({-39570, 866, -28068});
+            const clouds::V3 in = tank.randomPosition(true), ring = tank.randomPosition(false);
+            check3("0x5fdbf0 inside the sight (WELL512 from the shipped state)", in, {-37731.832f, 0, -27035.982f}, 0.02f);
+            check3("0x5fdbf0 on the ring [sight, 1.25 sight]", ring, {-42922.457f, 0, -27470.494f}, 0.02f);
+            tank.placeAt({0, 0, 0});
+            auto& cs = tank.mutableClouds();
+            cs.assign(2, clouds::Cloud{});
+            cs[1].pos = {100, 0, 100}, cs[1].active = true;
+            cs[0].pos = {490, 0, 200}, cs[0].active = false;  // inactive clouds do not count
+            const float acc[2] = {tank.accept({500, 0, 200}) ? 1.0f : 0.0f, tank.accept({150, 0, 200}) ? 1.0f : 0.0f};
+            const float accW[2] = {1, 0};
+            check("0x5fde90 accept (spacing PP5207 = 250)", acc, accW, 2, 0);
+            const std::array<float, 28> k = clouds::drawConstants(0.7f, 0.6f, 3000, 600, 866);
+            const float kW[28] = {0.7f, 0.6f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -100, 0, 0, 0, 2000, 3000, 2400, 1466};
+            check("0x5fe370 draw constants C_USER0..6", k.data(), kW, 28, 1e-4f);
+            check1("cloud layer height, clear (PP5203)", cloudLayerHeight(0, t.P(5202), t.P(5203)), 800, 0);
+            check1("cloud layer height, overcast (PP5202)", cloudLayerHeight(1, t.P(5202), t.P(5203)), 400, 0);
+            WeatherAmounts w;
+            w.cloud = 0.5f, w.rain = 0.2f, w.humidity = 0.3f;
+            const Weather h = weatherHook(w, 900, t.P(5202), t.P(5203));
+            const float hv[4] = {h.cloudBase, h.cloudTopArg, h.wet, h.fog};
+            const float hw[4] = {200, 900, 0.6f, 0.1f};
+            check("0x5bba30 hook args: h0 = +0xf8 - 400, camera y, wet = max(clamp01(2 humidity), rain, snow), fog'", hv, hw, 4, 1e-5f);
+            // vh_cloud corner on the GPU against the CPU copy.
+            @autoreleasepool {
+                id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                if (device != nil) {
+                    ResourceLibrary lib;
+                    MeshRenderer r(device, 1, lib);
+                    const simd_float3 eye = simd_make_float3(-39570, 866, -28068);
+                    clouds::Cloud c;
+                    c.pos = {-38900, 0, -27500}, c.width = 345, c.height = 330;
+                    std::vector<simd_float4> gin;
+                    const int corners[2][2] = {{-1, -1}, {1, 1}};
+                    for (const auto& cr : corners)
+                        gin.insert(gin.end(), {simd_make_float4(c.pos[0], c.pos[1], c.pos[2], 5), simd_make_float4(c.width, c.height, float(cr[0]), float(cr[1])),
+                                               simd_make_float4(0.4f, 0.7f, 0, 0), simd_make_float4(k[24], k[25], k[26], k[27])});
+                    const std::vector<simd_float4> out = r.shaderCheck(at(hm(12, 0)), eye, gin);
+                    if (out.size() == 4) {
+                        for (int i = 0; i < 2; ++i) {
+                            const clouds::Corner cc = clouds::vertexCorner(c, corners[i][0], corners[i][1], {eye.x, eye.y, eye.z}, k[27], 3000, 0.4f);
+                            const float g[5] = {out[size_t(i * 2)].x, out[size_t(i * 2)].y, out[size_t(i * 2)].z, out[size_t(i * 2)].w, out[size_t(i * 2 + 1)].x};
+                            const float wv[5] = {cc.pos[0], cc.pos[1], cc.pos[2], cc.alpha, cc.shade};
+                            char name[96];
+                            std::snprintf(name, sizeof name, "GPU vh_cloud corner %d (position, alpha, shade)", i);
+                            check(name, g, wv, 5, 0.05f);
+                        }
+                    } else {
+                        std::printf("  FAIL GPU cloud check did not run\n");
+                        ++gFail;
+                    }
+                }
+            }
         }
     }
 

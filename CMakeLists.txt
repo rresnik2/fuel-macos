@@ -48,6 +48,7 @@ add_library(fuelcore STATIC
   src/core/atmosphere.cpp
   src/core/sfx.cpp
   src/core/weather.cpp
+  src/core/clouds.cpp
 )
 target_include_directories(fuelcore PUBLIC src)
 
