@@ -23,8 +23,12 @@ double clamp01(double v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
 double S2(double t) { return 0.5 + 0.5 * t * (2 - std::fabs(t)); }
 // FUEL runs the x87 in round-down mode (notes p21 H0): values stored to float32 round
 // toward -infinity. Used where the stored value feeds a sine of a large argument.
+// Emulator comparisons only: Ghidra's pcode emulator ignores the x87 rounding mode and rounds
+// float stores to nearest; setFloat32RoundNearest(true) makes the port do the same.
+thread_local bool tNearest = false;
 double f32(double v) {
     float f = float(v);
+    if (tNearest) return double(f);
     if (double(f) > v) f = std::nextafter(f, -std::numeric_limits<float>::infinity());
     return double(f);
 }
@@ -49,6 +53,8 @@ constexpr double kCell = 256.0;  // spatial index cells (port choice)
 std::atomic<uint32_t> gNextId{1};
 
 }  // namespace
+
+void setFloat32RoundNearest(bool on) { tNearest = on; }
 
 // ---------------------------------------------------------------------------
 // GwMapSampler (0x69b620 init, 0x69c500/0x69c560 cell polynomial, B-spline basis).
@@ -442,6 +448,7 @@ double TerrainDetail::rockLattice(double x, double z) const {
 
 // 0x7a0c80: canyon terraces at an already scaled position.
 double TerrainDetail::canyon(double x, double z, double a, double b) const {
+    x = f32(x), z = f32(z);  // the scaled point is a float3 (stored by 0x7a2310)
     const double A = 3.0 * fsin(x * double(0.002f)), B = 3.0 * fsin(z * double(0.002f));
     const double u = f32(double(0.707f) * x + double(0.707f) * z), v = f32(double(0.707f) * x - double(0.707f) * z);
     bool haveQ = false;

@@ -27,6 +27,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/road_segments.hpp"
@@ -146,6 +147,78 @@ int main(int argc, char** argv) {
                             X, Z, R, n, dune, sumDune / double(std::max<size_t>(n, 1)), sand, zone, wet);
                 std::printf("  points with SAND/SAND2 %zu/%zu, WETSAND/WETSAND2 %zu/%zu, ROUGHSAND/2 %zu/%zu\n", types[6], types[7], types[36], types[37],
                             types[38], types[39]);
+            } else if (a == "--emu-fractal-cmd" && i + 1 < argc) {
+                // Writes an EmuRun.java command file (tools/ghidra, read-only emulation of FUEL.exe) that
+                // builds three Fractal objects with Fractal_Init 0x69b1b0 over this world's random table
+                // and evaluates them through 0x79d470 (F 0x5efc), 0x6a88d0 (F 0x11cec) and 0x79eed0
+                // (E of F 0x7ea4) at sample points; prints the port's values for the same points.
+                // The points sit at a small fraction (< 0.5) of a finest cell from a top-cell corner so
+                // the emulator's round-to-nearest fistp equals the game's round-down (p34 V1).
+                const std::string out = argv[++i];
+                const fuel::Permutation perm = fuel::buildPermutation(dpc, fuel::genWorldSeed(dpc));
+                std::ofstream f(out);
+                f.precision(12);
+                const uint32_t G = 0x20000000, bank = 0x21000000, reg = 0x22000000, arr = 0x22001000;
+                f << "reset\nzero " << G << " 0x800\nzero " << bank << " 0x13000\nzero " << reg << " 0x10\nzero " << arr << " 0x400\n";
+                for (int k = 0; k < 64; ++k) {
+                    const uint32_t v = uint32_t(perm[size_t(4 * k)]) | uint32_t(perm[size_t(4 * k + 1)]) << 8 | uint32_t(perm[size_t(4 * k + 2)]) << 16 |
+                                       uint32_t(perm[size_t(4 * k + 3)]) << 24;
+                    f << "w32 " << (G + 0x704 + 4 * k) << " " << v << "\n";
+                }
+                // Fractal registry DAT_00a65890 pre-made (count 1, capacity 64) so 0x69d390 does not grow it.
+                f << "w32 0xa65890 " << reg << "\nw32 " << reg << " 0x00010000\nw32 " << (reg + 8) << " 0x00400000\nw32 " << (reg + 12) << " " << arr << "\n";
+                struct Fr {
+                    uint32_t off, fn;
+                    int L;
+                    float S, seed, p4, p5, p6;
+                    bool e;
+                };
+                const Fr frs[] = {{0x5efc, 0x79d470, 2, 30.0f, 43.129738f, 0.6f, 0.6f, 0.5f, false},
+                                  {0x11cec, 0x6a88d0, 2, 10.0f, 33.129738f, 0.6f, 0.6f, 0.5f, false},
+                                  {0x7ea4, 0x79eed0, 4, 3000.0f, 9.647993f, 0.025f, 0.15f, 0.5f, true}};
+                for (const Fr& r : frs) {
+                    const uint32_t obj = bank + r.off;
+                    f << "pushf " << r.p6 << "\npushf " << r.p5 << "\npushf " << r.p4 << "\npushf " << r.seed << "\npushf " << r.S << "\npush32 " << r.L
+                      << "\nreg EBX " << obj << "\nreg EAX " << G << "\ncall 0x69b1b0\n";
+                    // The seed offset is a fistp (round-down in the game, nearest in the emulator).
+                    f << "w32 " << (obj + 0xb44) << " " << uint32_t(int32_t(std::floor(double(r.seed) * 262897.0))) << "\n";
+                    const fuel::Fractal F(perm, r.L, r.S, r.seed, r.p4, r.p5, r.p6);
+                    const double fine = double(r.S) / double(1 << r.L);
+                    const double pts[][2] = {{-39600.0, -28080.0}, {45900.0, -6300.0}, {0.0, 0.0}, {12000.0, -51000.0}};
+                    const double fr[][2] = {{0.1, 0.3}, {0.45, 0.05}, {0.2, 0.2}, {0.33, 0.41}};
+                    for (int k = 0; k < 4; ++k) {
+                        const double x = std::floor(pts[k][0] / r.S) * r.S + fr[k][0] * fine, z = std::floor(pts[k][1] / r.S) * r.S + fr[k][1] * fine;
+                        f << "wf 0x23000000 " << x << "\nwf 0x23000008 " << z << "\nreg ECX " << bank << "\nreg EAX 0x23000000\ncall " << r.fn << "\n";
+                        double v = F.at(x, z);
+                        if (r.e) {
+                            auto P8 = [](double t) { return t <= 0 ? std::pow(t + 1, 8) - 1 : 1 - std::pow(1 - t, 8); };
+                            v = 0.5 + 0.5 * P8(P8(2 * v * std::fabs(v) - 1));
+                        }
+                        std::printf("port 0x%x (%.4f, %.4f) = %.9g\n", r.fn, x, z, v);
+                    }
+                }
+                // Canyon terraces 0x7a0c80 (object W+0x48404: +0xc / +0x10 = Fractal_Init(5, 100, 25.442329,
+                // 0.3, 0.3, 2) / (5, 50, 28.442329, ...), 0x7a0b20) at scaled points, a = 10, b = 50.
+                {
+                    const uint32_t obj = 0x24000000, fc = 0x25000000, fd = 0x25002000;
+                    f << "zero " << obj << " 0x40\nzero " << fc << " 0x4000\nw32 " << (obj + 0xc) << " " << fc << "\nw32 " << (obj + 0x10) << " " << fd << "\n";
+                    for (const auto& [o, S, seed] : {std::tuple{fc, 100.0f, 25.442329f}, std::tuple{fd, 50.0f, 28.442329f}}) {
+                        f << "pushf 2\npushf 0.3\npushf 0.3\npushf " << seed << "\npushf " << S << "\npush32 5\nreg EBX " << o << "\nreg EAX " << G
+                          << "\ncall 0x69b1b0\n";
+                        f << "w32 " << (o + 0xb44) << " " << uint32_t(int32_t(std::floor(double(seed) * 262897.0))) << "\n";
+                    }
+                    const fuel::Heightfield lv = fuel::loadLevelledHeightfield(dpc);
+                    const double cp[][2] = {{-158399.7, -112299.8}, {183600.3, -25199.8}, {400.1, 800.3}, {48000.2, -203999.9}};
+                    for (const auto& q : cp) {
+                        f << "wf 0x23000000 " << q[0] << "\nwf 0x23000008 " << q[1] << "\npushf 50\npushf 10\npush32 0x23000000\npush32 " << obj
+                          << "\ncall 0x7a0c80\n";
+                        const double down = lv.detail->canyonTerraces(q[0], q[1], 10, 50);
+                        fuel::setFloat32RoundNearest(true);
+                        const double near = lv.detail->canyonTerraces(q[0], q[1], 10, 50);
+                        fuel::setFloat32RoundNearest(false);
+                        std::printf("port 0x7a0c80 (%.4f, %.4f) = %.9g (stores rounded to nearest: %.9g)\n", q[0], q[1], down, near);
+                    }
+                }
             } else if (a == "--flats" && i + 3 < argc) {  // --flats X Z R: procedural flat surfaces (0x799910) near
                 const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr), R = std::strtod(argv[i + 3], nullptr);
                 i += 3;
@@ -243,6 +316,75 @@ int main(int argc, char** argv) {
                     const bool ok = std::fabs(h - q.h) < 2e-3;
                     ++checked, bad += !ok;
                     std::printf("height (%.1f, %.1f) = %.3f (recorded %.3f) %s\n", q.x, q.z, h, q.h, ok ? "match" : "MISMATCH");
+                }
+                // (3) Emulated vectors (p34 V1/V2): FUEL.exe's Fractal_Init 0x69b1b0 + the evaluators 0x79d470 (bank
+                // F 0x5efc), 0x6a88d0 (F 0x11cec), 0x79eed0 (E of F 0x7ea4) and the canyon terraces 0x7a0c80, run
+                // under Ghidra's EmulatorHelper (tools/ghidra/EmuRun.java, read only) over this world's random table
+                // (command file from --emu-fractal-cmd). Points sit < 0.5 finest cell past a cell corner so the
+                // emulator's round-to-nearest fistp equals the game's round-down; the canyon is compared with the
+                // port's float32 stores rounded to nearest like the emulator (setFloat32RoundNearest).
+                {
+                    const fuel::Permutation perm = fuel::buildPermutation(dpc, fuel::genWorldSeed(dpc));
+                    const fuel::Fractal FN(perm, 2, 30.0f, 43.129738f, 0.6f, 0.6f, 0.5f), FJ(perm, 2, 10.0f, 33.129738f, 0.6f, 0.6f, 0.5f),
+                        FE(perm, 4, 3000.0f, 9.647993f, 0.025f, 0.15f, 0.5f);
+                    auto P8 = [](double t) { return t <= 0 ? std::pow(t + 1, 8) - 1 : 1 - std::pow(1 - t, 8); };
+                    struct EV {
+                        int f;  // 0 N, 1 J, 2 E, 3 canyon
+                        double x, z, emu, tol;
+                    };
+                    const EV ev[] = {{0, -39599.25, -28077.75, 0.184621947, 2e-5},   {0, 45903.375, -6299.625, 0.635593992, 2e-5},
+                                     {0, 1.5, 1.5, 0.0281049758, 2e-5},             {0, 12002.475, -50996.925, 0.663505909, 2e-5},
+                                     {1, -39599.75, -28079.25, 0.312729538, 2e-5},   {1, 45901.125, -6299.875, 0.751545586, 2e-5},
+                                     {1, 0.5, 0.5, 0.332733206, 2e-5},               {1, 12000.825, -50998.975, 0.636388680, 2e-5},
+                                     {2, -41981.25, -29943.75, 2.25107422e-13, 1e-6}, {2, 45084.375, -8990.625, 0.0, 1e-6},
+                                     {2, 37.5, 37.5, 1.0, 1e-6},                     {2, 12061.875, -50923.125, 1.0, 1e-6},
+                                     {3, -158399.7, -112299.8, 32.8392295, 1e-4},    {3, 183600.3, -25199.8, 40.8465797, 1e-4},
+                                     {3, 400.1, 800.3, 52.5867159, 1e-4},            {3, 48000.2, -203999.9, 27.2667041, 5e-4}};
+                    const char* names[] = {"0x79d470 F5efc", "0x6a88d0 F11cec", "0x79eed0 E(F7ea4)", "0x7a0c80 canyon"};
+                    for (const EV& e : ev) {
+                        const double x = double(float(e.x)), z = double(float(e.z));  // the engine reads a float3
+                        double v;
+                        if (e.f == 0) v = FN.at(x, z);
+                        else if (e.f == 1) v = FJ.at(x, z);
+                        else if (e.f == 2) {
+                            const double u = FE.at(x, z);
+                            v = 0.5 + 0.5 * P8(P8(2 * u * std::fabs(u) - 1));
+                        } else {
+                            fuel::setFloat32RoundNearest(true);
+                            v = ground.detail->canyonTerraces(x, z, 10, 50);
+                            fuel::setFloat32RoundNearest(false);
+                        }
+                        const bool ok = std::fabs(v - e.emu) <= e.tol;
+                        ++checked, bad += !ok;
+                        std::printf("emulated %-18s (%.3f, %.3f) = %.9g, port %.9g %s\n", names[e.f], e.x, e.z, e.emu, v, ok ? "match" : "MISMATCH");
+                    }
+                }
+                // (4) Port regression for p34's pieces (recorded values; no engine reference exists for them).
+                {
+                    const auto fl = ground.detail->proceduralFlats(-39600, -28080, 300);
+                    int mode1 = -1;
+                    for (size_t k = 0; k < fl.size(); ++k)
+                        if (fl[k].mode == 1) mode1 = int(k);
+                    const bool okF = fl.size() == 5 && mode1 >= 0 && std::fabs(fl[size_t(mode1)].cx - -39638.7) < 0.1 &&
+                                     std::fabs(fl[size_t(mode1)].cz - -28071.6) < 0.1 && std::fabs(fl[size_t(mode1)].lenZ - 59.3) < 0.1;
+                    ++checked, bad += !okF;
+                    std::printf("procedural flats within 300 m of the CR2 start: %zu (recorded 5, one mode 1 at (-39638.7, -28071.6), D 59.3) %s\n", fl.size(),
+                                okF ? "match" : "MISMATCH");
+                    const double hf = ground.smoothHeightAt(-39611.1, -28089.3);
+                    const bool okH = std::fabs(hf - 866.607) < 2e-3;
+                    ++checked, bad += !okH;
+                    std::printf("height on that flat (-39611.1, -28089.3) = %.3f (recorded 866.607) %s\n", hf, okH ? "match" : "MISMATCH");
+                    const double hr = ground.smoothHeightAt(-37367, -27769);
+                    const fuel::WaterPoint w = fuel::waterAt(nullptr, ground.detail.get(), -37367, -27769, hr);
+                    const bool okR = std::fabs((w.depth - w.base) - 6.871) < 2e-3 && w.riverShare > 0.99f;
+                    ++checked, bad += !okR;
+                    std::printf("river water depth at (-37367, -27769) = %.3f m, river share %.2f (recorded %.3f) %s\n", w.depth - w.base, w.riverShare, 6.871,
+                                okR ? "match" : "MISMATCH");
+                    fuel::GroundGenerator gen(dpc, ground, nullptr);
+                    const fuel::GroundPoint gp = gen.at(4900, 35538);
+                    const bool okD = std::fabs(gp.dune - 1.0f) < 1e-4f && gp.sand > 0.5f;
+                    ++checked, bad += !okD;
+                    std::printf("Dune at the Sand Dunes (4900, 35538) = %.3f, SandTexture %.3f (recorded 1, > 0.5) %s\n", gp.dune, gp.sand, okD ? "match" : "MISMATCH");
                 }
                 std::printf("terrain vectors: %d of %d match\n", checked - bad, checked);
                 if (bad) return 1;

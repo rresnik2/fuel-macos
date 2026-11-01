@@ -107,6 +107,8 @@ public:
     // (= the canyon floor level, map slot 12) when the ground h is at most 1 cm above L and r > 0,
     // else 0. h = finished height (ctx+0xb4), h0 = map height (ctx+0x190).
     double duneRelief(double x, double z, double h, double h0) const;
+    // The canyon terraces 0x7a0c80 at an already scaled position (for the emulator vectors).
+    double canyonTerraces(double sx, double sz, double a, double b) const { return canyon(sx, sz, a, b); }
     // WorkBump_Nearest 0x79d190 -> the ground point's zone byte ctx+0x240 (0x6b9ad0): the mode
     // (+0x50: 1 or 3) of the work bump whose capsule holds (x, z) with the nearest point +0x40;
     // 0 when none.
@@ -195,6 +197,10 @@ private:
     uint32_t id_ = 0;  // for the per-thread lattice caches
     int skip_ = 0;     // FUEL_TERRAIN_SKIP diagnostics
 };
+
+// For emulator comparisons only (this thread): round float32 stores to nearest like Ghidra's
+// pcode emulator instead of FUEL's round-down.
+void setFloat32RoundNearest(bool on);
 
 // Builds the detail for a world DPC (WORLD/USA1.DPC) from its GenWorld_Z maps, flat
 // surfaces and GwRoad_Z gulch lines, with the base map already decoded in `baseRaw`.
