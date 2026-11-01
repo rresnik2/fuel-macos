@@ -603,7 +603,7 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         ctx.types = ctx.roads ? &ctx.roads->types() : nullptr;
         ctx.free = [this](double x, double z, float) { return !nearObstacle(x, z, 0.0f); };  // W[0] (port: placed objects' circles)
         const auto t0 = std::chrono::steady_clock::now();
-        autoMesh_->generate(ctx, player.x, player.z, bg.autoObjects);
+        autoMesh_->generate(ctx, player.x, player.z, bg.autoObjects, &bg.autoRoadFrom);
         bg.haveAuto = true;
         if (std::getenv("FUEL_STREAM_TRACE")) {
             const fuel::AutoMesh::Stats st = autoMesh_->lastStats();
@@ -783,8 +783,11 @@ void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& rendere
     trunks_ = std::move(bg.trunks);
     if (bg.haveAuto) {
         autoSolid_.clear();
-        for (const fuel::PlacedMesh& p : bg.autoObjects)
-            if (std::hypot(p.world[12] - last_.x, p.world[14] - last_.z) <= kCollideRadius) {
+        // Cell objects (buildings, wrecks, rocks) are solid; road furniture is not (port: FUEL's
+        // knock-aside / dynamic handling of those props is not decoded, and as walls they block
+        // race and challenge starts on the road).
+        for (size_t i = 0; i < bg.autoRoadFrom && i < bg.autoObjects.size(); ++i)
+            if (const fuel::PlacedMesh& p = bg.autoObjects[i]; std::hypot(p.world[12] - last_.x, p.world[14] - last_.z) <= kCollideRadius) {
                 std::array<double, 16> m;
                 for (size_t k = 0; k < 16; ++k) m[k] = p.world[k];
                 autoSolid_.push_back({p.meshId, m});

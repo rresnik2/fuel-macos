@@ -83,7 +83,8 @@ public:
     // The objects FUEL has spawned for a camera at (x, z): every cell of every decor leaf chunk
     // that generates them, after the emit cull. Cells are cached (placement is deterministic), so
     // later calls only compute new cells. Thread: one caller at a time.
-    void generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out);
+    // `roadFrom` (optional) receives the index in `out` where the road objects start.
+    void generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out, size_t* roadFrom = nullptr);
     struct Stats {
         size_t cells = 0, cellObjects = 0, roadObjects = 0, parts = 0;
     };

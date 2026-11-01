@@ -841,8 +841,9 @@ void AutoMesh::emit(const Context& ctx, const Spawn& s, std::vector<PlacedMesh>&
     }
 }
 
-void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out) {
+void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out, size_t* roadFrom) {
     stats_ = {};
+    if (roadFrom) *roadFrom = out.size();
     if (ctx.terrain == nullptr || !ctx.terrain->detail || ctx.ground == nullptr) return;
     // Cells: class 0 (20 m) in leaves C < 100 (W+0xa74), classes 1/2 (50 m) in leaves C < 400
     // (W+0xa70 / +0xa6c); C = the leaf holding the cell corner.
@@ -870,6 +871,7 @@ void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vecto
                 stats_.cellObjects += out.size() > before;
             }
     }
+    if (roadFrom) *roadFrom = out.size();
     // Roads (C < 200, W+0xa84): GwRoad lines of the gathered types (0x78f130: 4, 5, 6, 8, 9, 10,
     // 11, 12, 18, 19; not 7) near the camera, both sides and the middle.
     if (ctx.lines != nullptr && ctx.roads != nullptr && !lists_[3].empty()) {

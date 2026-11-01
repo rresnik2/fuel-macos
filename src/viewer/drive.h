@@ -229,6 +229,7 @@ private:
         std::vector<std::array<double, 16>> trunks;  // solid cylinders for nearby trees (row-vector matrices)
         bool haveAuto = false;
         std::vector<fuel::PlacedMesh> autoObjects;   // AutoMesh / RoadMesh spawns (renderer set 1)
+        size_t autoRoadFrom = 0;                     // road furniture from here on (not solid)
     };
     std::unique_ptr<fuel::AutoMesh> autoMesh_;
     std::vector<std::pair<uint32_t, std::array<double, 16>>> autoSolid_;  // big AutoMesh objects near the player
