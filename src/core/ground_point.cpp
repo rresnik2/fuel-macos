@@ -389,14 +389,18 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     GroundPoint p;
     if (terrain_ == nullptr) return p;
     const Heightfield& t = *terrain_;
-    p.height = t.smoothHeightAt(x, z);
-    auto normalAt = [&](double e, float n[3]) {
-        const double dx = (t.smoothHeightAt(x + e, z) - t.smoothHeightAt(x - e, z)) / (2 * e);
-        const double dz = (t.smoothHeightAt(x, z + e) - t.smoothHeightAt(x, z - e)) / (2 * e);
+    // Bits 0 and 1 (0x6b9990, 0x6b99d0): the height and the normal come from the 1 m lattice point
+    // nearest below-left of (x + 0.5, z + 0.5): 0x63eb10 adds 0.5 and rounds down (_RC_DOWN), 0x63ea40
+    // caches 0x64a2a0(flags 0) there, and 0x64e130 (step 1) takes the central differences of the
+    // neighbours (-h(i+1) + h(i-1), 2, -h(j+1) + h(j-1)) normalised.
+    const double hx = std::floor(x + 0.5), hz = std::floor(z + 0.5);
+    p.height = t.smoothHeightAt(hx, hz);
+    {
+        const double dx = (t.smoothHeightAt(hx + 1, hz) - t.smoothHeightAt(hx - 1, hz)) / 2;
+        const double dz = (t.smoothHeightAt(hx, hz + 1) - t.smoothHeightAt(hx, hz - 1)) / 2;
         const double len = std::sqrt(dx * dx + 1 + dz * dz);
-        n[0] = float(-dx / len), n[1] = float(1 / len), n[2] = float(-dz / len);
-    };
-    normalAt(1.0, p.normal);
+        p.normal[0] = float(-dx / len), p.normal[1] = float(1 / len), p.normal[2] = float(-dz / len);
+    }
     // Coarse normal (ctx+0xe0, the W+0xcc4 sampler).
     float coarse[3];
     coarseNormal(x, z, coarse);
