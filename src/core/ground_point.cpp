@@ -1,6 +1,7 @@
 #include "ground_point.hpp"
 #include "ground.hpp"
 #include "resources.hpp"
+#include "terrain_height.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +54,11 @@ float band(float x, float lo, float hi, float soft) {
 // The engine rounds these position sums in single precision before taking the byte.
 // fistp in FUEL's game threads rounds down (_RC_DOWN, p21 H0).
 uint8_t hashByte(const Permutation& p, double v) { return p[size_t(int64_t(std::floor(float(v))) & 255)]; }
+
+// The position hash multipliers are 4-byte constants in FUEL.exe ([0x9dc200] = 10.193577766..,
+// [0x9dc204] = 12.317513465.., the Grass_Decide salt [0x9dd558] = 29.823713302.., [0x7dce50]'s mix 931.92828..);
+// the fmul/fadd operands are `dword ptr`, so the double literals are rounded to float first.
+constexpr double kHashZ = double(10.193578f), kHashX = double(12.317513f), kHashSalt = double(29.823713f), kHashMix = double(931.9283f);
 
 uint64_t cellKey(int64_t cx, int64_t cz) { return (uint64_t(uint32_t(int32_t(cx))) << 32) | uint32_t(int32_t(cz)); }
 constexpr double kSurfaceCell = 64.0;
@@ -279,6 +285,17 @@ float GroundGenerator::roadWeight(double x, double z, bool* nearRoad, float* tar
     return best;
 }
 
+// GenWorld_ForestDensity (0x6bd200): the forest map (map 7, bicubic, not clamped) through the
+// contrast curve, minus 0.95 x the clearing noise F_cdc8 (clamped finest cell) through the same
+// curve on 2G^2 - 1; the result fades out where the coarse base normal is flatter than 45 degrees
+// (n.y < 0.707 [0x9dc0c8], x 100 [0x9dbfc0]). Decoded from the decompile corpus.
+float GroundGenerator::forestDensity(double x, double z, float coarseNy) const {
+    const float F = mapAt(7, x, z), G = clamp01(fcdc8_.at(x, z));
+    float d = clamp01((contrast8(2 * F - 1) * 0.5f + 0.5f) - 0.95f * (contrast8(2 * G * G - 1) * 0.5f + 0.5f));
+    if (coarseNy < 0.707f) d *= std::max(0.0f, 1 - (0.707f - coarseNy) * 100.0f);
+    return clamp01(d);
+}
+
 // Point_RockCover (0x6b8d80) over Terrain_RockEval (0x7a4c20).
 void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarseNy) const {
     p.rock = p.rockSlope = 0;
@@ -309,12 +326,37 @@ void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarse
     if (p.height > 3000 - 500 * p.normal[2]) rock = rockSlope = 1;
     rock = clamp01(rock - p.cover - p.road - p.junction);
     rockSlope = clamp01(rockSlope - p.cover - p.road - p.junction);
+    if (p.waterDepth > 0) {
+        // Lake / river bed (ctx+0x1ac > 0, 0x6b8d80): ctx+0x1e4 = (1 - t) (S2(w) + ctx+0x1e4) with
+        // w = 2 (1 - ctx+0x248) ctx+0x198 - 1 (ctx+0x248 = Dune layer = 0 here) and
+        // t = clamp(10 n.y - 5); applied after the cover / road / junction clamp, before high ground.
+        const float w = 2 * p.surfaceHumidity - 1;
+        const float t = clamp01(10 * p.normal[1] - 5);
+        rockSlope = (1 - t) * (soft2(w) + rockSlope);
+    }
     p.rock = clamp01(rock - p.highGround);  // - water (ctx+0x228, not ported)
     p.rockSlope = clamp01(rockSlope - p.highGround);
 }
 
+// The coarse normal of the point context (ctx+0xe0): Point_BaseNormal (bit 26, 0x6b9a40) takes the
+// analytic normal of the base altitude map from 0x6ac460 / 0x45de10 (G+0xcc4), not a difference of
+// the detailed ground. TerrainDetail::baseNormal is that sampler (terrain_mesh.cpp uses it for the
+// chunk morph normals). Without FUEL's terrain detail (bare map) a 15 m difference stands in.
+void GroundGenerator::coarseNormal(double x, double z, float n[3]) const {
+    const Heightfield& t = *terrain_;
+    if (t.detail) {
+        t.detail->baseNormal(x, z, n);
+        return;
+    }
+    const double e = 15.0;
+    const double dx = (t.smoothHeightAt(x + e, z) - t.smoothHeightAt(x - e, z)) / (2 * e);
+    const double dz = (t.smoothHeightAt(x, z + e) - t.smoothHeightAt(x, z - e)) / (2 * e);
+    const double len = std::sqrt(dx * dx + 1 + dz * dz);
+    n[0] = float(-dx / len), n[1] = float(1 / len), n[2] = float(-dz / len);
+}
+
 // Point_Fields (0x6b9100).
-int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover,
+int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, bool nearRoad, float cover,
                                float* random) const {
     if (!(p.normal[1] > 0.8707f) || !(p.height < 1500)) return 0;
     const float pop = mapAt(8, x, z);
@@ -324,10 +366,17 @@ int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float c
     const double i = std::floor(a), j = std::floor(c);  // fistp rounds down in FUEL's threads (p21 H0)
     const float u = float(a - i), v = float(c - j);
     const double cx = i * 200 + 100, cz = j * 200 + 100;
-    const float r = float(hashByte(perm_, cx * 12.317513 + cz * 10.193578)) / 255.0f;
+    const float r = float(hashByte(perm_, cx * kHashX + cz * kHashZ)) / 255.0f;
     *random = r;
     int type = 0;
-    if (r > 0.3f && p.humidity > 0.2f && cover < 0.5f && !nearRoad && coarseNy > 0.98f) type = r < 0.33f ? 1 : 2;
+    if (r > 0.3f && p.humidity > 0.2f && cover < 0.5f && !nearRoad) {
+        // The coarse normal is tested at the field cell's centre (0x6b92c4-0x6b92f8: 0x45de10 on
+        // the centre buffer written by Fields_Cell 0x6b8820 at esp+0x18; n.y > 0.98 [0x9dcccc]),
+        // not at the point: a whole 200 m field appears or vanishes together.
+        float cn[3];
+        coarseNormal(cx, cz, cn);
+        if (cn[1] > 0.98f) type = r < 0.33f ? 1 : 2;
+    }
     if (u <= 0.0125f || v <= 0.0125f || u >= 0.9875f || v >= 0.9875f) return 0;
     if (nearRoad) return 0;  // +0x1bc <= 3N + 1 (it is 0 near roads, 1000 elsewhere)
     const float nf = clamp01((soft2(2 * f1fac_.at(x, z) - 1) + f6ed0_.at(x, z)) * 0.5f);
@@ -340,17 +389,22 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     GroundPoint p;
     if (terrain_ == nullptr) return p;
     const Heightfield& t = *terrain_;
-    p.height = t.smoothHeightAt(x, z);
-    auto normalAt = [&](double e, float n[3]) {
-        const double dx = (t.smoothHeightAt(x + e, z) - t.smoothHeightAt(x - e, z)) / (2 * e);
-        const double dz = (t.smoothHeightAt(x, z + e) - t.smoothHeightAt(x, z - e)) / (2 * e);
+    // Bits 0 and 1 (0x6b9990, 0x6b99d0): the height and the normal come from the 1 m lattice point
+    // nearest below-left of (x + 0.5, z + 0.5): 0x63eb10 adds 0.5 and rounds down (_RC_DOWN), 0x63ea40
+    // caches 0x64a2a0(flags 0) there, and 0x64e130 (step 1) takes the central differences of the
+    // neighbours (-h(i+1) + h(i-1), 2, -h(j+1) + h(j-1)) normalised.
+    const double hx = std::floor(x + 0.5), hz = std::floor(z + 0.5);
+    p.height = t.smoothHeightAt(hx, hz);
+    {
+        const double dx = (t.smoothHeightAt(hx + 1, hz) - t.smoothHeightAt(hx - 1, hz)) / 2;
+        const double dz = (t.smoothHeightAt(hx, hz + 1) - t.smoothHeightAt(hx, hz - 1)) / 2;
         const double len = std::sqrt(dx * dx + 1 + dz * dz);
-        n[0] = float(-dx / len), n[1] = float(1 / len), n[2] = float(-dz / len);
-    };
-    normalAt(1.0, p.normal);
-    // Coarse normal (ctx+0xe0, the W+0xcc4 sampler): APPROXIMATED by a 15 m difference.
+        p.normal[0] = float(-dx / len), p.normal[1] = float(1 / len), p.normal[2] = float(-dz / len);
+    }
+    // Coarse normal (ctx+0xe0, the W+0xcc4 sampler).
     float coarse[3];
-    normalAt(15.0, coarse);
+    coarseNormal(x, z, coarse);
+    p.coarseNy = coarse[1];
     // Humidity (bit 2): APPROXIMATED as the plain map (FUN_004dde20 adds terms not decoded).
     p.humidity = clamp01(mapAt(2, x, z));
     const float v = p.humidity, nxz = std::hypot(p.normal[0], p.normal[2]);
@@ -401,7 +455,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
         p.highGround = clamp01(hg - (2 - p.road) * p.road);
     }
     rockCover(x, z, p, coarse[1]);
-    p.field = fieldType(x, z, p, coarse[1], nearRoad, fs.cover, &p.fieldRandom);
+    p.field = fieldType(x, z, p, nearRoad, fs.cover, &p.fieldRandom);
     p.nearRoad = nearRoad;
     if (!full) return p;
 
@@ -520,7 +574,9 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     const float H = p.surfaceHumidity;
     float strata;
     {
-        const float v = fcdc8_.at(x, z);
+        // Point_Strata (bit 20, 0x4dea60) calls 0x4debf0, which returns F_cdc8 clamped to [0, 1]
+        // (asm 0x4df25e: fld1; fcom ...), as P31 noted.
+        const float v = clamp01(fcdc8_.at(x, z));
         const float y = 0.25f * std::sin(0.2f * (100 * v + p.height)) + 0.75f * std::sin(0.01f * (500 * v + p.height));
         strata = clamp01(y * (2 - std::fabs(y)) * clamp01(1 - 5 * (p.normal[1] - 0.8f)) * 0.2f);
     }
@@ -529,17 +585,23 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
 
     // Burnt ground (bit 7): Incinerated map 13.
     const float burnI = mapAt(13, x, z);
-    const float burn = std::min(contrast8(2 * burnI - 1) * 0.5f + 0.5f, 0.9f);
+    // ctx+0x22c is written 0 on the under-water branch (0x6b9f40: ctx+0x1ac - ctx+0x1b0 > 0), so bit 8's
+    // dry term and bit 9's burn tint see 0 there.
+    const float burn = p.underWater() ? 0.0f : std::min(contrast8(2 * burnI - 1) * 0.5f + 0.5f, 0.9f);
 
     // Mixer 1 (0x6b0750): M1 earth, M2 road dirt.
     C c4[4];
     for (int j = 0; j < 4; ++j) c4[j] = mix({16 + j, 20 + j, 24 + j, 28 + j, 32 + j}, {70 + j, 74 + j, 78 + j, 82 + j, 86 + j});
-    C M1 = lerp(c4[1], c4[0], pm), M2 = lerp(c4[3], c4[2], pm);
-    M1 = lerp(M1, P(58), chalk * mapAt(18, x, z));
-    // ctx+0x220 (wet ground) needs the water level map: 0 without water (port).
+    const C M1m = lerp(c4[1], c4[0], pm);
+    C M1 = M1m, M2 = lerp(c4[3], c4[2], pm);
+    // Point_EarthColours (bit 9, 0x6bacf0 tail 0x6bae38-0x6bb046): the chalk (P58) tint, the sand
+    // tint (ctx+0x220: 0 without the Dune layer) and the burn tint each start from the mixer
+    // output M1m, not from each other; the last applicable one wins and only burn also touches M2.
+    M1 = lerp(M1m, P(58), chalk * mapAt(18, x, z));
+    if (p.sand > 1e-6f) M1 = lerp(M1m, C{1.0f, 1.0f, 1.0f}, 0.33f * p.sand);  // g 0xa063c8 = (1, 1, 1)
     if (burn > 0.01f) {
-        const C b{0.4f, 0.35f, 0.35f};
-        M1 = lerp(M1, b, burn), M2 = lerp(M2, b, burn);
+        const C b{0.4f, 0.35f, 0.35f};  // g 0xa066d0
+        M1 = lerp(M1m, b, burn), M2 = lerp(M2, b, burn);
     }
     // Mixers 2 and 3 (0x6b22e0, 0x6b3130): rock colours M3, M4 (0x6b22e0's chalk Y reads slot 54 twice).
     const C M3 = lerp(mix({51, 52, 53, 54, 55}, {101, 103, 105, 54, 109}), mix({46, 47, 48, 49, 50}, {100, 102, 104, 106, 108}), pr);
@@ -584,7 +646,8 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
         A = lerp(A, G, p.road);
     }
     if (p.highGround > 0.025f) A = lerp(A, P(56), p.highGround);
-    float f = clamp01(2 * (mapAt(7, x, z) * p.humidity - 0.5f));
+    // ctx+0x1a4 is the forest density 0x6bd200 (bit 5, 0x4de5d0 stores it), not the raw map 7 (p32 pointcolours 1.4).
+    float f = clamp01(2 * (forestDensity(x, z, p.coarseNy) * p.humidity - 0.5f));
     f *= f;
     if (p.height > 3000 - 500 * p.normal[2] - 200) f = 0;
     const float k = std::max(f - p.rock, 0.0f);
@@ -688,7 +751,7 @@ void GroundGenerator::classFractions(double x, double y, double z, float frac[kG
         if (p.waterDepth <= p.waterBase + 0.01f) {  // ctx+0x1ac <= ctx+0x1b0 + 0.01: dry
             e.water = -10000.0f;
             // Grass weight ctx+0x1d0 = clamp(Grass - 0.8 dry) (bit 8; burn ctx+0x22c is 0 under water).
-            const float burn = std::min(contrast8(2 * mapAt(13, double(ix), double(iz)) - 1) * 0.5f + 0.5f, 0.9f);
+            const float burn = p.underWater() ? 0.0f : std::min(contrast8(2 * mapAt(13, double(ix), double(iz)) - 1) * 0.5f + 0.5f, 0.9f);
             const float dry = clamp01(1 - 2 * clamp01((p.surfaceHumidity - 0.33f) * 1.5625f + burn));
             const float g = clamp01(p.grass - 0.8f * dry);
             const float A = (1 - cr) * (1 - r);
@@ -743,7 +806,7 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
     for (int32_t iz = z0; iz < z1; ++iz)
         for (int32_t ix = x0; ix < x1; ++ix) {
             // Grass_Decide (0x7dddf0): jitter by the permutation nibbles.
-            const uint8_t jb = hashByte(perm_, double(iz) * 10.193578 + double(ix) * 12.317513 + 29.823713);
+            const uint8_t jb = hashByte(perm_, double(iz) * kHashZ + double(ix) * kHashX + kHashSalt);
             const double x = ix + float(jb & 15) * 0.06666667f, z = iz + float(jb >> 4) * 0.06666667f;
             const GroundPoint p = at(x, z);
             const float g = byte64(p.groundGrass);
@@ -753,19 +816,19 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
             const float scale = (byte64(p.grassSize) + 0.5f) * h;
             const float kind = byte64(p.surfaceHumidity);
             // Grass_EmitTuft (0x7dce50).
-            const float r0 = float(hashByte(perm_, z * 10.193578 + x * 12.317513)) / 255.0f, r0s = r0 * r0;
+            const float r0 = float(hashByte(perm_, z * kHashZ + x * kHashX)) / 255.0f, r0s = r0 * r0;
             const float size = std::max(1.0f, (r0s * 0.5f + 0.75f) * scale);
             auto base = uint32_t(std::floor(kind * 5.9f));  // fistp rounds down
             base = std::min(base, 6u);
             const float w0 = tileWeight_[base], w1 = tileWeight_[base + 1], w2 = tileWeight_[base + 2];
             const float inv = 1.0f / (w0 + w1 + w2);
-            const float r1 = float(hashByte(perm_, z * 10.193578 + (double(r0s) * 931.9283 + x) * 12.317513)) / 255.0f;
+            const float r1 = float(hashByte(perm_, z * kHashZ + (double(r0s) * kHashMix + x) * kHashX)) / 255.0f;
             uint32_t tile = base;
             if (w0 * inv <= r1) tile = (w0 * inv + w1 * inv <= r1) ? base + 2 : base + 1;
             const float tileSize = tileSize_[tile];
             if (tileSize <= 0) continue;  // tile 8 has size 0 in the engine's table
             const float u0 = float(tile & 3) * 0.25f;
-            const uint8_t r2 = hashByte(perm_, z * 10.193578 + (double(u0) * 931.9283 + x) * 12.317513);
+            const uint8_t r2 = hashByte(perm_, z * kHashZ + (double(u0) * kHashMix + x) * kHashX);
             GrassTuft tuft{};
             tuft.x = float(x), tuft.z = float(z);
             tuft.y = p.height - (1 - p.normal[1]) * 0.5f;

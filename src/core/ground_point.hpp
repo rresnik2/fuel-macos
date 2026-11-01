@@ -38,6 +38,7 @@ struct GroundPoint {
     float grass = 0;            // Grass (ctx+0x1c8)
     float groundGrass = 0;      // GroundGrass (ctx+0x1cc): what the grass tufts use
     float grassSize = 0;        // ctx+0x234
+    float coarseNy = 1;         // n.y of the coarse base normal (ctx+0xe4)
     // Road fields (bit 12 = 0x6b9bb0 over the road sampler 0x6fbab0; zero without a RoadSampler).
     float roughness = 0;        // ctx+0x1f0: dirt road roughness (picks DIRT_FLAT .. DIRT_ROUGH)
     float decal = 0;            // ctx+0x204: road decal weight
@@ -142,7 +143,9 @@ private:
     float roadWeight(double x, double z, bool* nearRoad, float* tarmac = nullptr) const;
     void surfaceTypes(double x, double z, GroundPoint& p) const;
     void rockCover(double x, double z, GroundPoint& p, float coarseNy) const;
-    int fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover, float* random) const;
+    float forestDensity(double x, double z, float coarseNy) const;
+    void coarseNormal(double x, double z, float n[3]) const;
+    int fieldType(double x, double z, const GroundPoint& p, bool nearRoad, float cover, float* random) const;
     float mapAt(int slot, double x, double z) const;
 
     const Heightfield* terrain_ = nullptr;
