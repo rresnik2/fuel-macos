@@ -608,6 +608,7 @@ struct RaceSession {
     }
     void begin(DriveSession& d, WorldStreamer* streamer, fuel::MeshRenderer& renderer) {
         const fuel::Race& r = race();
+        if (streamer) streamer->setMission(event().id);  // the course sub-world streams in with its mission (p35)
         if (terrain) rules.ground = [t = terrain](float x, float z) { return t->smoothHeightAt(x, z); };
         rules.begin(r, racers.size(), event().times[0]);
         route = rules.route;
@@ -1968,6 +1969,7 @@ int main(int argc, const char** argv) {
                                 renderer.setFoliage(std::move(foliage));
                             }
                             streamer->setVegetation(vegetation.get(), terrain.get());
+                            streamer->setSubWorlds(fuel::loadSubWorldRefs(*f));  // FUEL's region / course streaming (p35)
                             streamer->setSurfaces([](double x, double z) { return gSurfaces.at(x, z); });
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
                             roadTypes = fuel::loadRoadTypes(*f);

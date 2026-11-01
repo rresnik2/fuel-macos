@@ -9,6 +9,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <strings.h>
 #include <thread>
 
 #include "core/resources.hpp"
@@ -355,39 +356,60 @@ uint64_t cellKey(int64_t cx, int64_t cz) { return (uint64_t(uint32_t(int32_t(cx)
 
 WorldStreamer::WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup)
     : lookup_(lookup) {
-    for (const fuel::DpcFile* sub : subWorlds)
+    for (const fuel::DpcFile* sub : subWorlds) {
+        const auto subIndex = uint16_t(subFiles_.size());
+        subFiles_.push_back(std::filesystem::path(sub->path()).filename().string());
         for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, lookup)) {
             const float x = pm.world[12], z = pm.world[14];
             if (std::fabs(x) < 50 && std::fabs(z) < 50) continue;  // stray objects at the origin
             const auto index = uint32_t(placed_.size());
-            placed_.push_back({pm.meshId, pm.world, pm.fitToGround, pm.groundNormal});
+            placed_.push_back({pm.meshId, pm.world, pm.fitToGround, pm.groundNormal, subIndex});
             cells_[cellKey(int64_t(std::floor(x / kCell)), int64_t(std::floor(z / kCell)))].push_back(index);
             addObstacle(pm);
         }
+    }
+}
+
+void WorldStreamer::setSubWorlds(std::vector<fuel::SubWorldRef> refs) {
+    refs_ = std::move(refs);
+    subRef_.assign(subFiles_.size(), -1);
+    for (size_t f = 0; f < subFiles_.size(); ++f)
+        for (size_t r = 0; r < refs_.size(); ++r)
+            if (strcasecmp(refs_[r].file.c_str(), subFiles_[f].c_str()) == 0) subRef_[f] = int(r);
+    subActive_.assign(subFiles_.size(), 1);
+    streamed_ = true;
+    last_ = {1e30f, 0, 0};  // rebuild on the next update
+}
+
+void WorldStreamer::setMission(const std::string& mission) {
+    if (strcasecmp(mission.c_str(), mission_.c_str()) == 0) return;
+    mission_ = mission;  // M_TELEPORT of the new mission / M_END of the old one (0x513630)
+    last_ = {1e30f, 0, 0};
+}
+
+bool WorldStreamer::refreshActive(simd_float3 player) {
+    if (!streamed_) return false;
+    const std::vector<size_t> regions = fuel::nearestRegions(refs_, player.x, player.z);
+    bool changed = false;
+    for (size_t f = 0; f < subFiles_.size(); ++f) {
+        const int r = subRef_[f];
+        bool on = true;  // files without a WorldRef: not streamed by FUEL, keep the old behaviour
+        if (r >= 0 && refs_[size_t(r)].kind == fuel::SubWorldRef::Region)
+            on = std::find(regions.begin(), regions.end(), size_t(r)) != regions.end();
+        else if (r >= 0 && refs_[size_t(r)].kind == fuel::SubWorldRef::Course)
+            on = !mission_.empty() && strcasecmp(refs_[size_t(r)].mission.c_str(), mission_.c_str()) == 0;
+        changed = changed || subActive_[f] != char(on);
+        subActive_[f] = char(on);
+    }
+    return changed;
 }
 
 void WorldStreamer::setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) {
+    // Static placements keep their authored height, FITTOGROUND or not: the engine reads that
+    // keyword (and GROUNDNORMAL) only in 0x778650, the AutoMesh spawn of ground elements of kind
+    // 0x17 (0x779440), never for sub-world nodes (p35 F2; the strings' only references, and the
+    // keyword search 0x7b1bc0's only caller).
     vegetation_ = v, terrain_ = terrain;
-    if (terrain == nullptr || seated_) return;
-    seated_ = true;
-    for (Placed& p : placed_) {
-        if (!p.fitToGround) continue;
-        const float x = p.world[12], z = p.world[14];
-        p.world[13] = terrain->smoothHeightAt(x, z);
-        if (!p.groundNormal) continue;
-        // Tilt the object's axes by the rotation that takes +y to the terrain normal.
-        constexpr float e = 2.0f;
-        const float dx = (terrain->smoothHeightAt(x + e, z) - terrain->smoothHeightAt(x - e, z)) / (2 * e);
-        const float dz = (terrain->smoothHeightAt(x, z + e) - terrain->smoothHeightAt(x, z - e)) / (2 * e);
-        const simd_float3 n = simd_normalize(simd_make_float3(-dx, 1, -dz));
-        const simd_float3 axis = simd_cross(simd_make_float3(0, 1, 0), n);
-        if (simd_length(axis) < 1e-5f) continue;
-        const simd_quatf q = simd_quaternion(std::asin(std::min(1.0f, simd_length(axis))), simd_normalize(axis));
-        for (size_t r = 0; r < 3; ++r) {
-            const simd_float3 row = simd_act(q, simd_make_float3(p.world[r * 4], p.world[r * 4 + 1], p.world[r * 4 + 2]));
-            p.world[r * 4] = row.x, p.world[r * 4 + 1] = row.y, p.world[r * 4 + 2] = row.z;
-        }
-    }
 }
 
 // Bounding circle (ground plane) of a placement, from its mesh's bounding sphere.
@@ -735,6 +757,17 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
     updateGrass(player, renderer, force);
     updateGroundTiles(player, renderer, force);
     pollBackground(renderer, physics);
+    if (refreshActive(player)) {
+        force = true;
+        for (auto it = props_.begin(); it != props_.end();) {  // detached sub-worlds take their props along
+            if (active(placed_[it->first])) {
+                ++it;
+                continue;
+            }
+            if (it->second.body) physics.removeProp(it->first);
+            it = props_.erase(it);
+        }
+    }
     if (!force && simd_distance(player, last_) < 40.0f) {
         updateProps(renderer, physics, false);
         return;
@@ -751,7 +784,7 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
             for (uint32_t i : it->second) {
                 const Placed& p = placed_[i];
                 const float d = std::hypot(p.world[12] - player.x, p.world[14] - player.z);
-                if (d > kDrawRadius) continue;
+                if (d > kDrawRadius || !active(p)) continue;
                 if (props_.count(i)) continue;  // drawn from the prop list
                 if (d <= kPropRadius) {
                     // Small objects become movable props (cached radius per mesh).
@@ -857,7 +890,7 @@ std::vector<WorldStreamer::GroundGap> WorldStreamer::groundGaps(double x, double
             if (it == cells_.end()) continue;
             for (uint32_t i : it->second) {
                 const Placed& p = placed_[i];
-                if (p.fitToGround || std::hypot(p.world[12] - x, p.world[14] - z) > radius) continue;
+                if (std::hypot(p.world[12] - x, p.world[14] - z) > radius || !active(p)) continue;
                 const float gap = p.world[13] - terrain_->smoothHeightAt(p.world[12], p.world[14]);
                 if (std::fabs(gap) >= minGap) out.push_back({p.meshId, simd_make_float3(p.world[12], p.world[13], p.world[14]), gap});
             }

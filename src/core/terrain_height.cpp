@@ -116,8 +116,8 @@ double MapSampler::value(double x, double z, double* dpx, double* dpz) const {
 
 struct TerrainDetail::Flat {
     double cx, cy, cz;
-    double ax, az, lenX;  // axis X in the ground plane, scaled to its full length
-    double bx, bz, lenZ;  // axis Z likewise
+    double ax, az, lenX;  // shape axis +0x20 in the ground plane, scaled to its half extent lenX (+0x74)
+    double bx, bz, lenZ;  // shape axis +0x30 likewise (+0x78); corners cut where its projection < 0
     double nx, nz;        // normalised file axis Y (x, z): the plane slope (no division by n.y)
     double invMargin, strength;
     uint8_t priority;
@@ -265,13 +265,19 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
         const double N[3] = {rdf(b, r + 20), rdf(b, r + 24), rdf(b, r + 28)};
         const double Z[3] = {rdf(b, r + 36), rdf(b, r + 40), rdf(b, r + 44)};
         s.cx = rdf(b, r + 52), s.cy = rdf(b, r + 56), s.cz = rdf(b, r + 60);
+        // The file axes span the whole surface: the loader 0x77d480 hands SetShape 0x79c330 the
+        // axis v / (0.5 |v|^2) (0.5 = [0x9960c0]) and SetShape keeps 1 / |axis| = |v| / 2 as the
+        // half extent (+0x74 / +0x78), the distance 0x799020 projects onto the same axes (p35 F1).
         auto ground = [](const double v[3], double& gx, double& gz, double& len) {
-            len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            len = 0.5 * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
             const double h = std::hypot(v[0], v[2]);
             gx = h > 0 ? v[0] * len / h : 0, gz = h > 0 ? v[2] * len / h : 0;
         };
-        ground(X, s.ax, s.az, s.lenX);
-        ground(Z, s.bx, s.bz, s.lenZ);
+        // The loader passes the file X axis as SetShape's ECX (-> +0x30, half extent +0x78) and the
+        // Z axis as EDX (-> +0x20, +0x74); 0x799020 cuts the rounded corners on the side where the
+        // +0x30 projection is negative. Here the first axis is +0x20 (file Z), the second +0x30.
+        ground(Z, s.ax, s.az, s.lenX);
+        ground(X, s.bx, s.bz, s.lenZ);
         const double nl = std::sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
         if (s.lenX < 1e-3 || s.lenZ < 1e-3 || nl < 1e-6) continue;
         s.nx = N[0] / nl, s.nz = N[2] / nl;
@@ -288,6 +294,7 @@ TerrainDetail::TerrainDetail(const DpcFile& world, MapSampler base) : base_(std:
         // +0x78 height map index and +0x7f noise flag: none in USA1 (all 0xffff / 0).
         const auto idx = uint32_t(flats_.size());
         flats_.push_back(s);
+        flatRaw_.emplace_back(b.begin() + long(r), b.begin() + long(r + 0x83));  // whole record
         const double rx = std::fabs(s.ax) + std::fabs(s.bx), rz = std::fabs(s.az) + std::fabs(s.bz);
         for (int cz = int(std::floor((s.cz - rz) / kCell)); cz <= int(std::floor((s.cz + rz) / kCell)); ++cz)
             for (int cx = int(std::floor((s.cx - rx) / kCell)); cx <= int(std::floor((s.cx + rx) / kCell)); ++cx)
@@ -638,6 +645,27 @@ double TerrainDetail::insideDistance(const Flat& s, double x, double z, double j
         if (v < 0) d -= std::max(0.0, 15.0 - std::hypot(eX, eZ));
     }
     return d - jitter;
+}
+
+std::vector<TerrainDetail::FileFlatInfo> TerrainDetail::fileFlatsAt(double x, double z) const {
+    std::vector<FileFlatInfo> out;
+    const auto it = flatCells_.find(cellKey(int32_t(std::floor(x / kCell)), int32_t(std::floor(z / kCell))));
+    if (it == flatCells_.end()) return out;
+    for (uint32_t i : it->second) {
+        const Flat& s = flats_[i];
+        const double dx = x - s.cx, dz = z - s.cz;
+        if (std::fabs(dx) > std::fabs(s.ax) + std::fabs(s.bx) + 2.5 || std::fabs(dz) > std::fabs(s.az) + std::fabs(s.bz) + 2.5) continue;
+        out.push_back({i, s.cx, s.cy, s.cz, s.lenX, s.lenZ, insideDistance(s, x, z, 0), s.cy - (s.nx * dx + s.nz * dz), s.strength,
+                       1.0 / s.invMargin, s.priority, s.listB, s.ellipse, flatRaw_[i]});
+    }
+    return out;
+}
+
+TerrainDetail::FileFlatInfo TerrainDetail::fileFlat(uint32_t i, double x, double z) const {
+    const Flat& s = flats_.at(i);
+    const double dx = x - s.cx, dz = z - s.cz;
+    return {i, s.cx, s.cy, s.cz, s.lenX, s.lenZ, insideDistance(s, x, z, 0), s.cy - (s.nx * dx + s.nz * dz), s.strength, 1.0 / s.invMargin,
+            s.priority, s.listB, s.ellipse, flatRaw_[i]};
 }
 
 // FlatSurface_CombineHeight 0x79b870 over list A or B; edits y, returns min(d, 1) of the

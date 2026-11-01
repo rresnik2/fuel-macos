@@ -21,6 +21,7 @@ struct Outcome {
 };
 
 Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer, const fuel::Heightfield& terrain) {
+    streamer.setMission(e.id);  // its course sub-world, as the mission's teleport streams it in (p35)
     const fuel::Race& r = e.race;
     const int mode = r.gameMode();
     // Opponents without vehicles: they wait on their grid spots (hunted racers along their path,
