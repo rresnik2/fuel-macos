@@ -95,6 +95,7 @@ struct VertexOut {
     float3 m0, m1, m2;  // the instance's rotation (for object-space normal maps)
     float3 tint;        // local ground colour x2, for grey foliage and rock textures
     uint sprite [[flat]];
+    float fade [[flat]];  // 1 - the object's fade alpha (Lod_Z / Mesh_Z ComputeFade, p36); 0 = opaque
 };
 
 // ---- FUEL's cascaded sun shadow (p26-work/shadows.md S1): 4 orthographic slices stacked in one
@@ -259,8 +260,11 @@ float3 groundGrade(float3 c) {
 vertex VertexOut vsMain(VertexIn in [[stage_in]], constant FrameUniforms& f [[buffer(1)]],
                         const device float4x4* models [[buffer(2)]], constant uint& sprite [[buffer(3)]],
                         texture2d<float> groundColour [[texture(0)]], uint iid [[instance_id]]) {
-    const float4x4 model = models[iid];
+    // Placed objects carry 1 - fade alpha in column 0's w (0 for every affine world matrix).
+    float4x4 model = models[iid];
     VertexOut o;
+    o.fade = model[0].w;
+    model[0].w = 0.0;
     o.tint = float3(1.0);
     o.sprite = sprite;
     if (f.fog.y > 0.0) {
@@ -307,7 +311,8 @@ struct ShadowOut {
 
 vertex ShadowOut vsShadow(VertexIn in [[stage_in]], constant ShadowUniforms& su [[buffer(1)]],
                           const device float4x4* models [[buffer(2)]], constant uint& sprite [[buffer(3)]], uint iid [[instance_id]]) {
-    const float4x4 model = models[iid];
+    float4x4 model = models[iid];
+    model[0].w = 0.0;  // the fade slot (vsMain)
     float4 w = model * float4(in.position, 1.0);
     if (sprite != 0) {
         // Billboards face the light camera and move by the constant ReAddShadowBias.
@@ -346,6 +351,13 @@ fragment float4 fsMain(VertexOut in [[stage_in]], bool front [[front_facing]],
     // Codes 17 and 20 use sheets whose left half is the intact part and the
     // right half the damaged one; draw the intact half (bBroken, break amount 0).
     float2 uvHalf = (m.code == 17 || m.code == 20) ? float2(in.uv.x * 0.5, in.uv.y) : in.uv;
+    if (in.fade > 0.0) {
+        // Port: FUEL fades objects over the last 20 m of their view distance (view+0x160 alpha); the
+        // port dissolves them with a 4x4 ordered dither instead of sorting blended objects.
+        const uint2 q = uint2(in.position.xy) & 3u;
+        const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+        if ((bayer[q.y * 4 + q.x] + 0.5) / 16.0 < in.fade) discard_fragment();
+    }
     float4 d = tDiffuse.sample(smp, uvHalf);
     if (in.sprite != 0) {
         // Port: leaves take the ground's hue with only mild darkening (some leaf textures are dark).
@@ -2288,6 +2300,75 @@ size_t MeshRenderer::setWorldInstances(const std::vector<MeshInstance>& instance
     return worldInstances_.size();
 }
 
+size_t MeshRenderer::setLodObjects(const std::vector<PlacedMesh>& objects, int set) {
+    std::vector<LodObject>& list = lodObjects_[size_t(set & 1)];
+    list.clear();
+    list.reserve(objects.size());
+    size_t drawable = 0;
+    for (const PlacedMesh& p : objects) {
+        LodObject o;
+        o.p = p;
+        for (size_t c = 0; c < 4; ++c) o.world.columns[c] = simd_make_float4(p.world[c * 4], p.world[c * 4 + 1], p.world[c * 4 + 2], p.world[c * 4 + 3]);
+        bool any = false;
+        for (uint32_t id : p.levels) {
+            std::string err;
+            const GpuMesh* gm = loadMesh(id, &err);
+            if (gm != nullptr && gm->indices == nil) gm = nullptr;
+            o.levels.push_back(gm);
+            any = any || gm != nullptr;
+        }
+        drawable += any;
+        list.push_back(std::move(o));  // kept in input order (setLodHidden indexes)
+    }
+    if (set == 0) lodHidden_.assign(list.size(), 0);
+    return drawable;
+}
+
+// Per frame: FUEL's Lod_Z::Draw level and fade for every placed object (world.cpp lodLevel /
+// placementAlpha), grouped by mesh into one buffer per frame.
+void MeshRenderer::evaluateLodObjects(simd_float3 eye) {
+    const auto t0 = std::chrono::steady_clock::now();
+    lodVisible_.clear();
+    lodGroups_.clear();
+    lodDrawn_ = lodFading_ = 0;
+    lodSetDrawn_[0] = lodSetDrawn_[1] = 0;
+    if (lodObjects_[0].empty() && lodObjects_[1].empty()) return;
+    std::unordered_map<const GpuMesh*, std::vector<simd_float4x4>> byMesh;
+    for (size_t set = 0; set < 2; ++set)
+    for (size_t i = 0; i < lodObjects_[set].size(); ++i) {
+        const LodObject& o = lodObjects_[set][i];
+        if (set == 0 && i < lodHidden_.size() && lodHidden_[i]) continue;
+        const simd_float3 t = o.world.columns[3].xyz;  // node world T (node+0xd4 row 3)
+        const float d = simd_distance(t, eye);
+        const int level = lodLevel(o.p, d, lodView);
+        const GpuMesh* gm = level < int(o.levels.size()) ? o.levels[size_t(level)] : nullptr;
+        const float a = placementAlpha(o.p, level, d, lodView);
+        if (gm == nullptr) continue;
+        if (!(a >= 0.01f)) continue;
+        simd_float4x4 w = o.world;
+        w.columns[0].w = a >= 1.0f ? 0.0f : 1.0f - a;
+        lodFading_ += a < 1.0f;
+        lodVisible_.push_back({gm, w});
+        byMesh[gm].push_back(w);
+        lodSetDrawn_[set]++;
+    }
+    lodDrawn_ = lodVisible_.size();
+    static const bool trace = std::getenv("FUEL_LOD_TRACE") != nullptr;
+    if (trace && frame_ % 30 == 0)
+        std::printf("lod frame %llu: %zu + %zu objects, %zu + %zu drawn, %zu fading, %.3f ms\n", (unsigned long long)frame_, lodObjects_[0].size(),
+                    lodObjects_[1].size(), lodSetDrawn_[0], lodSetDrawn_[1], lodFading_,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    const size_t bytes = std::max<size_t>(1, lodVisible_.size()) * sizeof(simd_float4x4);
+    id<MTLBuffer> buf = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    auto* dst = static_cast<simd_float4x4*>(buf.contents);
+    size_t at = 0;
+    for (const auto& [gm, worlds] : byMesh) {
+        std::memcpy(dst + at, worlds.data(), worlds.size() * sizeof(simd_float4x4));
+        lodGroups_.push_back({gm, buf, uint32_t(worlds.size()), uint32_t(at * sizeof(simd_float4x4))});
+        at += worlds.size();
+    }
+}
+
 size_t MeshRenderer::setPropInstances(const std::vector<MeshInstance>& instances) {
     propInstances_.clear();
     std::unordered_map<const GpuMesh*, std::vector<simd_float4x4>> byMesh;
@@ -2496,6 +2577,7 @@ void MeshRenderer::encodeShadows(id<MTLCommandBuffer> cb, FrameUniforms& fu, con
                 for (const Instance& inst : ov.instances) consider(inst);
         for (const Instance& inst : worldInstances_) consider(inst);
         for (const Instance& inst : propInstances_) consider(inst);
+        for (const Instance& inst : lodVisible_) consider(inst);
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.depthAttachment.texture = shadowMap_;
@@ -2664,6 +2746,7 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
             it = chunkFrame_ - it->second.lastFrame > 240 ? chunkGpu_.erase(it) : std::next(it);
     }
 
+    evaluateLodObjects(eye);  // p36: per-object LOD level and fade from this frame's camera
     // ---- FUEL's lights, scattering and shadow slices for this frame (P28), then the scene pass.
     fu.paint = simd_make_float4(paint_.color.x, paint_.color.y, paint_.color.z, 1);  // gamma space, like the game
     fillAtmosphere(fu, eye, fu.viewProj, 0, aspect, zn);
@@ -2744,6 +2827,11 @@ void MeshRenderer::encode(id<MTLRenderCommandEncoder> enc, float aspect, const O
         for (const WorldGroup& g : propGroups_) {
             if (g.mesh->draws[pass].empty()) continue;
             [enc setVertexBuffer:g.matrices offset:0 atIndex:2];
+            drawMesh(*g.mesh, g.count);
+        }
+        for (const WorldGroup& g : lodGroups_) {  // placed objects at this frame's level and fade (p36)
+            if (g.mesh->draws[pass].empty()) continue;
+            [enc setVertexBuffer:g.matrices offset:g.offset atIndex:2];
             drawMesh(*g.mesh, g.count);
         }
     };

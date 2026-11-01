@@ -18,6 +18,7 @@ add_library(fuelcore STATIC
   src/core/resources.cpp
   src/core/vehicle.cpp
   src/core/world.cpp
+  src/core/automesh.cpp
   src/core/terrain.cpp
   src/core/terrain_height.cpp
   src/core/terrain_mesh.cpp

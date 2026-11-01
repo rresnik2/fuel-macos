@@ -359,15 +359,30 @@ WorldStreamer::WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds,
     for (const fuel::DpcFile* sub : subWorlds) {
         const auto subIndex = uint16_t(subFiles_.size());
         subFiles_.push_back(std::filesystem::path(sub->path()).filename().string());
-        for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, lookup)) {
-            const float x = pm.world[12], z = pm.world[14];
-            if (std::fabs(x) < 50 && std::fabs(z) < 50) continue;  // stray objects at the origin
-            const auto index = uint32_t(placed_.size());
-            placed_.push_back({pm.meshId, pm.world, pm.fitToGround, pm.groundNormal, subIndex});
-            cells_[cellKey(int64_t(std::floor(x / kCell)), int64_t(std::floor(z / kCell)))].push_back(index);
-            addObstacle(pm);
-        }
+        for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, lookup)) addPlacement(pm, subIndex);
     }
+}
+
+void WorldStreamer::addPlacement(const fuel::PlacedMesh& pm, uint16_t sub) {
+    const float x = pm.world[12], z = pm.world[14];
+    if (std::fabs(x) < 50 && std::fabs(z) < 50) return;  // stray objects at the origin
+    const auto index = uint32_t(placed_.size());
+    Placed p;
+    static_cast<fuel::PlacedMesh&>(p) = pm;
+    p.sub = sub;
+    placed_.push_back(std::move(p));
+    cells_[cellKey(int64_t(std::floor(x / kCell)), int64_t(std::floor(z / kCell)))].push_back(index);
+    addObstacle(pm);
+    lodDirty_ = true;
+}
+
+void WorldStreamer::addResident(const fuel::DpcFile& usa1) {
+    const auto subIndex = uint16_t(subFiles_.size());
+    subFiles_.push_back(std::filesystem::path(usa1.path()).filename().string());
+    if (!subActive_.empty()) subActive_.push_back(1), subRef_.push_back(-1);
+    size_t n = 0;
+    for (const fuel::PlacedMesh& pm : fuel::collectWorldRootMeshes(usa1, lookup_)) addPlacement(pm, subIndex), ++n;
+    if (std::getenv("FUEL_STREAM_TRACE")) std::printf("USA1 world-root placements: %zu\n", n);
 }
 
 void WorldStreamer::setSubWorlds(std::vector<fuel::SubWorldRef> refs) {
@@ -578,6 +593,24 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
         }
     }
     if (lakes_ && ground_ && terrain_) buildWater(player, bg);
+    static const bool noAuto = std::getenv("FUEL_NO_AUTOMESH") != nullptr;
+    if (autoMesh_ && !noAuto && ground_ && terrain_ && terrain_->detail) {
+        fuel::AutoMesh::Context ctx;
+        ctx.terrain = terrain_;
+        ctx.ground = ground_;
+        ctx.roads = terrain_->roads.get();
+        ctx.lines = roads_;
+        ctx.types = ctx.roads ? &ctx.roads->types() : nullptr;
+        ctx.free = [this](double x, double z, float) { return !nearObstacle(x, z, 0.0f); };  // W[0] (port: placed objects' circles)
+        const auto t0 = std::chrono::steady_clock::now();
+        autoMesh_->generate(ctx, player.x, player.z, bg.autoObjects);
+        bg.haveAuto = true;
+        if (std::getenv("FUEL_STREAM_TRACE")) {
+            const fuel::AutoMesh::Stats st = autoMesh_->lastStats();
+            std::printf("automesh: %zu new cells, %zu cell objects, %zu road objects, %zu parts in %.1f ms\n", st.cells, st.cellObjects,
+                        st.roadObjects, st.parts, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+    }
     return bg;
 }
 
@@ -730,12 +763,34 @@ void WorldStreamer::applySolids(fuel::DriveWorld& physics) {
     }
     std::vector<std::pair<uint32_t, std::array<double, 16>>> solid = cellSolid_;
     for (const auto& m : trunks_) solid.push_back({kTrunkShape, m});
+    for (const auto& [mesh, m] : autoSolid_) {  // AutoMesh buildings and big props (real world objects in FUEL)
+        if (!physics.hasStaticShape(mesh)) {
+            fuel::CollisionMesh cm;
+            try {
+                cm = fuel::loadCollisionMesh(lookup_, mesh);
+            } catch (const std::exception&) {
+            }
+            if (cm.radius < 3.0f) cm.indices.clear();
+            physics.addStaticShape(mesh, cm.positions, cm.indices);
+        }
+        solid.push_back({mesh, m});
+    }
     if (std::getenv("FUEL_STREAM_TRACE")) std::printf("solids: %zu placed, %zu trunks\n", cellSolid_.size(), trunks_.size());
     physics.setStaticObjects(solid);
 }
 
 void WorldStreamer::applyBackground(Background&& bg, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics) {
     trunks_ = std::move(bg.trunks);
+    if (bg.haveAuto) {
+        autoSolid_.clear();
+        for (const fuel::PlacedMesh& p : bg.autoObjects)
+            if (std::hypot(p.world[12] - last_.x, p.world[14] - last_.z) <= kCollideRadius) {
+                std::array<double, 16> m;
+                for (size_t k = 0; k < 16; ++k) m[k] = p.world[k];
+                autoSolid_.push_back({p.meshId, m});
+            }
+        renderer.setLodObjects(bg.autoObjects, 1);
+    }
     applySolids(physics);
     plantDraw_ = std::move(bg.plants);
     std::vector<fuel::MeshInstance> draw = cellDraw_;
@@ -759,6 +814,7 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
     pollBackground(renderer, physics);
     if (refreshActive(player)) {
         force = true;
+        lodDirty_ = true;
         for (auto it = props_.begin(); it != props_.end();) {  // detached sub-worlds take their props along
             if (active(placed_[it->first])) {
                 ++it;
@@ -775,7 +831,9 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
     last_ = player;
     std::vector<fuel::MeshInstance> draw;
     std::vector<std::pair<uint32_t, std::array<double, 16>>> solid;
-    const int64_t r = int64_t(std::ceil(kDrawRadius / kCell));
+    // Drawing: every active placement goes to the renderer, which picks its level and fade each
+    // frame like Lod_Z::Draw (p36); this loop only makes props and collision near the player.
+    const int64_t r = int64_t(std::ceil(kCollideRadius / kCell));
     const int64_t cx = int64_t(std::floor(player.x / kCell)), cz = int64_t(std::floor(player.z / kCell));
     for (int64_t dz = -r; dz <= r; ++dz)
         for (int64_t dx = -r; dx <= r; ++dx) {
@@ -784,7 +842,7 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
             for (uint32_t i : it->second) {
                 const Placed& p = placed_[i];
                 const float d = std::hypot(p.world[12] - player.x, p.world[14] - player.z);
-                if (d > kDrawRadius || !active(p)) continue;
+                if (d > kCollideRadius || !active(p)) continue;
                 if (props_.count(i)) continue;  // drawn from the prop list
                 if (d <= kPropRadius) {
                     // Small objects become movable props (cached radius per mesh).
@@ -810,9 +868,6 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
                         continue;
                     }
                 }
-                simd_float4 cols[4];
-                for (size_t c = 0; c < 4; ++c) cols[c] = simd_make_float4(p.world[c * 4], p.world[c * 4 + 1], p.world[c * 4 + 2], p.world[c * 4 + 3]);
-                draw.push_back({p.meshId, simd_matrix(cols[0], cols[1], cols[2], cols[3])});
                 if (d > kCollideRadius) continue;
                 if (auto mr = meshRadius_.find(p.meshId); mr != meshRadius_.end() && mr->second >= 0.4f && mr->second < 3.0f) continue;  // a prop
                 if (!physics.hasStaticShape(p.meshId)) {
@@ -834,6 +889,21 @@ void WorldStreamer::update(simd_float3 player, fuel::MeshRenderer& renderer, fue
             }
         }
     cellDraw_ = std::move(draw);
+    if (lodDirty_) {
+        lodDirty_ = false;
+        std::vector<fuel::PlacedMesh> list;
+        lodIndex_.assign(placed_.size(), -1);
+        for (size_t i = 0; i < placed_.size(); ++i)
+            if (active(placed_[i])) lodIndex_[i] = int32_t(list.size()), list.push_back(placed_[i]);
+        const size_t n = renderer.setLodObjects(list);
+        if (std::getenv("FUEL_STREAM_TRACE")) std::printf("lod objects: %zu active placements, %zu drawable\n", list.size(), n);
+    }
+    {
+        std::vector<uint32_t> hidden;
+        for (const auto& [i, prop] : props_)
+            if (i < lodIndex_.size() && lodIndex_[i] >= 0) hidden.push_back(uint32_t(lodIndex_[i]));
+        renderer.setLodHidden(hidden);
+    }
     if (force) {  // teleports and the first frame: build everything now
         if (job_.valid()) (void)job_.get();
         rerun_ = false;

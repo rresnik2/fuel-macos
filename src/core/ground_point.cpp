@@ -101,7 +101,8 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
     }
     // Maps used here: 2 humidity, 8 population, 10 rock (Terrain_Map10); colours (p16):
     // 3 clay, 4 colour layer, 5 volcano, 6 chalk, 7 forest, 9 occlusion, 13 incinerated, 18 (ctx+0x184).
-    for (int slot : {2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 18}) {
+    // 14 stormed, 15 flooded, 16 sanded: AutoMesh's climate test (p36).
+    for (int slot : {2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 18}) {
         if (size_t(slot) >= mapIds.size() || mapIds[size_t(slot)] == 0) continue;
         if (const DpcFile::Entry* e = world.find(mapIds[size_t(slot)]))
             if (const auto mb = world.body(*e)) {

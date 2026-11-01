@@ -24,6 +24,7 @@
 #include "core/terrain.hpp"
 #include "core/terrain_mesh.hpp"
 #include "core/vehicle.hpp"
+#include "core/world.hpp"
 
 #include <algorithm>
 #include <array>
@@ -140,6 +141,21 @@ public:
     // World objects drawn with the scene (not part of its bounds); meshes
     // load on first use. Returns the number of instances that could be shown.
     size_t setWorldInstances(const std::vector<MeshInstance>& instances);
+    // Placed objects with FUEL's per-object level of detail and fade (p36): each frame picks the
+    // level (Lod_Z::Draw 0x884170) and the fade alpha (ComputeFade 0x672950) from the camera
+    // distance; faded-out objects are not drawn. Returns the number of objects kept.
+    // set 0: placed objects (sub-worlds, USA1), set 1: AutoMesh / RoadMesh spawns.
+    size_t setLodObjects(const std::vector<PlacedMesh>& objects, int set = 0);
+    // Objects (indexes into the last setLodObjects list) not to draw (e.g. those that became props).
+    void setLodHidden(const std::vector<uint32_t>& indexes) {
+        lodHidden_.assign(lodObjects_[0].size(), 0);
+        for (uint32_t i : indexes)
+            if (i < lodHidden_.size()) lodHidden_[i] = 1;
+    }
+    fuel::LodView lodView;  // FUEL's main view factors (world.hpp)
+    // Objects drawn / fading in the last frame (FUEL_STREAM_TRACE).
+    size_t lodDrawn() const { return lodDrawn_; }
+    size_t lodFading() const { return lodFading_; }
     // A small second list for props the physics moves; cheap to call every frame.
     size_t setPropInstances(const std::vector<MeshInstance>& instances);
     // Race beacons: xyz = ground position, w = kind (0 next checkpoint,
@@ -411,9 +427,21 @@ private:
         const GpuMesh* mesh;
         id<MTLBuffer> matrices;
         uint32_t count;
+        uint32_t offset = 0;  // bytes into `matrices`
     };
     std::vector<WorldGroup> worldGroups_;   // instanced draws
     std::vector<Instance> propInstances_;   // movable props (shadow casters)
+    struct LodObject {
+        PlacedMesh p;
+        simd_float4x4 world;
+        std::vector<const GpuMesh*> levels;  // nullptr = not drawable
+    };
+    std::array<std::vector<LodObject>, 2> lodObjects_;
+    std::vector<char> lodHidden_;
+    std::vector<Instance> lodVisible_;      // this frame's levels (shadow casters; fade in column 0 w)
+    std::vector<WorldGroup> lodGroups_;     // this frame's instanced draws
+    size_t lodDrawn_ = 0, lodFading_ = 0, lodSetDrawn_[2] = {0, 0};
+    void evaluateLodObjects(simd_float3 eye);
     std::vector<WorldGroup> propGroups_;
     std::vector<int> inputToInstance_;  // setScene input index -> instance, or -1
     struct OtherVehicle {
