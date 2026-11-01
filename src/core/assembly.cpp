@@ -187,7 +187,9 @@ Node parseNodeBody(const std::vector<uint8_t>& body) {
     n.objectData = r.u32();
     n.userDefine = r.u32();
     n.light = r.u32();
-    r.raw(8 + 0x82);  // two unused links, the transform block
+    r.raw(8 + 0x34);  // two unused links, the transform block up to node+0x44
+    n.lodScale = r.f32();
+    r.raw(0x82 - 0x38);
     for (float& f : n.world) f = r.f32();
     return n;
 }
@@ -230,7 +232,9 @@ Lod parseLodBody(const std::vector<uint8_t>& body) {
     ByteReader r(body);
     Lod l;
     l.spheres = readNamedPoints(r);
-    r.raw(12);
+    l.nearFade = r.f32();
+    l.hardCull = r.f32();
+    l.baseDistance = r.f32();
     l.objects = r.u32Array(kListLimit);
     r.u32();
     for (int i = 0; i < 2; ++i)

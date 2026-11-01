@@ -1969,6 +1969,7 @@ int main(int argc, const char** argv) {
                                 renderer.setFoliage(std::move(foliage));
                             }
                             streamer->setVegetation(vegetation.get(), terrain.get());
+                            streamer->addResident(*f);  // USA1's own scene placements (World_Z root, p36)
                             streamer->setSubWorlds(fuel::loadSubWorldRefs(*f));  // FUEL's region / course streaming (p35)
                             streamer->setSurfaces([](double x, double z) { return gSurfaces.at(x, z); });
                             roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(*f));
@@ -2025,6 +2026,14 @@ int main(int argc, const char** argv) {
                             }
                             streamer->setGround(ground.get());
                             renderer.setGrassAtlas(ground->grassAtlas());
+                            try {  // FUEL's AutoMesh / RoadMesh objects (p36)
+                                auto am = std::make_unique<fuel::AutoMesh>((fs::path(opt.dataDir) / "CommonComponent").string(), *f, lookup);
+                                std::printf("automesh: %zu + %zu + %zu cell rules, %zu road rules, %zu templates\n", am->ruleCount(0), am->ruleCount(1),
+                                            am->ruleCount(2), am->ruleCount(3), am->templateCount());
+                                if (am->valid()) streamer->setAutoMesh(std::move(am));
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "fuelview: automesh: %s\n", e.what());
+                            }
                         } catch (const std::exception& e) {
                             std::fprintf(stderr, "fuelview: vegetation: %s\n", e.what());
                         }

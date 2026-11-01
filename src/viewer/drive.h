@@ -4,6 +4,7 @@
 #include <simd/simd.h>
 
 #include "core/assembly.hpp"
+#include "core/automesh.hpp"
 #include "core/roads.hpp"
 #include "core/vegetation.hpp"
 #include "core/world.hpp"
@@ -145,7 +146,7 @@ private:
 };
 
 // Streams the static world around the player: every object the sub-worlds
-// place, drawn within kDrawRadius and solid within kCollideRadius.
+// place, drawn with FUEL's per-object LOD and fade (renderer setLodObjects) and solid within kCollideRadius.
 class WorldStreamer {
 public:
     WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds, const std::vector<const fuel::DpcFile*>& lookup);
@@ -155,6 +156,9 @@ public:
         if (tileJob_.valid()) tileJob_.wait();
     }
     size_t placementCount() const { return placed_.size(); }
+    // USA1.DPC's own drawn placements (collectWorldRootMeshes, p36); always loaded like FUEL's
+    // resident groups. Call once after construction.
+    void addResident(const fuel::DpcFile& usa1);
     // FUEL's sub-world streaming (p35, decode P31 out-F): with the WorldRef table, only the two
     // nearest regions within 5000 m and the course of the running mission are drawn and solid;
     // without it every sub-world is. `mission` = the event id ("" = free roam: no course).
@@ -168,6 +172,9 @@ public:
     void setRoads(const fuel::RoadNetwork* roads) { roads_ = roads; }
     // Lake water meshes around the player (needs setGround).
     void setLakes(const fuel::Lakes* lakes) { lakes_ = lakes; }
+    // FUEL's AutoMesh / RoadMesh objects (core/automesh.hpp), generated with the plants on the
+    // worker (needs setVegetation, setGround and setRoads first). FUEL_NO_AUTOMESH=1 disables.
+    void setAutoMesh(std::unique_ptr<fuel::AutoMesh> a) { autoMesh_ = std::move(a); }
     // Call every frame; refreshes after the player has moved a little.
     void update(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics, bool force = false);
     // Waits for every worker job, then rebuilds everything (objects, plants, roads, grass,
@@ -198,7 +205,7 @@ public:
     bool nearestProp(simd_float3 from, const std::vector<simd_float3>& skip, simd_float3& out) const;
 
 private:
-    static constexpr float kCell = 256.0f, kDrawRadius = 1500.0f, kCollideRadius = 250.0f;
+    static constexpr float kCell = 256.0f, kCollideRadius = 250.0f;
     // Decor draw distances follow FUEL's decor quadtree (see decorChunkSize in drive.mm):
     // FUEL's trees end with the 384 m chunks (camera within 2.0625 x 768 m of the 768 m
     // chunk centre, so at most ~2130 m away), bushes with the 96 m chunks, full meshes
@@ -220,7 +227,12 @@ private:
         bool haveWater = false;
         std::vector<fuel::MeshInstance> plants;
         std::vector<std::array<double, 16>> trunks;  // solid cylinders for nearby trees (row-vector matrices)
+        bool haveAuto = false;
+        std::vector<fuel::PlacedMesh> autoObjects;   // AutoMesh / RoadMesh spawns (renderer set 1)
+        size_t autoRoadFrom = 0;                     // road furniture from here on (not solid)
     };
+    std::unique_ptr<fuel::AutoMesh> autoMesh_;
+    std::vector<std::pair<uint32_t, std::array<double, 16>>> autoSolid_;  // big AutoMesh objects near the player
     Background buildBackground(simd_float3 player) const;
     void buildWater(simd_float3 player, Background& bg) const;
     void applyBackground(Background&& bg, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
@@ -232,12 +244,13 @@ private:
     bool rerun_ = false;      // the player moved on while the job ran
     std::vector<fuel::MeshInstance> cellDraw_, plantDraw_;  // the static world's draw list, in two halves
     const fuel::Heightfield* terrain_ = nullptr;
-    struct Placed {
-        uint32_t meshId;
-        std::array<float, 16> world;  // row-vector convention
-        bool fitToGround = false, groundNormal = false;
+    struct Placed : fuel::PlacedMesh {  // with its level-of-detail data (p36)
         uint16_t sub = 0;  // index into subFiles_
     };
+    void addPlacement(const fuel::PlacedMesh& pm, uint16_t sub);
+    // The renderer's object list (setLodObjects): placement index -> list index, or -1.
+    std::vector<int32_t> lodIndex_;
+    bool lodDirty_ = true;  // the active set changed: hand the renderer a new list
     std::vector<std::string> subFiles_;  // the sub-world DPC file names, in constructor order
     std::vector<fuel::SubWorldRef> refs_;
     std::vector<int> subRef_;            // per sub-world file: index into refs_ (-1 = not streamed)

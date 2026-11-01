@@ -47,6 +47,7 @@ struct Node {
     uint32_t objectData = 0;  // MeshData_Z, LodData_Z, ...
     uint32_t userDefine = 0;
     uint32_t light = 0;
+    float lodScale = 1;  // node+0x44 (transform block +0x34): the scale Lod_Z::Draw / ComputeFade use
     std::array<float, 16> world{};  // row-vector convention
 };
 Node parseNodeBody(const std::vector<uint8_t>& body);  // throws
@@ -81,6 +82,9 @@ std::vector<NodeGroup> parseGameObjBody(const std::vector<uint8_t>& body);  // t
 // Lod_Z body: named points, then one object per LOD level.
 struct Lod {
     std::vector<NamedSphere> spheres;
+    // Lod+0x7c near fade, +0x80 hard cull, +0x84 base distance D (metres; Lod_Z::Draw 0x884170,
+    // ComputeFade 0x672950, p6 W7/W8): level k is drawn from D * 2^(k-1) on (scaled, see world.hpp).
+    float nearFade = 0, hardCull = 0, baseDistance = 1;
     std::vector<uint32_t> objects;  // [0] = LOD1, ...
     // (animation slot, Animation_Z id) pairs; the rider's Lod_Z lists its poses here.
     std::vector<std::pair<uint32_t, uint32_t>> animations;

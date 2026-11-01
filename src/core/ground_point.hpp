@@ -126,6 +126,10 @@ public:
     void grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std::vector<GrassTuft>& out) const;
 
     const Permutation& permutation() const { return perm_; }
+    // A GenWorld map (bicubic sampler as the point evaluator reads it; slots 2, 7, 8, 13-16, 18...)
+    // and the forest density 0x6bd200, for AutoMesh's climate test 0x78b470 (p36).
+    float map(int slot, double x, double z) const { return mapAt(slot, x, z); }
+    float forest(double x, double z, float coarseNy) const { return forestDensity(x, z, coarseNy); }
     // Bitmap_Z of the Grass material's 4x4 tuft atlas (0 if not found).
     uint32_t grassAtlas() const { return grassAtlas_; }
 
