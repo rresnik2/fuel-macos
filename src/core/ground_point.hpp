@@ -142,7 +142,8 @@ private:
     float roadWeight(double x, double z, bool* nearRoad, float* tarmac = nullptr) const;
     void surfaceTypes(double x, double z, GroundPoint& p) const;
     void rockCover(double x, double z, GroundPoint& p, float coarseNy) const;
-    int fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover, float* random) const;
+    void coarseNormal(double x, double z, float n[3]) const;
+    int fieldType(double x, double z, const GroundPoint& p, bool nearRoad, float cover, float* random) const;
     float mapAt(int slot, double x, double z) const;
 
     const Heightfield* terrain_ = nullptr;

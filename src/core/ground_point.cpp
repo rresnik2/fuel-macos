@@ -313,8 +313,19 @@ void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarse
     p.rockSlope = clamp01(rockSlope - p.highGround);
 }
 
+// The coarse normal of the point context (ctx+0xe0, bit 26 / 0x45de10 on G+0xcc4).
+// APPROXIMATED by a 15 m central difference of the ground.
+void GroundGenerator::coarseNormal(double x, double z, float n[3]) const {
+    const Heightfield& t = *terrain_;
+    const double e = 15.0;
+    const double dx = (t.smoothHeightAt(x + e, z) - t.smoothHeightAt(x - e, z)) / (2 * e);
+    const double dz = (t.smoothHeightAt(x, z + e) - t.smoothHeightAt(x, z - e)) / (2 * e);
+    const double len = std::sqrt(dx * dx + 1 + dz * dz);
+    n[0] = float(-dx / len), n[1] = float(1 / len), n[2] = float(-dz / len);
+}
+
 // Point_Fields (0x6b9100).
-int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float coarseNy, bool nearRoad, float cover,
+int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, bool nearRoad, float cover,
                                float* random) const {
     if (!(p.normal[1] > 0.8707f) || !(p.height < 1500)) return 0;
     const float pop = mapAt(8, x, z);
@@ -327,7 +338,14 @@ int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, float c
     const float r = float(hashByte(perm_, cx * 12.317513 + cz * 10.193578)) / 255.0f;
     *random = r;
     int type = 0;
-    if (r > 0.3f && p.humidity > 0.2f && cover < 0.5f && !nearRoad && coarseNy > 0.98f) type = r < 0.33f ? 1 : 2;
+    if (r > 0.3f && p.humidity > 0.2f && cover < 0.5f && !nearRoad) {
+        // The coarse normal is tested at the field cell's centre (0x6b92c4-0x6b92f8: 0x45de10 on
+        // the centre buffer written by Fields_Cell 0x6b8820 at esp+0x18; n.y > 0.98 [0x9dcccc]),
+        // not at the point: a whole 200 m field appears or vanishes together.
+        float cn[3];
+        coarseNormal(cx, cz, cn);
+        if (cn[1] > 0.98f) type = r < 0.33f ? 1 : 2;
+    }
     if (u <= 0.0125f || v <= 0.0125f || u >= 0.9875f || v >= 0.9875f) return 0;
     if (nearRoad) return 0;  // +0x1bc <= 3N + 1 (it is 0 near roads, 1000 elsewhere)
     const float nf = clamp01((soft2(2 * f1fac_.at(x, z) - 1) + f6ed0_.at(x, z)) * 0.5f);
@@ -348,9 +366,9 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
         n[0] = float(-dx / len), n[1] = float(1 / len), n[2] = float(-dz / len);
     };
     normalAt(1.0, p.normal);
-    // Coarse normal (ctx+0xe0, the W+0xcc4 sampler): APPROXIMATED by a 15 m difference.
+    // Coarse normal (ctx+0xe0, the W+0xcc4 sampler).
     float coarse[3];
-    normalAt(15.0, coarse);
+    coarseNormal(x, z, coarse);
     // Humidity (bit 2): APPROXIMATED as the plain map (FUN_004dde20 adds terms not decoded).
     p.humidity = clamp01(mapAt(2, x, z));
     const float v = p.humidity, nxz = std::hypot(p.normal[0], p.normal[2]);
@@ -401,7 +419,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
         p.highGround = clamp01(hg - (2 - p.road) * p.road);
     }
     rockCover(x, z, p, coarse[1]);
-    p.field = fieldType(x, z, p, coarse[1], nearRoad, fs.cover, &p.fieldRandom);
+    p.field = fieldType(x, z, p, nearRoad, fs.cover, &p.fieldRandom);
     p.nearRoad = nearRoad;
     if (!full) return p;
 
