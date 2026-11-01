@@ -221,18 +221,29 @@ double GroundGenerator::insideDistance(const Surface& s, double x, double z) con
 // Point_FlatSurfaceWeights (0x79b480, bit 27).
 GroundGenerator::SurfaceWeights GroundGenerator::surfaceWeights(double x, double z) const {
     SurfaceWeights w;
-    const auto it = surfaceCells_.find(cellKey(int64_t(std::floor(x / kSurfaceCell)), int64_t(std::floor(z / kSurfaceCell))));
-    if (it == surfaceCells_.end()) return w;
-    float sum = 0, cover = 0, cut = 0, noise = 0, add = 0, keep = 0;
+    // ctx+0x304 starts at 1.0 (fld1 at 0x79b4ae), so with surfaces 0x304 = 1 - (1 + sum k (1 - k9c)) / sum k.
+    float sum = 0, cover = 0, cut = 0, noise = 0, add = 0, keep = 1;
     float jitter = -1;
-    for (uint32_t i : it->second) {
-        const Surface& s = surfaces_[i];
-        if (std::fabs(x - s.cx) > s.radius || std::fabs(z - s.cz) > s.radius) continue;
+    const auto it = surfaceCells_.find(cellKey(int64_t(std::floor(x / kSurfaceCell)), int64_t(std::floor(z / kSurfaceCell))));
+    if (it != surfaceCells_.end())
+        for (uint32_t i : it->second) {
+            const Surface& s = surfaces_[i];
+            if (std::fabs(x - s.cx) > s.radius || std::fabs(z - s.cz) > s.radius) continue;
+            if (jitter < 0) jitter = 5.0f * edgeJitter(x, z);
+            const double d = insideDistance(s, x, z) - jitter;
+            if (d <= 0) continue;
+            const float k = clamp01(float(d) * s.invMargin);
+            sum += k, cover += k, cut += k * s.grassCut, noise += k * s.grassNoise, add += k * s.grassAdd, keep += k * (1 - s.w9c);
+        }
+    // Procedural flat surfaces (0x799910, p34): grass fields from the constructor 0x74cb50
+    // (+0x90 = 1 -> cut, +0x94 = +0x98 = +0x9c = 0).
+    if (terrain_ != nullptr && terrain_->detail) {
         if (jitter < 0) jitter = 5.0f * edgeJitter(x, z);
-        const double d = insideDistance(s, x, z) - jitter;
-        if (d <= 0) continue;
-        const float k = clamp01(float(d) * s.invMargin);
-        sum += k, cover += k, cut += k * s.grassCut, noise += k * s.grassNoise, add += k * s.grassAdd, keep += k * (1 - s.w9c);
+        terrain_->detail->proceduralFlatsAt(x, z, jitter, [&](double d, double invMargin) {
+            if (d <= 0) return;
+            const float k = clamp01(float(d * invMargin));
+            sum += k, cover += k, cut += k, keep += k;
+        });
     }
     if (sum > 1e-6f) {
         const float inv = 1.0f / sum;
@@ -245,13 +256,17 @@ bool GroundGenerator::excludesPlants(double x, double z) const {
     // 0x7831e0 test 3: BigLake_MaxDepth 0x65a390 > 0.001 (inside a lake below its level).
     if (lakes_ != nullptr && terrain_ != nullptr && lakes_->depthAbove(x, z, terrain_->smoothHeightAt(x, z)) > 0.001) return true;
     const auto it = surfaceCells_.find(cellKey(int64_t(std::floor(x / kSurfaceCell)), int64_t(std::floor(z / kSurfaceCell))));
-    if (it == surfaceCells_.end()) return false;
+    if (it != surfaceCells_.end())
     for (uint32_t i : it->second) {
         const Surface& s = surfaces_[i];
         if (s.allowPlants || std::fabs(x - s.cx) > s.radius || std::fabs(z - s.cz) > s.radius) continue;
         if (insideDistance(s, x, z) > 0) return true;  // 0x79a850 calls the distance with no jitter
     }
-    return false;
+    // Procedural flat surfaces are list A (+0xa8 = 0): no plants on them either (p34).
+    bool inside = false;
+    if (terrain_ != nullptr && terrain_->detail)
+        terrain_->detail->proceduralFlatsAt(x, z, 0.0, [&](double d, double) { inside |= d > 0; });
+    return inside;
 }
 
 // Road weight (Point_RoadSampler 0x6fbab0 return value): 1 on the road, fading out over
@@ -330,12 +345,12 @@ void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarse
         // Lake / river bed (ctx+0x1ac > 0, 0x6b8d80): ctx+0x1e4 = (1 - t) (S2(w) + ctx+0x1e4) with
         // w = 2 (1 - ctx+0x248) ctx+0x198 - 1 (ctx+0x248 = Dune layer = 0 here) and
         // t = clamp(10 n.y - 5); applied after the cover / road / junction clamp, before high ground.
-        const float w = 2 * p.surfaceHumidity - 1;
+        const float w = 2 * (1 - clamp01(p.dune)) * p.surfaceHumidity - 1;  // ctx+0x248 = clamp(Dune)
         const float t = clamp01(10 * p.normal[1] - 5);
         rockSlope = (1 - t) * (soft2(w) + rockSlope);
     }
-    p.rock = clamp01(rock - p.highGround);  // - water (ctx+0x228, not ported)
-    p.rockSlope = clamp01(rockSlope - p.highGround);
+    p.rock = clamp01(rock - p.highGround - p.dune);  // - Dune ctx+0x228
+    p.rockSlope = clamp01(rockSlope - p.highGround - p.dune);
 }
 
 // The coarse normal of the point context (ctx+0xe0): Point_BaseNormal (bit 26, 0x6b9a40) takes the
@@ -410,10 +425,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     const float v = p.humidity, nxz = std::hypot(p.normal[0], p.normal[2]);
     p.surfaceHumidity = clamp01(v - nxz * clamp01(1 - v * v - (1 - v) * (1 - v)));
     bool nearRoad = false;
-    if (lakes_ != nullptr) {
-        const WaterPoint w = waterAt(*lakes_, x, z, p.height);
-        p.waterDepth = w.depth, p.waterBase = w.base, p.waterFade = w.fade;
-    }
+    float roadMin = 1e6f, roadT60 = 0, roadInside = 0;  // ctx+0x20c / 0x210 / 0x214 (bit 12)
     const SurfaceWeights fs = surfaceWeights(x, z);
     p.cover = fs.cover;
     // Bit 12 (0x6b9bb0): road weight plus the flat surfaces that clear grass.
@@ -444,8 +456,25 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
         p.junction = junction;
         p.roadEdge = rf.berm;
         nearRoad = rf.inside > 0;  // ctx+0x1bc = 0 when ctx+0x214 > 0, else 1000
+        roadMin = rf.minHeight, roadT60 = rf.maxT60, roadInside = rf.inside;
     } else {
         p.road = clamp01(roadWeight(x, z, &nearRoad, &p.tarmac) + clamp01(1 - (fs.add + fs.noise)) * fs.cut);
+    }
+    // Water, bits 6/13/18 (0x6b9560 over GenWorld_WaterQuery 0x6acf80: rivers and lakes; p34).
+    if (lakes_ != nullptr || (terrain_ != nullptr && terrain_->detail)) {
+        const WaterPoint w = waterAt(lakes_, terrain_ ? terrain_->detail.get() : nullptr, x, z, p.height);
+        float depth = w.depth;
+        if (depth > 0 && w.riverShare > 0.99f) {
+            // Pure river point: fords level the water to 2 m under the road, steep banks dry.
+            float T, f;
+            if (roadInside <= 0 || roadT60 <= 0) T = w.base, f = 1;
+            else T = std::max(0.0f, roadMin - p.height - 2) + w.base, f = 1 - roadInside / roadT60;
+            const float sl = clamp01((p.coarseNy - 0.707f) * 3.4129696f);
+            const float k = clamp01(sl * f - fs.cover);
+            if (T < depth) depth = T + (depth - T) * k;
+        }
+        p.waterDepth = depth, p.waterBase = w.base, p.waterFade = waterFade(depth, w.base);
+        p.riverShare = w.riverShare;
     }
     // Bit 4: high ground (p13 V2 0x4de850) minus road.
     {
@@ -453,6 +482,14 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
         a = clamp01(a - 2 * (1 - p.normal[1]));
         const float hg = contrast8(2 * a - 1) * 0.5f + 0.5f;
         p.highGround = clamp01(hg - (2 - p.road) * p.road);
+    }
+    // Bit 28 (0x6b9ad0): work-bump zone; bit 25 (0x6bb070): Dune = zone ? (zone == 3) :
+    // clamp(10 Dune_Offset(h, h0) - ctx+0x19c + ctx+0x300) (p34).
+    if (terrain_ != nullptr && terrain_->detail) {
+        const TerrainDetail& d = *terrain_->detail;
+        p.zone = d.workBumpZone(x, z);
+        if (p.zone != 0) p.dune = p.zone == 3 ? 1.0f : 0.0f;
+        else p.dune = clamp01(float(d.duneRelief(x, z, p.height, d.baseHeight(x, z))) * 10.0f - p.highGround + fs.add);
     }
     rockCover(x, z, p, coarse[1]);
     p.field = fieldType(x, z, p, nearRoad, fs.cover, &p.fieldRandom);
@@ -481,7 +518,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
                 g = 0;
             }
         }
-        g -= p.highGround;  // and water (ctx+0x228, not ported)
+        g -= p.highGround + p.dune;  // ctx+0x19c and Dune ctx+0x228
         // W+0xaaa == 0 (a runtime setting, value Unknown; the port takes 0): 4 m bare patches.
         g -= clamp01((f2f80_.at(x, z) - 1.3f) * 10);
         ground = g * band(slope, 0, 35 * kDeg, 5 * kDeg);
@@ -497,7 +534,11 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     // Bit 23: grass size.
     p.grassSize = clamp01(clamp01((1 - p.normal[1] - 0.1f) * 10) + s4c(ffd44_.at(x, z)) - (1 - fs.keep));
     // Bit 24 (0x6b8980): Stones; under water away from roads, Caillou (pebbles) too (water.md 1.8).
-    if (p.road <= 0.95f) {
+    if (p.road <= 0.95f && p.zone != 0) {
+        // Work-bump zone (ctx+0x240, 0x6b8980): zone 1 -> Stones, otherwise Caillou (pebbles).
+        p.caillou = p.zone == 1 ? 0.0f : 1.0f;
+        p.stones = p.zone == 1 ? 1.0f : 0.0f;
+    } else if (p.road <= 0.95f) {
         const float F = ffd44_.at(x, z);
         float st = 0, pc = 0;
         if (p.waterDepth > 0 && !p.nearRoad) {
@@ -513,9 +554,15 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
             st = nst * band(slope, 30 * kDeg, 45 * kDeg, 5 * kDeg) - p.grass;
         }
         const float v = clamp01(st - p.road + p.junction);
-        const float w = clamp01(soft6(2 * v - 1) - p.highGround);  // - Dune ctx+0x228 (0 without the Dune layer)
+        const float w = clamp01(soft6(2 * v - 1) - p.dune - p.highGround);  // - Dune ctx+0x228 - ctx+0x19c
         p.caillou = w * pc;
         p.stones = w * (1 - pc);
+    }
+    // Bit 22 (0x4df2f0): SandTexture ctx+0x220 = (2 - v) v, v = clamp(ctx+0x248 - (road + Grass +
+    // high ground)), ctx+0x248 = clamp(Dune) (bit 23, 0x6bb1f0).
+    {
+        const float v = clamp01(clamp01(p.dune) - (p.road + p.grass + p.highGround));
+        p.sand = (2 - v) * v;
     }
     surfaceTypes(x, z, p);
     return p;
@@ -712,7 +759,15 @@ void GroundGenerator::surfaceTypes(double x, double z, GroundPoint& p) const {
     const float v = clamp01(contrast8(2 * f3f54_.at(x, z) - 1) * 0.5f + 0.5f);  // 0x6a81f0
     for (const auto& [a, b] : {std::pair{38, 39}, {34, 35}, {32, 33}, {30, 31}, {11, 12}, {15, 16}, {22, 23}, {3, 4}, {8, 9}, {26, 27}})
         if (w[a] > 0.025f) w[b] = w[a] * (1 - v), w[a] *= v;
-    if (w[6] > 0.025f) w[7] = w[6] * (1 - v), w[6] *= v;  // dry land (under water: WETSAND 36/37)
+    if (w[6] > 0.025f) {
+        // Sand at the water's edge (ctx+0x1ac > 0 and > ctx+0x1b0 - 1) is WETSAND 36/37 (notes p22 S1).
+        if (p.waterDepth > 0 && p.waterDepth > p.waterBase - 1) {
+            w[36] = w[6], w[6] = 0;
+            if (w[36] > 0.025f) w[37] = w[36] * (1 - v), w[36] *= v;
+        } else {
+            w[7] = w[6] * (1 - v), w[6] *= v;
+        }
+    }
     // Keep weights > 0.025, strongest first, normalised by their total.
     int idx[kSurfaceTypes];
     int n = 0;

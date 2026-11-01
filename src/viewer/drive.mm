@@ -559,82 +559,133 @@ WorldStreamer::Background WorldStreamer::buildBackground(simd_float3 player) con
     return bg;
 }
 
-// Lake water around the player, by Paysage_BuildWaterMesh's rules (0x7fbc10, water.md 3.1) on
-// one 8 m grid (the engine builds it per terrain chunk at the chunk's vertex spacing).
+// Lake and river water around the player, by Paysage_BuildWaterMesh's rules (0x7fbc10, water.md
+// 3.1): lakes on one 8 m grid over 2 km, rivers (category 0xf, p34) on one 2 m grid over 384 m
+// (the engine builds both per terrain chunk at the chunk's vertex spacing). The vertex `pad`
+// carries the category for the shader: 0 lake (vh/ph_water), 1 river (vh_water_noanim /
+// ph_water_river).
 void WorldStreamer::buildWater(simd_float3 player, Background& bg) const {
-    constexpr int n = 257;
-    constexpr double sp = 8.0, half = sp * (n - 1) / 2;
-    const double ox = std::round(player.x / 64.0) * 64.0 - half, oz = std::round(player.z / 64.0) * 64.0 - half;
     bg.haveWater = true;
-    bool any = false;
-    for (const fuel::Lake& L : lakes_->lakes())
-        if (L.maxX >= ox && L.minX <= ox + 2 * half && L.maxZ >= oz && L.minZ <= oz + 2 * half) any = true;
-    if (!any) return;
     struct P {
-        float y, W, S;
-        bool flag;
+        float y, W, S, rf;
         float c60[3], c70[3];
     };
-    std::vector<P> pts(size_t(n) * n);
-    for (int r = 0; r < n; ++r)
-        for (int c = 0; c < n; ++c) {
-            const double x = ox + c * sp, z = oz + r * sp;
-            P& p = pts[size_t(r) * n + c];
+    auto pack = [](const float* v, float scale) {  // BGRA bytes; 0x7fd280 packs floor(v * 128)
+        uint32_t out = 0;
+        for (int i = 0; i < 3; ++i) out |= uint32_t(std::clamp(int(std::floor(v[2 - i] * scale)), 0, 255)) << (8 * i);
+        return out;
+    };
+    // One grid: n x n points at spacing sp from (ox, oz).
+    auto grid = [&](int n, double sp, double ox, double oz, bool river, const std::function<void(double, double, P&)>& eval) {
+        std::vector<P> pts(size_t(n) * n);
+        for (int r = 0; r < n; ++r)
+            for (int c = 0; c < n; ++c) eval(ox + c * sp, oz + r * sp, pts[size_t(r) * n + c]);
+        const uint32_t base = uint32_t(bg.water.size());
+        std::vector<uint8_t> alpha(pts.size(), 0);
+        bg.water.resize(base + pts.size());
+        for (int r = 0; r < n; ++r)
+            for (int c = 0; c < n; ++c) {
+                const P& p = pts[size_t(r) * n + c];
+                float W = p.W, S = p.S;
+                const float* c60 = p.c60;
+                if (!river && S <= p.y + 0.01f) {  // dry: a wet diagonal neighbour's level (last one wins); not for 0xf
+                    for (int rr = std::max(r - 1, 0); rr <= std::min(r + 1, n - 1); ++rr)
+                        for (int cc = std::max(c - 1, 0); cc <= std::min(c + 1, n - 1); ++cc) {
+                            if (rr == r || cc == c) continue;
+                            const P& q = pts[size_t(rr) * n + cc];
+                            if (q.y + 0.01f < q.S) W = q.W, S = q.S, c60 = q.c60;
+                        }
+                }
+                uint32_t col;
+                uint8_t a;
+                if (S - p.y < 0.01f) col = pack(c60, 128.0f), a = 0;
+                else if (W - p.y <= 0.01f) col = pack(p.c70, 255.0f), a = 10;
+                else {
+                    const float m[3] = {(p.c70[0] + c60[0]) * 0.5f, (p.c70[1] + c60[1]) * 0.5f, (p.c70[2] + c60[2]) * 0.5f};
+                    col = pack(m, 128.0f), a = 40;
+                }
+                alpha[size_t(r) * n + c] = a;
+                fuel::MeshRenderer::WaterVertex& v = bg.water[base + size_t(r) * n + size_t(c)];
+                const float x = float(ox + c * sp), z = float(oz + r * sp);
+                v.position[0] = x, v.position[1] = S, v.position[2] = z;
+                v.colour = col | uint32_t(a) << 24;
+                v.uv[0] = x, v.uv[1] = z;
+                v.depth = S - p.y;
+                v.pad = river ? 1.0f : 0.0f;
+            }
+        auto rf = [&](uint32_t i) { return pts[i].rf > 0.99f; };
+        for (int r = 1; r < n; ++r)
+            for (int c = 1; c < n; ++c) {
+                const uint32_t v = uint32_t(r * n + c), a = v - n - 1, b = v - n, l = v - 1;
+                // Triangles with a wet vertex; river ones also need a river point (rf > 0.99).
+                if ((alpha[a] || alpha[b] || alpha[v]) && (!river || rf(a) || rf(v) || rf(b)))
+                    bg.waterIndices.insert(bg.waterIndices.end(), {base + a, base + b, base + v});
+                if ((alpha[a] || alpha[v] || alpha[l]) && (!river || rf(a) || rf(l) || rf(v)))
+                    bg.waterIndices.insert(bg.waterIndices.end(), {base + a, base + v, base + l});
+            }
+    };
+    auto colours = [&](double x, double z, const fuel::GroundPoint& gp, P& p) {
+        const fuel::GroundColours gc = ground_->colours(x, z, gp);
+        for (int i = 0; i < 3; ++i) p.c60[i] = gc.water[i], p.c70[i] = gc.base[i];
+    };
+    // Lakes (category 0xe): the lake query alone (river points belong to 0xf).
+    {
+        constexpr int n = 257;
+        constexpr double sp = 8.0, half = sp * (n - 1) / 2;
+        const double ox = std::round(player.x / 64.0) * 64.0 - half, oz = std::round(player.z / 64.0) * 64.0 - half;
+        bool any = false;
+        for (const fuel::Lake& L : lakes_->lakes())
+            if (L.maxX >= ox && L.minX <= ox + 2 * half && L.maxZ >= oz && L.minZ <= oz + 2 * half) any = true;
+        if (any)
+            grid(n, sp, ox, oz, false, [&](double x, double z, P& p) {
+                p.y = float(terrain_->smoothHeightAt(x, z));
+                const fuel::WaterPoint w = fuel::waterAt(*lakes_, x, z, p.y);
+                const bool flag = w.depth - w.base > 0.001f;
+                p.W = flag ? p.y + (w.depth - w.base) : p.y;
+                p.S = std::max(p.y, p.W);
+                p.rf = 0;
+                if (w.depth > 0) colours(x, z, ground_->at(x, z), p);
+                else for (int i = 0; i < 3; ++i) p.c60[i] = p.c70[i] = 0;
+            });
+    }
+    // Rivers (category 0xf): points whose water is all river (ctx+0x30c > 0.99) take part.
+    if (terrain_->detail) {
+        constexpr int n = 193;
+        constexpr double sp = 2.0, half = sp * (n - 1) / 2;
+        const double ox = std::round(player.x / 16.0) * 16.0 - half, oz = std::round(player.z / 16.0) * 16.0 - half;
+        const fuel::TerrainDetail& det = *terrain_->detail;
+        // D does not depend on y: find the river points first; they and their neighbours are evaluated.
+        std::vector<uint8_t> wet(size_t(n) * n, 0), need(size_t(n) * n, 0);
+        bool any = false;
+        for (int r = 0; r < n; ++r)
+            for (int c = 0; c < n; ++c)
+                if (det.river(ox + c * sp, oz + r * sp, 0).flag) {
+                    wet[size_t(r) * n + c] = 1, any = true;
+                    for (int rr = std::max(r - 1, 0); rr <= std::min(r + 1, n - 1); ++rr)
+                        for (int cc = std::max(c - 1, 0); cc <= std::min(c + 1, n - 1); ++cc) need[size_t(rr) * n + cc] = 1;
+                }
+        if (any)
+        grid(n, sp, ox, oz, true, [&](double x, double z, P& p) {
+            p.rf = 0;
+            for (int i = 0; i < 3; ++i) p.c60[i] = p.c70[i] = 0;
+            const size_t k = size_t(std::lround((z - oz) / sp)) * n + size_t(std::lround((x - ox) / sp));
+            if (!need[k]) {
+                p.y = p.W = p.S = 0;
+                return;
+            }
+            if (!wet[k]) {
+                p.y = p.W = p.S = float(terrain_->smoothHeightAt(x, z));
+                return;
+            }
+            const fuel::GroundPoint gp = ground_->at(x, z);
             p.y = float(terrain_->smoothHeightAt(x, z));
-            const fuel::WaterPoint w = fuel::waterAt(*lakes_, x, z, p.y);
-            p.flag = w.depth - w.base > 0.001f;
-            p.W = p.flag ? p.y + (w.depth - w.base) : p.y;
+            const bool flag = gp.waterDepth - gp.waterBase > 0.001f;
+            p.W = flag ? p.y + (gp.waterDepth - gp.waterBase) : p.y;
             p.S = std::max(p.y, p.W);
-            if (w.depth > 0) {  // the colours are needed near water only
-                const fuel::GroundPoint gp = ground_->at(x, z);
-                const fuel::GroundColours gc = ground_->colours(x, z, gp);
-                for (int i = 0; i < 3; ++i) p.c60[i] = gc.water[i], p.c70[i] = gc.base[i];
-            } else {
-                for (int i = 0; i < 3; ++i) p.c60[i] = p.c70[i] = 0;
-            }
-        }
-    std::vector<uint8_t> alpha(pts.size(), 0);
-    bg.water.resize(pts.size());
-    for (int r = 0; r < n; ++r)
-        for (int c = 0; c < n; ++c) {
-            const P& p = pts[size_t(r) * n + c];
-            float W = p.W, S = p.S;
-            const float* c60 = p.c60;
-            if (S <= p.y + 0.01f) {  // dry: a wet diagonal neighbour's level (last one wins)
-                for (int rr = std::max(r - 1, 0); rr <= std::min(r + 1, n - 1); ++rr)
-                    for (int cc = std::max(c - 1, 0); cc <= std::min(c + 1, n - 1); ++cc) {
-                        if (rr == r || cc == c) continue;
-                        const P& q = pts[size_t(rr) * n + cc];
-                        if (q.y + 0.01f < q.S) W = q.W, S = q.S, c60 = q.c60;
-                    }
-            }
-            auto pack = [](const float* v, float scale) {  // BGRA bytes; 0x7fd280 packs floor(v * 128)
-                uint32_t out = 0;
-                for (int i = 0; i < 3; ++i) out |= uint32_t(std::clamp(int(std::floor(v[2 - i] * scale)), 0, 255)) << (8 * i);
-                return out;
-            };
-            uint32_t col;
-            uint8_t a;
-            if (S - p.y < 0.01f) col = pack(c60, 128.0f), a = 0;
-            else if (W - p.y <= 0.01f) col = pack(p.c70, 255.0f), a = 10;
-            else {
-                const float m[3] = {(p.c70[0] + c60[0]) * 0.5f, (p.c70[1] + c60[1]) * 0.5f, (p.c70[2] + c60[2]) * 0.5f};
-                col = pack(m, 128.0f), a = 40;
-            }
-            alpha[size_t(r) * n + c] = a;
-            fuel::MeshRenderer::WaterVertex& v = bg.water[size_t(r) * n + c];
-            const float x = float(ox + c * sp), z = float(oz + r * sp);
-            v.position[0] = x, v.position[1] = S, v.position[2] = z;
-            v.colour = col | uint32_t(a) << 24;
-            v.uv[0] = x, v.uv[1] = z;
-            v.depth = S - p.y;
-        }
-    for (int r = 1; r < n; ++r)
-        for (int c = 1; c < n; ++c) {
-            const uint32_t v = uint32_t(r * n + c), a = v - n - 1, b = v - n, l = v - 1;
-            if (alpha[a] || alpha[b] || alpha[v]) bg.waterIndices.insert(bg.waterIndices.end(), {a, b, v});
-            if (alpha[a] || alpha[v] || alpha[l]) bg.waterIndices.insert(bg.waterIndices.end(), {a, v, l});
-        }
+            p.rf = gp.riverShare;
+            colours(x, z, gp, p);
+        });
+    }
     if (bg.waterIndices.empty()) bg.water.clear();
     if (std::getenv("FUEL_STREAM_TRACE")) std::printf("water: %zu triangles\n", bg.waterIndices.size() / 3);
 }

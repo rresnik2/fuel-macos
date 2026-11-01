@@ -50,10 +50,13 @@ struct GroundPoint {
     float stones = 0;           // ctx+0x1dc "Stones" (bit 24, dry land)
     float caillou = 0;          // ctx+0x1d8 "Caillou" (pebbles; only under water)
     float sand = 0;             // ctx+0x220 "SandTexture" (bit 22; from the Dune layer)
+    float dune = 0;             // ctx+0x228 "Dune" (bit 25, 0x6bb070; map slot 12 floor relief, p34)
+    uint8_t zone = 0;           // ctx+0x240 work-bump zone (bit 28, 0x6b9ad0): 0, 1 or 3
     // Surface types (bit 21 = 0x6bb670): the four strongest of the 40 ground textures and their
     // weights (normalised by the sum of every weight > 0.025); type 0xff = none.
-    // Water (bit 6 = 0x6b9560 over the lake query; rivers not yet): ctx+0x1ac, 0x1b0, 0x1b8.
+    // Water (bit 6 = 0x6b9560 over the lake and river queries): ctx+0x1ac, 0x1b0, 0x1b8.
     float waterDepth = 0, waterBase = 2, waterFade = 1;
+    float riverShare = 0;       // ctx+0x30c: river share of the water (1 = river only)
     bool underWater() const { return waterDepth - waterBase > 0; }
     bool nearRoad = false;      // ctx+0x1bc <= 1 (inside a road band)
     uint8_t surfaceType[4] = {0xff, 0xff, 0xff, 0xff};

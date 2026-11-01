@@ -84,6 +84,20 @@ public:
     // Segments whose influence may reach (x, z) (built on demand), in a fixed order.
     void segmentsNear(double x, double z, std::vector<const Segment*>& out) const;
 
+    // Nearest-road queries of the terrain code (decoded by P32, out/p32/chunkroads.md; used by
+    // the procedural flat surfaces 0x799910). Candidates: built segments whose u16 cell box
+    // (0x6f0ef0) overlaps (x, z) +- r (0x6f0c40); edge = capsule distance (0x6f0da0) - T[+0xbc].
+    struct Nearest {
+        const Segment* seg = nullptr;
+        float edge = 10000.0f;  // min max(0, edge); 10000 [0xa2a4e0] when nothing
+        float px = 0, pz = 0;   // closest centreline point of `seg` (0x6f0e30)
+    };
+    // 0x6fac40 + 0x6fb240: any road; `seg` = the one with the smallest signed edge.
+    Nearest nearestRoad(double x, double z, double r) const;
+    // 0x6fb0c0 + 0x6fb320: types with T[+0x1fc] (big roads) within 50 m; `seg` = the one with the
+    // smallest centreline distance.
+    Nearest nearestBigRoad(double x, double z) const;
+
 private:
     struct Record {
         int16_t minX, minZ, maxX, maxZ;  // 2 m cells
@@ -100,6 +114,7 @@ private:
     };
     using P2 = std::array<float, 2>;
 
+    Nearest nearest(double x, double z, double r, bool big) const;
     P2 point(uint32_t rec, uint32_t k) const;
     float recordLength(uint32_t rec) const;
     void ring(uint32_t rec, int end, std::vector<std::pair<uint32_t, int>>& out) const;

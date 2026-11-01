@@ -7,8 +7,10 @@
 //   R      = rock outcrops (map slot 10, four terrain fractals; 2 m lattice)
 //   floor  = canyon terraces where map slot 12 >= 0.1
 //   h      = lerp(max(h2 + R, floor), h0, clamp(map slot 18))
-//   ground = h - gulches (GwRoad type-14 river beds), flat surfaces list A,
-//            [roads: hook], flat surfaces list B, + 0.3 * high-ground (snow) lift
+//   ground = h - gulches (GwRoad type-14 river beds), flat surfaces list A (file +
+//            procedural, 0x799910), [roads: hook], flat surfaces list B, work bumps
+//            (0x79c980 / 0x79cfa0), + 0.3 * high-ground (snow) lift
+// Procedural flats and work bumps: notes p34-terrain-leftovers.md F1-F4.
 #pragma once
 
 #include "dpc.hpp"
@@ -79,7 +81,56 @@ public:
     using RoadCarver = std::function<double(double x, double z, double& y, double cover, double detailWeight)>;
     void setRoadCarver(RoadCarver c) { roads_ = std::move(c); }
 
+    // Road queries for the procedural flat surfaces (AGW_TerraFlat::GenerateCell 0x799910): the
+    // nearest big road within 50 m (0x6fb320) and the nearest road within r (0x6fb240). Without
+    // them no procedural flats (and no work bumps) are made.
+    struct RoadHit {
+        bool found = false;
+        double edge = 10000;    // min max(0, distance - T[+0xbc])
+        double px = 0, pz = 0;  // closest centreline point of the chosen segment
+        double dx = 0, dz = 0;  // its unit direction (+0x10 / +0x14)
+        double c8 = 0;          // T[+0xc8] of its road type
+    };
+    using BigRoadQuery = std::function<RoadHit(double x, double z)>;
+    using NearRoadQuery = std::function<RoadHit(double x, double z, double r)>;
+    void setRoadQueries(BigRoadQuery big, NearRoadQuery near);
+
+    // Rivers (Gulches_WaterQuery 0x7a07d0 over 0x7a00e0): the carve depth D at (x, z) and the
+    // output A; `y` is the finished ground height there (0x63ea40). D = 0 off rivers.
+    struct River {
+        bool flag = false;
+        double depth = 0;  // D (-> GenWorld_WaterQuery h1)
+        double bed = 0;    // A (-> ctx+0x1b0 = max(A, 2))
+    };
+    River river(double x, double z, double y) const;
+    // Dune_Offset 0x6ad0e0 (point bit 25): the floor relief r = L - h0 of Dune_Level 0x7a2310
+    // (= the canyon floor level, map slot 12) when the ground h is at most 1 cm above L and r > 0,
+    // else 0. h = finished height (ctx+0xb4), h0 = map height (ctx+0x190).
+    double duneRelief(double x, double z, double h, double h0) const;
+    // The canyon terraces 0x7a0c80 at an already scaled position (for the emulator vectors).
+    double canyonTerraces(double sx, double sz, double a, double b) const { return canyon(sx, sz, a, b); }
+    // WorkBump_Nearest 0x79d190 -> the ground point's zone byte ctx+0x240 (0x6b9ad0): the mode
+    // (+0x50: 1 or 3) of the work bump whose capsule holds (x, z) with the nearest point +0x40;
+    // 0 when none.
+    uint8_t workBumpZone(double x, double z) const;
+
     size_t flatSurfaceCount() const;
+    size_t proceduralFlatCount() const;  // built so far
+    // Procedural flat surfaces with centres within r of (x, z) (builds their cells): centre,
+    // half extents along / across the road (L2, D), the axis along the road, mode, strength.
+    struct ProcFlatInfo {
+        double cx, cy, cz, lenX, lenZ, ax, az, nx, nz, margin, strength;
+        int mode;
+    };
+    std::vector<ProcFlatInfo> proceduralFlats(double x, double z, double r) const;
+    // For each procedural flat whose u16 cell box holds (x, z) (the ground point's candidate
+    // lists 0x79b1f0 / 0x79a850): fn(inside distance minus `jitter` (0x799020), 1 / margin).
+    // Their grass fields are the constructor's (0x74cb50): +0x90 = 1, +0x94 = +0x98 = +0x9c = 0.
+    void proceduralFlatsAt(double x, double z, double jitter, const std::function<void(double d, double invMargin)>& fn) const;
+    size_t workBumpCount() const;        // built so far
+    // The height with flags 5 (0x64a2a0 | 1): detail, roads and the snow lift, no gulches, flat
+    // surfaces or work bumps (what 0x799910 probes the ground with).
+    double roadHeight(double x, double z) const;
     size_t gulchLineCount() const;
     size_t roadLineCount() const;
 
@@ -89,6 +140,9 @@ private:
     struct RoadLine;
     struct RoadBuilt;
     struct GulchSeg;
+    struct FlatCell;
+    struct BumpSeg;
+    struct BumpCell;
 
     double baseWithNormal(double x, double z, double n[3]) const;
     double rockEval(double x, double z, double ny) const;   // 0x7a4c20 return value L
@@ -97,13 +151,23 @@ private:
     double floorLevel(double x, double z, double h0) const; // 0x7a2310
     double detailOnly(double x, double z, GroundSample* s) const;
     double gulchDepth(double x, double z) const;            // 0x7a00e0
+    double gulchProfile(double x, double z, double* sh, double* sw) const;
     double combineFlats(bool listB, double x, double z, double& y) const;  // 0x79b870
+    double insideDistance(const Flat& s, double x, double z, double jitter) const;  // 0x799020
+    double jitterJ(double x, double z) const;                                        // 0x6ef6f0
+    const FlatCell* flatCell(int32_t cx, int32_t cz) const;   // AGW_TerraFlat 450 m cell, built on first use
+    void buildFlatCell(int32_t cx, int32_t cz, FlatCell& c) const;  // 0x799910
+    const std::vector<const Flat*>& flatsCovering(double x, double z) const;
+    const BumpCell* bumpCell(int32_t cx, int32_t cz) const;   // AGW_WorkBumps 400 m cell
+    void buildBumpCell(int32_t cx, int32_t cz, BumpCell& c) const;  // 0x79c980
+    bool gulchNear(double x, double z, double r) const;       // 0x79fe80
+    double workBumps(double x, double z, double& y) const;    // 0x79cfa0
     const std::vector<GulchSeg>& gulchSegments(uint32_t line) const;
     const RoadBuilt& roadBuilt(uint32_t line) const;
     double roadCarve(double x, double z, double& y, double cover, double detailWeight) const;  // 0x6fcaa0
 
     Permutation perm_{};
-    MapSampler base_, map10_, map11_, map12_, map18_;
+    MapSampler base_, map08_, map10_, map11_, map12_, map18_;
     Fractal f1_, f2_;                       // altitude object +4 / +0xfd8
     Fractal t0c_, t18_, t24_, t28_;         // terrain-detail object W+0x483a0
     Fractal canyonC_, canyonD_;             // W+0x48404 +0xc / +0x10
@@ -123,9 +187,20 @@ private:
     mutable std::vector<std::unique_ptr<RoadBuilt>> roadBuilt_;
     Fractal b3f54_;  // bank +0x3f54 (road height noise)
     RoadCarver roads_;
+    BigRoadQuery bigRoad_;
+    NearRoadQuery nearRoad_;
+    // Procedural cells: [cx + kCellOff][cz + kCellOff], allocated on first use.
+    static constexpr int32_t kFlatCells = 320, kBumpCells = 360;
+    mutable std::unique_ptr<std::atomic<FlatCell*>[]> flatCells2_;
+    mutable std::unique_ptr<std::atomic<BumpCell*>[]> bumpCells_;
+    mutable std::atomic<size_t> procCount_{0}, bumpCount_{0};
     uint32_t id_ = 0;  // for the per-thread lattice caches
     int skip_ = 0;     // FUEL_TERRAIN_SKIP diagnostics
 };
+
+// For emulator comparisons only (this thread): round float32 stores to nearest like Ghidra's
+// pcode emulator instead of FUEL's round-down.
+void setFloat32RoundNearest(bool on);
 
 // Builds the detail for a world DPC (WORLD/USA1.DPC) from its GenWorld_Z maps, flat
 // surfaces and GwRoad_Z gulch lines, with the base map already decoded in `baseRaw`.
