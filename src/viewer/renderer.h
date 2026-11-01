@@ -15,6 +15,7 @@
 
 #include "core/atmosphere.hpp"
 #include "core/weather.hpp"
+#include "core/clouds.hpp"
 #include "core/sfx.hpp"
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
@@ -262,6 +263,17 @@ private:
     void encodeDust(id<MTLCommandBuffer> cb);
     void encodeTanks(id<MTLCommandBuffer> cb);  // rain / snow (weather tanks)
     id<MTLRenderPipelineState> tankPipeline_;
+    void encodeClouds(id<MTLCommandBuffer> cb);  // billboard clouds (cloud tank, p37)
+    id<MTLRenderPipelineState> cloudPipeline_;
+    id<MTLTexture> cloudTex_ = nil;               // FX_BILLBOARD_CLOUDS (FX atlas entry 14)
+    std::unique_ptr<clouds::Tank> cloudTank_;
+    id<MTLBuffer> cloudBuf_ = nil;
+    uint32_t cloudRng_ = 0x6d2b79f5u;
+    std::chrono::steady_clock::time_point cloudClock_;
+    bool haveCloudClock_ = false;
+    WindGusts gusts_;                             // 0x5b8680 gusts on the weather wind
+    simd_float3 wind_ = {0, 0, 0};                // WeatherManager +0xc4 after the gusts
+    double windClock_ = 0;
     id<MTLBuffer> rainDrops_ = nil, snowDrops_ = nil;
     simd_float3 rainSmooth_ = {0, 0, 0}, rainShift_ = {0, 0, 0}, snowShift_ = {0, 0, 0}, tankEye_ = {0, 0, 0};
     bool haveTankEye_ = false, haveTankClock_ = false;
