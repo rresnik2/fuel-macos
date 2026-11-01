@@ -3,7 +3,8 @@
 // notes p15 D2) with one 25 x 25 point patch per chunk (Paysage_FillPoints 0x7f92c0,
 // Paysage_BuildVertices 0x7f9b50; notes p21 M1-M3). Vertices carry a morph target on
 // the half-resolution grid; the vertex shader blends to it between 2.375 and 2.875 chunk
-// sizes from the camera, so a chunk has the parent's shape where it hands over.
+// sizes from the camera, so a chunk has the parent's shape where it hands over: odd points
+// collapse onto the even point (i & ~1, j & ~1), normals morph too (notes p31 E6).
 #pragma once
 
 #include "terrain.hpp"
@@ -27,8 +28,10 @@ struct TerrainVertex {
     float tweenInv;    // 1 / morph range (2 / C)
     float n[3];        // ground normal
     float size;        // chunk size C (for the shader's texture bands)
+    float n1[3];       // morph target normal (the parent's coarse normal)
+    float pad;
 };
-static_assert(sizeof(TerrainVertex) == 48, "TerrainVertex layout is shared with the Metal shader");
+static_assert(sizeof(TerrainVertex) == 64, "TerrainVertex layout is shared with the Metal shader");
 
 constexpr int kChunkSide = 25;  // points per side (24 quads)
 
@@ -53,7 +56,8 @@ public:
     // The chunks to draw for a camera at (ex, ez): the quadtree's leaves, where a chunk
     // whose four children are not built yet stands in for them (as FUEL keeps the parent
     // until its children are generated). Missing chunks are queued for the workers.
-    std::vector<std::shared_ptr<const TerrainChunk>> update(double ex, double ez);
+    // (fx, fz) = horizontal view direction for FUEL's build order (0: no preference).
+    std::vector<std::shared_ptr<const TerrainChunk>> update(double ex, double ez, double fx = 0, double fz = 0);
     // Blocks until nothing is queued or building.
     void settle();
 
@@ -74,6 +78,7 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<const TerrainChunk>> built_;
     std::unordered_map<uint64_t, uint64_t> lastUsed_;
     uint64_t frame_ = 0;
+    double fx_ = 0, fz_ = 0;
     int busy_ = 0;
     bool stop_ = false;
     std::vector<std::thread> threads_;

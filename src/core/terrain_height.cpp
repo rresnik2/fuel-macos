@@ -512,7 +512,8 @@ double TerrainDetail::gulchDepth(double x, double z) const {
             if (!(D < s.R)) continue;
             if (!have) {
                 N = b5efc_.at(x, z);
-                B = 0.66 * double(b4f28_.at(x, z)) + 0.34 * double(b1fac_.at(x, z));
+                // 0x79dae0: float32 constants 0.66f / 0.34f (.rdata 0x9dc93c / 0x9dc940), result stored as float.
+                B = double(0.66f * b4f28_.at(x, z) + 0.34f * b1fac_.at(x, z));
                 C = bfd44_.at(x, z);
                 const double v = b7ea4_.at(x, z);
                 E = 0.5 + 0.5 * P8(P8(2 * v * std::fabs(v) - 1));

@@ -144,6 +144,60 @@ int main(int argc, char** argv) {
                     std::printf("chunk %5.0f m: %zu vertices in %.1f ms\n", c, v.size(),
                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count() * 1e3);
                 }
+            } else if (a == "--vectors") {
+                // Terrain checks (notes p31 "Vectors"). (1) Morph hand-over, 0x7f9b50 (p31 E6): every vertex of a
+                // chunk of size C morphs to the even point (i & ~1, j & ~1) as the parent chunk (2C) builds it, so
+                // at full tween the chunk is exactly its parent: target height and normal must equal the parent's
+                // own vertex there, for every level from 24 m to 6144 m. (2) Heights at fixed points against the
+                // values recorded in notes p31 (port regression; FUEL.exe's 0x64a2a0 itself cannot be emulated
+                // without the runtime GenWorld state).
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                int bad = 0, checked = 0;
+                const double px = -39570.0, pz = -28068.0;  // CR2-Yell-CP start
+                double cx = std::round(px / 12288.0) * 12288.0, cz = std::round(pz / 12288.0) * 12288.0, C = 12288.0;
+                std::vector<std::array<double, 3>> path;  // centre x, z, size from the root down to a 24 m leaf
+                path.push_back({cx, cz, C});
+                while (C > 24.01) {
+                    const double q = C * 0.25;
+                    cx += px >= cx ? q : -q, cz += pz >= cz ? q : -q, C *= 0.5;
+                    path.push_back({cx, cz, C});
+                }
+                std::vector<fuel::TerrainVertex> parent = fuel::buildTerrainChunk(ground, path[0][0], path[0][1], path[0][2]);
+                for (size_t k = 1; k < path.size(); ++k) {
+                    const auto child = fuel::buildTerrainChunk(ground, path[k][0], path[k][1], path[k][2]);
+                    const double Cc = path[k][2], s = Cc / 24.0;
+                    const int oi = int(std::lround((path[k][0] - path[k - 1][0]) / (Cc / 2) + 1)) * 6;  // 0 or 12
+                    const int oj = int(std::lround((path[k][1] - path[k - 1][1]) / (Cc / 2) + 1)) * 6;
+                    float worstY = 0, worstN = 0, worstXZ = 0;
+                    for (int j = 0; j < fuel::kChunkSide; ++j)
+                        for (int i = 0; i < fuel::kChunkSide; ++i) {
+                            const fuel::TerrainVertex& v = child[size_t(j) * fuel::kChunkSide + size_t(i)];
+                            const fuel::TerrainVertex& p = parent[size_t(oj + (j >> 1)) * fuel::kChunkSide + size_t(oi + (i >> 1))];
+                            worstXZ = std::max({worstXZ, std::fabs(v.p1[0] - p.p0[0]), std::fabs(v.p1[2] - p.p0[2])});
+                            worstY = std::max(worstY, std::fabs(v.p1[1] - p.p0[1]));
+                            for (int c = 0; c < 3; ++c) worstN = std::max(worstN, std::fabs(v.n1[c] - p.n[c]));
+                        }
+                    (void)s;
+                    const bool ok = worstXZ < 1e-3f && worstY < 1e-3f && worstN < 2e-3f;
+                    ++checked, bad += !ok;
+                    std::printf("morph %5.0f m -> parent %5.0f m: target xz %.4f, y %.4f, normal %.5f %s\n", Cc, path[k - 1][2], worstXZ, worstY, worstN,
+                                ok ? "match" : "MISMATCH");
+                    parent = child;
+                }
+                struct Pt {
+                    double x, z, h;
+                };
+                // Port values (notes p31 "Vectors"), recorded after the morph/LOD port (heights unchanged by it).
+                const Pt pts[] = {{-39570.0, -28068.0, 863.728}, {45850.0, -6250.0, 1153.995}, {62652.4, 12699.0, 896.835},
+                                  {-39700.0, -28300.0, 898.577}, {0.0, 0.0, 1750.413}};
+                for (const Pt& q : pts) {
+                    const double h = ground.smoothHeightAt(q.x, q.z);
+                    const bool ok = std::fabs(h - q.h) < 2e-3;
+                    ++checked, bad += !ok;
+                    std::printf("height (%.1f, %.1f) = %.3f (recorded %.3f) %s\n", q.x, q.z, h, q.h, ok ? "match" : "MISMATCH");
+                }
+                std::printf("terrain vectors: %d of %d match\n", checked - bad, checked);
+                if (bad) return 1;
             } else if (a == "--road-types") {  // the AGW_TerraRoad table replayed from FUEL.exe
                 std::string err;
                 const auto t = fuel::loadRoadTypes(dpc, &err);
