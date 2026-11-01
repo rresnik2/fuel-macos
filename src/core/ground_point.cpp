@@ -558,7 +558,9 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     const float H = p.surfaceHumidity;
     float strata;
     {
-        const float v = fcdc8_.at(x, z);
+        // Point_Strata (bit 20, 0x4dea60) calls 0x4debf0, which returns F_cdc8 clamped to [0, 1]
+        // (asm 0x4df25e: fld1; fcom ...), as P31 noted.
+        const float v = clamp01(fcdc8_.at(x, z));
         const float y = 0.25f * std::sin(0.2f * (100 * v + p.height)) + 0.75f * std::sin(0.01f * (500 * v + p.height));
         strata = clamp01(y * (2 - std::fabs(y)) * clamp01(1 - 5 * (p.normal[1] - 0.8f)) * 0.2f);
     }
