@@ -279,6 +279,17 @@ float GroundGenerator::roadWeight(double x, double z, bool* nearRoad, float* tar
     return best;
 }
 
+// GenWorld_ForestDensity (0x6bd200): the forest map (map 7, bicubic, not clamped) through the
+// contrast curve, minus 0.95 x the clearing noise F_cdc8 (clamped finest cell) through the same
+// curve on 2G^2 - 1; the result fades out where the coarse base normal is flatter than 45 degrees
+// (n.y < 0.707 [0x9dc0c8], x 100 [0x9dbfc0]). Decoded from the decompile corpus.
+float GroundGenerator::forestDensity(double x, double z, float coarseNy) const {
+    const float F = mapAt(7, x, z), G = clamp01(fcdc8_.at(x, z));
+    float d = clamp01((contrast8(2 * F - 1) * 0.5f + 0.5f) - 0.95f * (contrast8(2 * G * G - 1) * 0.5f + 0.5f));
+    if (coarseNy < 0.707f) d *= std::max(0.0f, 1 - (0.707f - coarseNy) * 100.0f);
+    return clamp01(d);
+}
+
 // Point_RockCover (0x6b8d80) over Terrain_RockEval (0x7a4c20).
 void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarseNy) const {
     p.rock = p.rockSlope = 0;
@@ -369,6 +380,7 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     // Coarse normal (ctx+0xe0, the W+0xcc4 sampler).
     float coarse[3];
     coarseNormal(x, z, coarse);
+    p.coarseNy = coarse[1];
     // Humidity (bit 2): APPROXIMATED as the plain map (FUN_004dde20 adds terms not decoded).
     p.humidity = clamp01(mapAt(2, x, z));
     const float v = p.humidity, nxz = std::hypot(p.normal[0], p.normal[2]);
@@ -602,7 +614,8 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
         A = lerp(A, G, p.road);
     }
     if (p.highGround > 0.025f) A = lerp(A, P(56), p.highGround);
-    float f = clamp01(2 * (mapAt(7, x, z) * p.humidity - 0.5f));
+    // ctx+0x1a4 is the forest density 0x6bd200 (bit 5, 0x4de5d0 stores it), not the raw map 7 (p32 pointcolours 1.4).
+    float f = clamp01(2 * (forestDensity(x, z, p.coarseNy) * p.humidity - 0.5f));
     f *= f;
     if (p.height > 3000 - 500 * p.normal[2] - 200) f = 0;
     const float k = std::max(f - p.rock, 0.0f);
