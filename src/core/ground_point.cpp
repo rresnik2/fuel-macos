@@ -534,7 +534,11 @@ GroundPoint GroundGenerator::at(double x, double z, bool full) const {
     // Bit 23: grass size.
     p.grassSize = clamp01(clamp01((1 - p.normal[1] - 0.1f) * 10) + s4c(ffd44_.at(x, z)) - (1 - fs.keep));
     // Bit 24 (0x6b8980): Stones; under water away from roads, Caillou (pebbles) too (water.md 1.8).
-    if (p.road <= 0.95f) {
+    if (p.road <= 0.95f && p.zone != 0) {
+        // Work-bump zone (ctx+0x240, 0x6b8980): zone 1 -> Stones, otherwise Caillou (pebbles).
+        p.caillou = p.zone == 1 ? 0.0f : 1.0f;
+        p.stones = p.zone == 1 ? 1.0f : 0.0f;
+    } else if (p.road <= 0.95f) {
         const float F = ffd44_.at(x, z);
         float st = 0, pc = 0;
         if (p.waterDepth > 0 && !p.nearRoad) {
