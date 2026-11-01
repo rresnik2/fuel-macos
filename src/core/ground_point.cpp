@@ -564,12 +564,16 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     // Mixer 1 (0x6b0750): M1 earth, M2 road dirt.
     C c4[4];
     for (int j = 0; j < 4; ++j) c4[j] = mix({16 + j, 20 + j, 24 + j, 28 + j, 32 + j}, {70 + j, 74 + j, 78 + j, 82 + j, 86 + j});
-    C M1 = lerp(c4[1], c4[0], pm), M2 = lerp(c4[3], c4[2], pm);
-    M1 = lerp(M1, P(58), chalk * mapAt(18, x, z));
-    // ctx+0x220 (wet ground) needs the water level map: 0 without water (port).
+    const C M1m = lerp(c4[1], c4[0], pm);
+    C M1 = M1m, M2 = lerp(c4[3], c4[2], pm);
+    // Point_EarthColours (bit 9, 0x6bacf0 tail 0x6bae38-0x6bb046): the chalk (P58) tint, the sand
+    // tint (ctx+0x220: 0 without the Dune layer) and the burn tint each start from the mixer
+    // output M1m, not from each other; the last applicable one wins and only burn also touches M2.
+    M1 = lerp(M1m, P(58), chalk * mapAt(18, x, z));
+    if (p.sand > 1e-6f) M1 = lerp(M1m, C{1.0f, 1.0f, 1.0f}, 0.33f * p.sand);  // g 0xa063c8 = (1, 1, 1)
     if (burn > 0.01f) {
-        const C b{0.4f, 0.35f, 0.35f};
-        M1 = lerp(M1, b, burn), M2 = lerp(M2, b, burn);
+        const C b{0.4f, 0.35f, 0.35f};  // g 0xa066d0
+        M1 = lerp(M1m, b, burn), M2 = lerp(M2, b, burn);
     }
     // Mixers 2 and 3 (0x6b22e0, 0x6b3130): rock colours M3, M4 (0x6b22e0's chalk Y reads slot 54 twice).
     const C M3 = lerp(mix({51, 52, 53, 54, 55}, {101, 103, 105, 54, 109}), mix({46, 47, 48, 49, 50}, {100, 102, 104, 106, 108}), pr);
