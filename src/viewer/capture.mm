@@ -79,7 +79,10 @@ std::vector<CaptureSpot> loadCaptureSpots(const std::string& path) {
         if (cells.size() > 5) s.distance = numberOrChase(cells[5], "distance", n);
         if (cells.size() > 6) s.timeOfDay = trim(cells[6]);
         if (cells.size() > 7) s.notes = trim(cells[7]);
-        if ((s.pitchDeg < 0) != (s.distance < 0))
+        // A numeric pitch may be negative (the camera below the focus, looking up) when a distance is given.
+        const std::string pt = cells.size() > 4 ? trim(cells[4]) : std::string();
+        const bool pitchChase = pt.empty() || pt == "-" || strcasecmp(pt.c_str(), "chase") == 0;
+        if (pitchChase != (s.distance < 0))
             throw std::runtime_error("capture spots line " + std::to_string(n) + ": give both pitch and distance, or 'chase' for both");
         spots.push_back(std::move(s));
     }

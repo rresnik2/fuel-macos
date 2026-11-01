@@ -196,12 +196,13 @@ Scatter fuelScattering(constant FrameUniforms& f, float3 p) {
     return fuelScatterFinish(f, min(look.y, 0.0), density, cosT);
 }
 
-// The sky seen along `dir` (ph_sky: the inscatter of the sky box, U1: box half size 20 km around the camera).
+// The sky seen along `dir` (vh_sky / ph_sky: scatteringbase to the sky dome vertex). The dome (SkyDome_Update
+// 0x7e2690, tiles 0x7e1610 + 0x7e1340) is a sphere of radius 0.9 x the GenWorld camera's far plane (frustum +0x6c4,
+// forced to 50000 at 0x77ad73) = 45 km, centred on the camera (frustum +0x6e0, re-placed every 5th frame), scale
+// 1 - 0.75 sky+8 (0: no writer is called). FUEL evaluates it per dome vertex; the port per pixel.
+constant float kSkyDomeRadius = 0.9 * 50000.0;
 float3 fuelSky(constant FrameUniforms& f, float3 dir) {
-    const float B = 20000.0;
-    const float3 a = abs(dir);
-    const float t = B / max(max(a.x, a.y), max(a.z, 1e-4));
-    return fuelScattering(f, f.eye.xyz + dir * t).insc;
+    return fuelScattering(f, f.eye.xyz + dir * kSkyDomeRadius).insc;
 }
 
 // ---- Lighting (scattering_light.h)
@@ -953,7 +954,7 @@ fragment float4 fsSky(SkyOut in [[stage_in]], constant FrameUniforms& f [[buffer
     const float3 sd = normalize(f.sunRaw.xyz);
     const float disc = smoothstep(0.99996, 0.999975, dot(dir, sd));
     if (disc > 0.0) {
-        const Scatter sc = fuelScattering(f, f.eye.xyz + sd * 20000.0);
+        const Scatter sc = fuelScattering(f, f.eye.xyz + sd * kSkyDomeRadius);
         const float3 sunDisc = f.dlight.rgb * disc * sc.ext * 1000.0, moonDisc = f.dlight.rgb * disc * sc.ext * 100.0;
         c += mix(moonDisc, sunDisc, saturate(f.dlight.w - 0.5));
     }
@@ -1089,6 +1090,82 @@ fragment float4 fsSfx(SfxOut in [[stage_in]], depth2d<float> depth [[texture(0)]
     const float d = depth.read(uint2(in.position.xy));
     const float scene = f.fog.z * f.fog.w / (d + f.fog.w);
     c.a *= saturate((scene - in.viewZ) * 4.0);
+    return float4(max(c.rgb, 0.0), saturate(c.a));
+}
+
+// ---- FUEL's billboard clouds (SpecialEffectsCloudTank_G, SubCode 0x27): sfx.vhl vh_cloud + sfx.phl
+// ph_sfxScattering (the variant without bShadowMap). One instance per active cloud; the constants are 0x5fe370's.
+
+struct CloudSprite {
+    float4 pos;  // xyz cloud position (y 0), w half width (+0x14)
+    float4 uv;   // u at -x, u at +x, v at the top, v at the bottom (0x5fe580)
+    float4 size; // x half height (+0x18)
+};
+
+struct CloudParams {
+    float4 user0;  // C_USER0: x Cloudness (+0x94), y CloudsAlpha (+0xf4 = (cloud + 1) / 2)
+    float4 user5;  // C_USER5: x downHeight -100
+    float4 user6;  // C_USER6: x lightning range 2000, y AppearanceZone (sight), z SightLine (0.8 sight), w layer + tank y
+    float4 rgba;   // the vertex colour: 1.25 PP5201 x3, 0.5
+};
+
+struct CloudOut {
+    float4 position [[position]];
+    float2 uv;
+    float4 sun;  // (sky + sun saturate(L.y)) x vcol, a = the distance alpha
+    float3 insc;
+    float viewZ;
+};
+
+// vh_cloud's corner: world position, distance alpha (o.diffuse.a) and the bottom darkening 1 - Cloudness s.
+float3 fuelCloudCorner(constant FrameUniforms& f, float3 cpos, float2 halfSize, float2 corner, float4 user0, float4 user5,
+                       float4 user6, thread float& alpha, thread float& shade) {
+    const float Cloudness = user0.x, zone = user6.y, sightLine = user6.z;
+    float3 position = float3(cpos.x, cpos.y + user6.w, cpos.z);
+    const float3 vEye = position - f.eye.xyz;
+    const float len = length(vEye);
+    float scaleFactor = mix(1.0, 0.75, len / zone);
+    if (len > zone) scaleFactor = 0.0;
+    position.y += mix(0.0, user5.x, len / zone);
+    const float3 viewDir = normalize(position - f.eye.xyz);
+    const float3 right = normalize(cross(viewDir, float3(0, 1, 0)));
+    const float3 up = cross(right, viewDir);
+    const float2 uvscale = corner * halfSize;
+    shade = 1.0 - Cloudness * (1.0 - (1.0 + sign(uvscale.y)) * 0.5);
+    // No lightning flashes in the port (C_USER1..4 w = 0): GetLightningInfluence = 0.
+    alpha = saturate(1.0 - (len - (sightLine - zone)) / zone);
+    return position + uvscale.x * right * scaleFactor + uvscale.y * up * scaleFactor;
+}
+
+vertex CloudOut vsCloud(uint vid [[vertex_id]], uint iid [[instance_id]], const device CloudSprite* cs [[buffer(0)]],
+                        constant FrameUniforms& f [[buffer(1)]], constant CloudParams& u [[buffer(2)]]) {
+    const CloudSprite c = cs[iid];
+    const float2 corner = float2(vid & 1, vid >> 1) * 2.0 - 1.0;
+    float alpha, shade;
+    const float3 v = fuelCloudCorner(f, c.pos.xyz, float2(c.pos.w, c.size.x), corner, u.user0, u.user5, u.user6, alpha, shade);
+    CloudOut o;
+    o.position = f.viewProj * float4(v, 1.0);
+    o.uv = float2(corner.x < 0.0 ? c.uv.x : c.uv.y, corner.y > 0.0 ? c.uv.z : c.uv.w);
+    // o.diffuse = rgba x CloudsAlpha, a = 1, rgb x (1 - Cloudness s), a x the distance fade.
+    const float3 diffuse = u.rgba.rgb * u.user0.y * shade;
+    const Scatter sc = fuelScattering(f, v);
+    const float3 vcol = diffuse * sc.ext * 2.0;
+    o.sun = float4((f.skyColour.rgb + f.sunColour.rgb * saturate(f.lightDir.y)) * vcol, alpha);
+    o.insc = sc.insc;
+    o.viewZ = dot(v - f.eye.xyz, cross(f.camUp.xyz, f.camRight.xyz));
+    return o;
+}
+
+fragment float4 fsCloud(CloudOut in [[stage_in]], depth2d<float> depth [[texture(0)]], texture2d<float> tex [[texture(1)]],
+                        constant FrameUniforms& f [[buffer(1)]]) {
+    constexpr sampler smp(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
+    float4 c = tex.sample(smp, in.uv);
+    c.a *= in.sun.a;                     // color.w *= GetShadowLight(i).w
+    if (c.a < 0.01) discard_fragment();  // sfxClip
+    c.rgb *= in.sun.rgb;
+    c.rgb += in.insc;
+    const float d = depth.read(uint2(in.position.xy));
+    if (in.viewZ > f.fog.z * f.fog.w / (d + f.fog.w)) discard_fragment();  // behind the scene
     return float4(max(c.rgb, 0.0), saturate(c.a));
 }
 
@@ -1335,6 +1412,12 @@ kernel void kRenderCheck(constant FrameUniforms& f [[buffer(0)]], const device f
         }
         case 3: {  // the sky along a.xyz
             r0 = float4(fuelSky(f, normalize(a.xyz)), 0);
+            break;
+        }
+        case 5: {  // vh_cloud corner: cloud a.xyz, half size b.xy, corner b.zw, C_USER0 = c, C_USER6 = d, C_USER5.x -100
+            float alpha, shade;
+            r0 = float4(fuelCloudCorner(f, a.xyz, b.xy, b.zw, c, float4(-100, 0, 0, 0), d, alpha, shade), alpha);
+            r1 = float4(shade, 0, 0, 0);
             break;
         }
     }
@@ -1689,6 +1772,7 @@ MeshRenderer::MeshRenderer(id<MTLDevice> device, NSUInteger sampleCount, const R
     };
     dustPipeline_ = makePost(@"vsSfx", @"fsSfx", kRenderColorFormat, 1);
     tankPipeline_ = makePost(@"vsTank", @"fsTank", kRenderColorFormat, 1);
+    cloudPipeline_ = makePost(@"vsCloud", @"fsCloud", kRenderColorFormat, 1);
     shrinkPipeline_ = makePost(@"vsFull", @"fsShrink", kRenderColorFormat, 0);
     lumLogPipeline_ = makePost(@"vsFull", @"fsLumLog", MTLPixelFormatR32Float, 0);
     lumAvgPipeline_ = makePost(@"vsFull", @"fsLumAvg", MTLPixelFormatR32Float, 0);
@@ -2380,8 +2464,8 @@ void MeshRenderer::fillAtmosphere(FrameUniforms& fu, simd_float3 eye, const simd
     // FUEL's weather at the camera (WeatherManager_G 0x5b89e0 -> apply 0x5bba30 -> hook 0x6409d0), unless --weather.
     if (weatherFromWorld && weatherFields_ && weatherFields_->valid()) {
         weatherNow_ = weatherFields_->sample(eye.x, eye.y, eye.z);
-        const Weather h = weatherHook(weatherNow_);
-        in.weather.cloud = h.cloud, in.weather.fog = h.fog, in.weather.wet = h.wet;
+        const Weather h = weatherHook(weatherNow_, eye.y, weatherFields_->P(5202), weatherFields_->P(5203));
+        in.weather = h;
     }
     in.brightness = brightness;
     in.camera = {eye.x, eye.y, eye.z};
@@ -2893,6 +2977,7 @@ void MeshRenderer::render(id<MTLCommandBuffer> cb, id<MTLTexture> target, const 
 
 void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     if (sfxAtlas_ == nil) return;
+    encodeClouds(cb);
     encodeTanks(cb);
     if (dust_.sprites.empty()) return;
     // Back to front from the camera (FUEL sorts its 32-particle buckets by depth, 0x5fee80; the port sorts sprites).
@@ -2934,12 +3019,88 @@ void MeshRenderer::encodeDust(id<MTLCommandBuffer> cb) {
     [enc endEncoding];
 }
 
+// FUEL's billboard clouds (SpecialEffectsCloudTank_G, p37-sky-clouds.md): the tank follows the camera (vf+0x24
+// 0x5fd890), refreshes every 10 s (0x5fe040), and draws its active clouds with vh_cloud (constants 0x5fe370).
+void MeshRenderer::encodeClouds(id<MTLCommandBuffer> cb) {
+    const auto now = std::chrono::steady_clock::now();
+    float dt = haveCloudClock_ ? std::min(0.25f, std::chrono::duration<float>(now - cloudClock_).count()) : 0.0f;
+    if (exposureDt >= 0) dt = exposureDt;
+    cloudClock_ = now, haveCloudClock_ = true;
+    if (!weatherFields_ || cloudTex_ == nil || !weatherFromWorld) return;
+    const WeatherAmounts& w = weatherNow_;
+    const float cloud = w.cloud;
+    const float cloudness = std::min(std::max(2.0f * cloud, 0.0f), 1.0f);  // 0x5b7e40: clamp01(2 x 0x5bac10)
+    if (!cloudTank_) {
+        auto rnd = [this]() {  // port generator (FUEL: WELL512 0x5fd710 and 0x6460f0, shared with other systems)
+            cloudRng_ ^= cloudRng_ << 13, cloudRng_ ^= cloudRng_ >> 17, cloudRng_ ^= cloudRng_ << 5;
+            return float(cloudRng_ >> 8) / 16777216.0f;
+        };
+        cloudTank_ = std::make_unique<clouds::Tank>(clouds::Params::fromPP(weatherFields_->pp()), rnd, rnd);
+    }
+    const simd_float3 eye = lastFrame_->eye.xyz;
+    cloudTank_->setPosition({eye.x, eye.y, eye.z}, cloudness);
+    cloudTank_->update(dt, cloud, cloudness);
+    const int n = cloudTank_->activeCount();  // +8 = +0x98: the active clouds lead the sorted array
+    if (n <= 0) return;
+    const auto& cs = cloudTank_->clouds();
+    struct CloudSprite {
+        simd_float4 pos, uv, size;
+    };
+    if (cloudBuf_ == nil) cloudBuf_ = [device_ newBufferWithLength:cs.size() * sizeof(CloudSprite) options:MTLResourceStorageModeShared];
+    if (cloudTank_->dirty()) {  // 0x5fe580: uv quarter by variant, u swapped when mirrored
+        auto* out = static_cast<CloudSprite*>(cloudBuf_.contents);
+        for (size_t i = 0; i < cs.size(); ++i) {
+            const clouds::Cloud& c = cs[i];
+            float u0 = 0, v0 = 0;
+            if (c.variant == 1) u0 = 0.5f;
+            else if (c.variant == 2) u0 = 0.5f, v0 = 0.5f;
+            else if (c.variant == 3) v0 = 0.5f;
+            float ua = u0, ub = u0 + 0.5f;
+            if (c.mirror) std::swap(ua, ub);
+            out[i] = {simd_make_float4(c.pos[0], c.pos[1], c.pos[2], c.width), simd_make_float4(ua, ub, v0, v0 + 0.5f),
+                      simd_make_float4(c.height, 0, 0, 0)};
+        }
+        cloudTank_->clearDirty();
+    }
+    const clouds::Params& p = cloudTank_->params();
+    // CloudsAlpha = (cloud + 1) / 2 (0x5bba30 -> +0xf4); vertex colour 1.25 PP5201 (0x5fe580).
+    const std::array<float, 28> k = clouds::drawConstants(cloudness, (cloud + 1.0f) * 0.5f, p.sight, cloudTank_->layerHeight(),
+                                                          cloudTank_->position()[1]);
+    struct {
+        simd_float4 user0, user5, user6, rgba;
+    } params = {simd_make_float4(k[0], k[1], k[2], k[3]), simd_make_float4(k[20], k[21], k[22], k[23]),
+                simd_make_float4(k[24], k[25], k[26], k[27]), simd_make_float4(1.25f * p.colour, 1.25f * p.colour, 1.25f * p.colour, 0.5f)};
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = hdr_;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:cloudPipeline_];
+    [enc setVertexBuffer:cloudBuf_ offset:0 atIndex:0];
+    [enc setVertexBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setVertexBytes:&params length:sizeof params atIndex:2];
+    [enc setFragmentBytes:lastFrame_.get() length:sizeof(FrameUniforms) atIndex:1];
+    [enc setFragmentTexture:depth_ atIndex:0];
+    [enc setFragmentTexture:cloudTex_ atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:NSUInteger(n)];
+    [enc endEncoding];
+}
+
 // FUEL's rain and snow tanks (SpecialEffectsRainTank_G 0x5e1920 / SnowTank_G 0x5dfbd0, started by the weather apply
 // 0x5bba30 with 1024 x 12 rain drops and 12000 flakes; drawn count = floor(amount x N) 0x5de850).
 void MeshRenderer::encodeTanks(id<MTLCommandBuffer> cb) {
     const WeatherAmounts& w = weatherNow_;
     if (std::getenv("FUEL_SFX_DEBUG") && frame_ % 30 == 0)
-        std::fprintf(stderr, "weather at camera: cloud %.2f rain %.2f snow %.2f fog %.2f wind %.1f\n", w.cloud, w.rain, w.snow, w.fog, w.windSpeed);
+        std::fprintf(stderr, "weather at camera: cloud %.2f rain %.2f snow %.2f fog %.2f wind %.1f (%.2f, %.2f) humidity %.2f clouds %d\n", w.cloud,
+                     w.rain, w.snow, w.fog, w.windSpeed, wind_.x, wind_.z, w.humidity, cloudTank_ ? cloudTank_->activeCount() : -1);
+    if (weatherFields_) {  // 0x5b8680: the field wind with gusts (WELL512 draws; port generator), on the game clock
+        windClock_ += exposureDt >= 0 ? exposureDt : 1.0 / 60.0;
+        const std::array<float, 3> g = gusts_.apply(w.wind, windClock_, weatherFields_->pp(), [this]() {
+            cloudRng_ ^= cloudRng_ << 13, cloudRng_ ^= cloudRng_ >> 17, cloudRng_ ^= cloudRng_ << 5;
+            return float(cloudRng_ >> 8) / 16777216.0f;
+        });
+        wind_ = simd_make_float3(g[0], g[1], g[2]);
+    }
     if (!weatherFields_ || (w.rain <= 0 && w.snow <= 0)) {
         tankClock_ = std::chrono::steady_clock::now(), haveTankClock_ = false;
         return;
@@ -2952,12 +3113,13 @@ void MeshRenderer::encodeTanks(id<MTLCommandBuffer> cb) {
     const simd_float3 eye = lastFrame_->eye.xyz;
     const simd_float3 fwd = simd_cross(lastFrame_->camUp.xyz, lastFrame_->camRight.xyz);
     // Rain velocity (0x5e1fc0): the player's velocity smoothed 0.25 per frame, x PP5043, + 0.3 wind, at most PP5042.
-    // Port: the camera's velocity stands in for the player vehicle's (it follows it), no wind vector (U).
+    // Port: the camera's velocity stands in for the player vehicle's (it follows it). The wind is the weather
+    // manager's +0xc4 (0x5b8330 field x speed, 0x5b8680 gusts; the apply 0x5bba30 copies it into the tanks' +0x20).
     simd_float3 v = haveTankEye_ && dt > 0 ? (eye - tankEye_) / dt : simd_make_float3(0, 0, 0);
     if (simd_length(v) > 200.0f) v = 0;
     tankEye_ = eye, haveTankEye_ = true;
     rainSmooth_ += (v - rainSmooth_) * 0.25f;
-    simd_float3 rv = rainSmooth_ * P(5043);
+    simd_float3 rv = rainSmooth_ * P(5043) + 0.3f * wind_;
     const float rl = simd_length(rv);
     if (P(5042) < rl) rv *= P(5042) / rl;
     const simd_float3 half = simd_make_float3(rv.x * 0.5f, rv.y + P(5058), rv.z * 0.5f);  // +0xb4..+0xbc (0x5e1cb0)
@@ -2965,7 +3127,8 @@ void MeshRenderer::encodeTanks(id<MTLCommandBuffer> cb) {
     // Snow drift (0x5e0240): 0.5 wind + a fall of lerp(PP5027, PP5026, drawn / N).
     const int rainN = 1024 * 12, snowN = 12000;
     const int rainDrawn = int(std::floor(w.rain * float(rainN))), snowDrawn = int(std::floor(w.snow * float(snowN)));
-    snowShift_ += simd_make_float3(0, P(5027) + (P(5026) - P(5027)) * (float(snowDrawn) / float(snowN)), 0) * dt;
+    snowShift_ += simd_make_float3(0.5f * wind_.x, 0.5f * wind_.y + P(5027) + (P(5026) - P(5027)) * (float(snowDrawn) / float(snowN)),
+                                   0.5f * wind_.z) * dt;
     auto ensure = [&](__strong id<MTLBuffer>& buf, int n, bool rain) {
         if (buf != nil) return;
         std::vector<simd_float4> d(static_cast<size_t>(n));
@@ -3043,28 +3206,33 @@ void MeshRenderer::loadSfxAtlas(const DpcFile& world) {
         if (!fs::exists(shared)) return;
         sfxShared_ = std::make_unique<DpcFile>(shared.string());
         const DpcFile& d = *sfxShared_;
-        const uint32_t want = asoboCrc("FX_ATLAS_0");
-        for (uint32_t id : d.ids(cls::MaterialAnim)) {
-            const DpcFile::Entry* e = d.find(id);
-            const std::vector<uint8_t> link = d.link(*e);
-            uint32_t name = 0;
-            if (link.size() >= 4) std::memcpy(&name, link.data(), 4);
-            if (name != want) continue;
-            const auto body = d.body(*e);
-            if (!body || body->size() < 0x40) return;
-            uint32_t matId;
-            std::memcpy(&matId, body->data() + 0x3c, 4);
-            const DpcFile::Entry* me = d.find(matId);
-            if (!me) return;
-            const Material mat = parseMaterialBody(d.body(*me).value());
-            const DpcFile::Entry* be = d.find(mat.textures[0]);
-            if (!be) return;
-            uint8_t alphaKind = 0;
-            sfxAtlas_ = uploadBitmap(d, *be, false, &alphaKind);
-            if (std::getenv("FUEL_SFX_DEBUG"))
-                std::fprintf(stderr, "sfx atlas: material %08x bitmap %08x -> %s\n", matId, mat.textures[0], sfxAtlas_ ? "loaded" : "failed");
-            return;
-        }
+        auto load = [&](const char* nameStr) -> id<MTLTexture> {
+            const uint32_t want = asoboCrc(nameStr);
+            for (uint32_t oid : d.ids(cls::MaterialAnim)) {
+                const DpcFile::Entry* e = d.find(oid);
+                const std::vector<uint8_t> link = d.link(*e);
+                uint32_t name = 0;
+                if (link.size() >= 4) std::memcpy(&name, link.data(), 4);
+                if (name != want) continue;
+                const auto body = d.body(*e);
+                if (!body || body->size() < 0x40) return nil;
+                uint32_t matId;
+                std::memcpy(&matId, body->data() + 0x3c, 4);
+                const DpcFile::Entry* me = d.find(matId);
+                if (!me) return nil;
+                const Material mat = parseMaterialBody(d.body(*me).value());
+                const DpcFile::Entry* be = d.find(mat.textures[0]);
+                if (!be) return nil;
+                uint8_t alphaKind = 0;
+                id<MTLTexture> t = uploadBitmap(d, *be, false, &alphaKind);
+                if (std::getenv("FUEL_SFX_DEBUG"))
+                    std::fprintf(stderr, "sfx %s: material %08x bitmap %08x -> %s\n", nameStr, matId, mat.textures[0], t ? "loaded" : "failed");
+                return t;
+            }
+            return nil;
+        };
+        sfxAtlas_ = load("FX_ATLAS_0");
+        cloudTex_ = load("FX_BILLBOARD_CLOUDS");  // the cloud tank's atlas entry 14 (whole texture)
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fuelview: no FX atlas: %s\n", e.what());
     }

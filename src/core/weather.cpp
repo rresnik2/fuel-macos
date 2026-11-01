@@ -49,6 +49,7 @@ WeatherFields::WeatherFields(const DpcFile& world, const std::string& pp001Path)
     load(22, fog_);
     load(21, wind_);
     load(16, sand_);
+    load(2, humidity_);  // 0x4dde20 (weather object + 0x17c90 = second sampler array slot 2)
 }
 
 WeatherAmounts WeatherFields::sample(double x, double y, double z) const {
@@ -73,11 +74,18 @@ WeatherAmounts WeatherFields::sample(double x, double y, double z) const {
     // fog = max(fog field, PP5444 snow, PP5445 rain)
     w.fog = std::max(std::max(field(fog_), P(5444) * w.snow), w.rain * P(5445));
     w.cloud = clamp01(w.cloud), w.fog = clamp01(w.fog), w.rain = clamp01(w.rain), w.snow = clamp01(w.snow);
+    w.humidity = humidity_.valid() ? clamp01(float(humidity_.value(x, z))) : 0.0f;  // 0x4dde20 ends in clamp01
+    const std::array<float, 3> wd = windDirection(x, z);
+    for (int i = 0; i < 3; ++i) w.wind[size_t(i)] = wd[size_t(i)] * w.windSpeed;
     // The debug menu's "Force Rain" / "Force Snow" (0x5f7f90: flags 0xa654d9 / 0xa654da; 0x5b89e0 sets rain = 1,
     // 0x5bba30 starts the tanks with amount 1): FUEL_FORCE_RAIN=1 / FUEL_FORCE_SNOW=1.
     static const bool forceRain = std::getenv("FUEL_FORCE_RAIN") != nullptr, forceSnow = std::getenv("FUEL_FORCE_SNOW") != nullptr;
     if (forceRain) w.rain = 1;
     if (forceSnow) w.snow = 1;
+    // The "Weather" tweak menu's edit mode (0xa654e5) replaces the cloud amount by [0xa022b8] (0x5bba30, 0x5b7e40):
+    // FUEL_FORCE_CLOUD=0..1.
+    static const char* forceCloud = std::getenv("FUEL_FORCE_CLOUD");
+    if (forceCloud) w.cloud = clamp01(float(std::atof(forceCloud)));
     return w;
 }
 
@@ -109,12 +117,53 @@ std::shared_ptr<const WeatherFields> weatherFieldsFor(const DpcFile& world) {
     return w;
 }
 
-Weather weatherHook(const WeatherAmounts& w) {
+float cloudLayerHeight(float cloud, float pp5202, float pp5203) {
+    // 0x5fe040: +0xf8 = (+0x74 - +0x78) x +0x6c + +0x78 with +0x74 = PP5202, +0x78 = PP5203, +0x6c = weather cloud.
+    return (pp5202 - pp5203) * cloud + pp5203;
+}
+
+namespace {
+// The CRT's rand (0x8b3440) on its per-thread seed (srand 0x8b3433).
+struct MsvcRand {
+    uint32_t s;
+    int next() {
+        s = s * 214013u + 2531011u;
+        return int((s >> 16) & 0x7fff);
+    }
+};
+float cornerAngle(int seed, bool extraDraw) {
+    MsvcRand r{uint32_t(seed)};
+    const float a = (float(r.next() % 1000) * 0.001f * 2.0f - 1.0f) * 3.14159f;  // 0x9dc024, 0x9963b8, 0x9dccc0
+    if (extraDraw) r.next();  // the engine draws once more after the first corner (result unused)
+    return a;
+}
+}  // namespace
+
+std::array<float, 3> windDirection(double x, double z) {
+    // 0x5b8330 (asm read): ix = ftol(x 0.001), iz = ftol(z 0.001) with the game's round-down mode.
+    const float fx = float(x) * 0.001f, fz = float(z) * 0.001f;
+    const int ix = int(std::floor(fx)), iz = int(std::floor(fz));
+    const float a00 = cornerAngle(ix * iz, true), a10 = cornerAngle((ix + 1) * iz, false);
+    const float a01 = cornerAngle((iz + 1) * ix, false), a11 = cornerAngle((iz + 1) * (ix + 1), false);
+    const float tx = fx - float(ix), tz = fz - float(iz);
+    const float top = a00 + (a10 - a00) * tx, bottom = (a11 - a01) * tx + a01;
+    const float a = top + (fz - float(iz)) * (bottom - top);
+    (void)tz;
+    const float c = std::cos(a), s = std::sin(a);
+    float v[3] = {c - s, 0.0f, s + c};
+    const float len = std::sqrt(v[0] * v[0] + v[2] * v[2]);
+    return {v[0] / len, 0.0f, v[2] / len};
+}
+
+Weather weatherHook(const WeatherAmounts& w, float cameraY, float pp5202, float pp5203) {
+    // 0x5bba30 (asm read 0x5bbe7c..0x5bc040).
     Weather h;
     h.cloud = w.cloud;
     h.fog = std::max(w.fog, 0.5f * std::max(w.rain, w.snow));
-    // wet = max(rain, snow, clamp01(2 x)) with x from 0x4dde20 (U: not decoded; 0)
-    h.wet = std::max(w.rain, w.snow);
+    h.cloudBase = cloudLayerHeight(w.cloud, pp5202, pp5203) - 400.0f;  // cloud tank +0xf8 - 400 (0x9dbffc)
+    h.cloudTopArg = cameraY;                                            // the reference position's y
+    // wet = max(clamp01(2 x 0x4dde20), max(rain, snow)).
+    h.wet = std::max(std::min(std::max(2.0f * w.humidity, 0.0f), 1.0f), std::max(w.rain, w.snow));
     return h;
 }
 
