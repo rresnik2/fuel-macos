@@ -55,6 +55,11 @@ float band(float x, float lo, float hi, float soft) {
 // fistp in FUEL's game threads rounds down (_RC_DOWN, p21 H0).
 uint8_t hashByte(const Permutation& p, double v) { return p[size_t(int64_t(std::floor(float(v))) & 255)]; }
 
+// The position hash multipliers are 4-byte constants in FUEL.exe ([0x9dc200] = 10.193577766..,
+// [0x9dc204] = 12.317513465.., the Grass_Decide salt [0x9dd558] = 29.823713302.., [0x7dce50]'s mix 931.92828..);
+// the fmul/fadd operands are `dword ptr`, so the double literals are rounded to float first.
+constexpr double kHashZ = double(10.193578f), kHashX = double(12.317513f), kHashSalt = double(29.823713f), kHashMix = double(931.9283f);
+
 uint64_t cellKey(int64_t cx, int64_t cz) { return (uint64_t(uint32_t(int32_t(cx))) << 32) | uint32_t(int32_t(cz)); }
 constexpr double kSurfaceCell = 64.0;
 
@@ -361,7 +366,7 @@ int GroundGenerator::fieldType(double x, double z, const GroundPoint& p, bool ne
     const double i = std::floor(a), j = std::floor(c);  // fistp rounds down in FUEL's threads (p21 H0)
     const float u = float(a - i), v = float(c - j);
     const double cx = i * 200 + 100, cz = j * 200 + 100;
-    const float r = float(hashByte(perm_, cx * 12.317513 + cz * 10.193578)) / 255.0f;
+    const float r = float(hashByte(perm_, cx * kHashX + cz * kHashZ)) / 255.0f;
     *random = r;
     int type = 0;
     if (r > 0.3f && p.humidity > 0.2f && cover < 0.5f && !nearRoad) {
@@ -797,7 +802,7 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
     for (int32_t iz = z0; iz < z1; ++iz)
         for (int32_t ix = x0; ix < x1; ++ix) {
             // Grass_Decide (0x7dddf0): jitter by the permutation nibbles.
-            const uint8_t jb = hashByte(perm_, double(iz) * 10.193578 + double(ix) * 12.317513 + 29.823713);
+            const uint8_t jb = hashByte(perm_, double(iz) * kHashZ + double(ix) * kHashX + kHashSalt);
             const double x = ix + float(jb & 15) * 0.06666667f, z = iz + float(jb >> 4) * 0.06666667f;
             const GroundPoint p = at(x, z);
             const float g = byte64(p.groundGrass);
@@ -807,19 +812,19 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
             const float scale = (byte64(p.grassSize) + 0.5f) * h;
             const float kind = byte64(p.surfaceHumidity);
             // Grass_EmitTuft (0x7dce50).
-            const float r0 = float(hashByte(perm_, z * 10.193578 + x * 12.317513)) / 255.0f, r0s = r0 * r0;
+            const float r0 = float(hashByte(perm_, z * kHashZ + x * kHashX)) / 255.0f, r0s = r0 * r0;
             const float size = std::max(1.0f, (r0s * 0.5f + 0.75f) * scale);
             auto base = uint32_t(std::floor(kind * 5.9f));  // fistp rounds down
             base = std::min(base, 6u);
             const float w0 = tileWeight_[base], w1 = tileWeight_[base + 1], w2 = tileWeight_[base + 2];
             const float inv = 1.0f / (w0 + w1 + w2);
-            const float r1 = float(hashByte(perm_, z * 10.193578 + (double(r0s) * 931.9283 + x) * 12.317513)) / 255.0f;
+            const float r1 = float(hashByte(perm_, z * kHashZ + (double(r0s) * kHashMix + x) * kHashX)) / 255.0f;
             uint32_t tile = base;
             if (w0 * inv <= r1) tile = (w0 * inv + w1 * inv <= r1) ? base + 2 : base + 1;
             const float tileSize = tileSize_[tile];
             if (tileSize <= 0) continue;  // tile 8 has size 0 in the engine's table
             const float u0 = float(tile & 3) * 0.25f;
-            const uint8_t r2 = hashByte(perm_, z * 10.193578 + (double(u0) * 931.9283 + x) * 12.317513);
+            const uint8_t r2 = hashByte(perm_, z * kHashZ + (double(u0) * kHashMix + x) * kHashX);
             GrassTuft tuft{};
             tuft.x = float(x), tuft.z = float(z);
             tuft.y = p.height - (1 - p.normal[1]) * 0.5f;
