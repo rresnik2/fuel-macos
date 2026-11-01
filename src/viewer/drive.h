@@ -156,7 +156,6 @@ public:
     }
     size_t placementCount() const { return placed_.size(); }
     // Procedural trees and bushes (drawn; tree trunks solid within kCollideRadius).
-    // Also seats the FITTOGROUND objects on `terrain`, as the engine does at load.
     void setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain);
     // Surface types for ground clutter (grass tufts, stones); must be thread-safe.
     void setSurfaces(fuel::SurfaceQuery q) { surfaces_ = std::move(q); }
@@ -171,7 +170,7 @@ public:
     // has fully caught up (--capture-spot).
     void settle(simd_float3 player, fuel::MeshRenderer& renderer, fuel::DriveWorld& physics);
     // Placed objects within `radius` of (x, z) whose base is more than `minGap` metres off the
-    // port's terrain (FITTOGROUND objects are seated, so only authored heights show up here).
+    // port's terrain (authored heights; the engine seats no static placement, p35).
     struct GroundGap {
         uint32_t meshId = 0;
         simd_float3 position = {0, 0, 0};  // the placement's origin
@@ -233,7 +232,6 @@ private:
         std::array<float, 16> world;  // row-vector convention
         bool fitToGround = false, groundNormal = false;
     };
-    bool seated_ = false;
     // Movable props, keyed by placement index. A prop keeps its state until it is far away.
     struct Prop {
         std::array<float, 16> world;  // current transform (row-vector convention)

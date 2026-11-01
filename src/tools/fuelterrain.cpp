@@ -5,8 +5,14 @@
 // --pgm compares every sample with a 16-bit PGM export (raw * 65535 / 4095).
 // --seat measures how many objects the sub-worlds next to USA1.DPC place on the
 // ground, with the raw and the levelled (flat surfaces) heightfield.
+// --float adds geometry classes (floating / on another object / elevated origin / buried, p35);
+// FUEL_FLOAT_CLASSES=FILE lists them. --float-dump OUT.tsv: one row per placement for classifying.
+// --file-flats X Z: the authored flat surfaces holding a point; --emu-flat-cmd FILE: EmuRun commands
+// for the emulated flat-distance vectors; --resident: USA1.DPC's own placements.
 
+#include "core/assembly.hpp"
 #include "core/dpc.hpp"
+#include "core/resources.hpp"
 #include "core/events.hpp"
 #include "core/ground.hpp"
 #include "core/ground_point.hpp"
@@ -19,19 +25,335 @@
 #include "core/world.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "core/road_segments.hpp"
 #include "core/water.hpp"
+
+namespace {
+
+// Emulated flat-surface distance vectors (p35 F1): file record index and the point as fractions of
+// the file X and Z axes from the centre (FUEL's half extent is 0.5 of each axis).
+struct EmuFlatPoint {
+    uint32_t index;
+    float fx, fz;
+};
+const EmuFlatPoint kEmuFlatPoints[] = {{510, -0.45f, 0.40f}, {510, 0.30f, -0.47f}, {510, -0.48f, -0.46f}, {510, 0.60f, 0.10f},
+                                       {505, -0.47f, 0.20f}, {505, 0.10f, -0.49f}, {526, 0.30f, 0.30f},   {526, -0.20f, 0.45f},
+                                       {526, 0.70f, 0.00f}};
+
+// --float-dump OUT.tsv (p35): one row per sub-world mesh placement with what classifying a
+// floating object needs: the file, node, its parent and the parent's object class, the
+// prototype name (from USA1's prototype GameObj_Z groups), UserDefine text, scale, the
+// offset from FUEL's ground, the height terms there, and the placement it rests on, if any.
+void dumpPlacements(const fuel::DpcFile& usa1, const std::vector<std::unique_ptr<fuel::DpcFile>>& subs, const fuel::Heightfield& ground,
+                    const char* out) {
+    constexpr uint32_t kNode = 0x85D02528, kLod = 0x73DC6A13, kUserDefine = 0x52F79F96;
+    // Prototype names: USA1's GameObj_Z groups list library nodes; their object is the prototype.
+    std::unordered_map<uint32_t, std::string> protoName;
+    std::unordered_map<uint32_t, size_t> protoGroupSize;  // the smallest group names the prototype
+    for (uint32_t g : usa1.ids(fuel::cls::GameObj)) try {
+            for (const fuel::NodeGroup& grp : fuel::parseGameObjBody(*usa1.body(*usa1.find(g))))
+                for (uint32_t n : grp.nodes)
+                    if (const auto* e = usa1.find(n); e && e->classCrc == kNode)
+                        if (const auto b = usa1.body(*e)) {
+                            const uint32_t obj = fuel::parseNodeBody(*b).object;
+                            auto [it, added] = protoGroupSize.try_emplace(obj, grp.nodes.size());
+                            if (added || grp.nodes.size() < it->second) it->second = grp.nodes.size(), protoName[obj] = grp.name;
+                        }
+        } catch (const std::exception&) {
+        }
+    auto findIn = [&](const fuel::DpcFile& sub, uint32_t id) -> std::pair<const fuel::DpcFile*, const fuel::DpcFile::Entry*> {
+        for (const fuel::DpcFile* f : {&sub, &usa1})
+            if (const auto* e = f->find(id); e && e->header) return {f, e};
+        return {nullptr, nullptr};
+    };
+    struct Row {
+        std::string file, name, ud, parentClass;
+        uint32_t node = 0, parent = 0, object = 0, mesh = 0;
+        bool fit = false;
+        float x = 0, y = 0, z = 0, scale = 1, top = 0, radius = 0;
+    };
+    std::vector<Row> rows;
+    std::unordered_map<uint32_t, std::pair<float, float>> meshTopRadius;  // local max y, xz radius
+    for (const auto& sub : subs) {
+        const std::string file = std::filesystem::path(sub->path()).filename().string();
+        for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, {sub.get(), &usa1})) {
+            Row r;
+            r.file = file, r.node = pm.nodeId, r.mesh = pm.meshId, r.fit = pm.fitToGround;
+            r.x = pm.world[12], r.y = pm.world[13], r.z = pm.world[14];
+            if (std::fabs(r.x) < 50 && std::fabs(r.z) < 50) continue;
+            r.scale = std::sqrt(pm.world[4] * pm.world[4] + pm.world[5] * pm.world[5] + pm.world[6] * pm.world[6]);
+            try {
+                const fuel::Node n = fuel::parseNodeBody(*sub->body(*sub->find(pm.nodeId)));
+                r.parent = n.parent, r.object = n.object;
+                if (auto it = protoName.find(n.object); it != protoName.end()) r.name = it->second;
+                if (auto [f, e] = findIn(*sub, n.userDefine); e && e->classCrc == kUserDefine)
+                    for (const std::string& l : fuel::parseUserDefineBody(*f->body(*e))) r.ud += (r.ud.empty() ? "" : "|") + l.substr(0, 40);
+                if (auto [f, e] = findIn(*sub, n.parent); e && e->classCrc == kNode) {
+                    const fuel::Node p = fuel::parseNodeBody(*f->body(*e));
+                    auto [pf, pe] = findIn(*sub, p.object);
+                    char buf[16];
+                    std::snprintf(buf, sizeof buf, "%08x", pe ? pe->classCrc : 0u);
+                    r.parentClass = p.object == 0 ? "group" : pe && pe->classCrc == kLod ? "Lod" : pe && pe->classCrc == fuel::cls::Mesh ? "Mesh" : buf;
+                }
+            } catch (const std::exception&) {
+            }
+            auto mt = meshTopRadius.find(r.mesh);
+            if (mt == meshTopRadius.end()) {
+                float top = 0, rad = 0;
+                try {
+                    const fuel::CollisionMesh cm = fuel::loadCollisionMesh({sub.get(), &usa1}, r.mesh);
+                    for (size_t i = 0; i + 2 < cm.positions.size(); i += 3)
+                        top = std::max(top, cm.positions[i + 1]), rad = std::max(rad, std::hypot(cm.positions[i], cm.positions[i + 2]));
+                } catch (const std::exception&) {
+                }
+                mt = meshTopRadius.emplace(r.mesh, std::make_pair(top, rad)).first;
+            }
+            r.top = mt->second.first * r.scale, r.radius = mt->second.second * r.scale;
+            rows.push_back(std::move(r));
+        }
+    }
+    // Spatial hash (16 m) for "rests on": another placement whose xz footprint covers this
+    // one's origin and whose top is within 1.5 m of this one's base.
+    std::unordered_map<int64_t, std::vector<uint32_t>> grid;
+    auto key = [](float x, float z) { return (int64_t(std::floor(x / 16)) << 32) ^ int64_t(uint32_t(int32_t(std::floor(z / 16)))); };
+    for (uint32_t i = 0; i < rows.size(); ++i) grid[key(rows[i].x, rows[i].z)].push_back(i);
+    std::FILE* f = std::fopen(out, "w");
+    if (!f) throw std::runtime_error(std::string("cannot write ") + out);
+    std::fprintf(f, "file\tnode\tparent\tparentClass\tobject\tmesh\tname\tfit\tud\tx\ty\tz\tscale\ttop\tradius\tground\td\th0\tdetail\tgulch\tflatA\troad\tflatB\trock\tny\trestsOn\trestsOnD\n");
+    for (const Row& r : rows) {
+        const fuel::GroundSample g = ground.detail->sample(r.x, r.z);
+        const float gr = ground.smoothHeightAt(r.x, r.z);
+        int best = -1;
+        float bestD = 1e9f;
+        for (int dz = -4; dz <= 4; ++dz)
+            for (int dx = -4; dx <= 4; ++dx) {
+                auto it = grid.find(key(r.x + dx * 16, r.z + dz * 16));
+                if (it == grid.end()) continue;
+                for (uint32_t j : it->second) {
+                    const Row& q = rows[j];
+                    if (&q == &r || q.node == r.node || q.y > r.y - 0.3f) continue;
+                    if (std::hypot(q.x - r.x, q.z - r.z) > q.radius) continue;
+                    const float d = std::fabs(q.y + q.top - r.y);
+                    if (d < 1.5f && d < bestD) bestD = d, best = int(j);
+                }
+            }
+        std::fprintf(f, "%s\t%08x\t%08x\t%s\t%08x\t%08x\t%s\t%d\t%s\t%.2f\t%.2f\t%.2f\t%.3f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.3f\t%s\t%.2f\n",
+                     r.file.c_str(), r.node, r.parent, r.parentClass.c_str(), r.object, r.mesh, r.name.empty() ? "-" : r.name.c_str(), r.fit ? 1 : 0,
+                     r.ud.empty() ? "-" : r.ud.c_str(), r.x, r.y, r.z, r.scale, r.top, r.radius, gr, r.y - gr, g.h0, g.detail, g.gulch, g.flatA, g.road,
+                     g.flatB, g.rock, g.ny, best < 0 ? "-" : (rows[size_t(best)].name.empty() ? "?" : rows[size_t(best)].name.c_str()), best < 0 ? 0.0f : bestD);
+    }
+    std::fclose(f);
+    std::printf("float-dump: %zu placements -> %s\n", rows.size(), out);
+}
+
+// --float (p35): classify every sub-world mesh placement by its geometry, not only its origin.
+// The origin offset (authored y - FUEL's ground) cannot tell a floating prop from one that stands on a
+// bridge, a building or another prop, or a big mesh whose origin is not at its base. Here each
+// placement's mesh vertices (the lowest 64 in its own space plus 32 spread over it and the top one)
+// are taken to world space; a vertex is supported when it is at most 0.5 m above the ground or above
+// the top of another placement's triangles under it (vertical ray). Classes:
+//   floating   no sampled vertex within 0.5 m of a supporting surface (the object hangs in the air)
+//   on object  origin > 0.5 m above the ground, supported by another placement (a surface under a vertex
+//              within 0.5 m, or a vertex within 0.3 m of its triangles: hung on or leaning on it)
+//   elevated   origin > 0.5 m above the ground, but the mesh itself reaches the ground
+//   buried     every sampled vertex (and the top) more than 0.3 m under the ground
+// Distance from p to triangle abc (closest point on the triangle, Ericson's region test).
+float pointTriangleDistance(const float* p, const float* a, const float* b, const float* c) {
+    auto sub = [](const float* u, const float* v, float* o) { o[0] = u[0] - v[0], o[1] = u[1] - v[1], o[2] = u[2] - v[2]; };
+    auto dot = [](const float* u, const float* v) { return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]; };
+    float ab[3], ac[3], ap[3], bp[3], cp[3], q[3];
+    sub(b, a, ab), sub(c, a, ac), sub(p, a, ap);
+    auto at = [&](float s, float t) {
+        for (int k = 0; k < 3; ++k) q[k] = a[k] + s * ab[k] + t * ac[k];
+        const float d[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+        return std::sqrt(dot(d, d));
+    };
+    const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) return at(0, 0);
+    sub(p, b, bp);
+    const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) return at(1, 0);
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) return at(d1 / (d1 - d3), 0);
+    sub(p, c, cp);
+    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) return at(0, 1);
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) return at(0, d2 / (d2 - d6));
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return at(1 - w, w);
+    }
+    const float den = 1 / (va + vb + vc);
+    return at(vb * den, vc * den);
+}
+
+struct FloatClasses {
+    size_t total = 0, onGround = 0, floating = 0, floating2 = 0, onObject = 0, elevated = 0, buried = 0, sunkOrigin = 0;
+};
+
+FloatClasses classifyPlacements(const fuel::DpcFile& usa1, const std::vector<std::unique_ptr<fuel::DpcFile>>& subs, const fuel::Heightfield& ground,
+                                bool includeFit, std::FILE* list) {
+    struct MeshGeo {
+        std::vector<float> pos;            // local xyz
+        std::vector<uint32_t> idx;         // triangles
+        std::vector<uint32_t> sample;      // vertex indices tested for support
+        float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+    };
+    struct Pl {
+        const MeshGeo* geo;
+        std::array<float, 16> m;
+        float lo[3], hi[3];  // world AABB
+        uint32_t mesh;
+        std::string file;
+    };
+    std::unordered_map<uint32_t, MeshGeo> geos;
+    std::vector<Pl> pls;
+    auto xf = [](const std::array<float, 16>& m, const float* v, float* o) {
+        for (int c = 0; c < 3; ++c) o[c] = v[0] * m[c] + v[1] * m[4 + c] + v[2] * m[8 + c] + m[12 + c];
+    };
+    for (const auto& sub : subs)
+        for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(*sub, {sub.get(), &usa1})) {
+            if (std::fabs(pm.world[12]) < 50 && std::fabs(pm.world[14]) < 50) continue;
+            if (pm.fitToGround && !includeFit) continue;
+            auto it = geos.find(pm.meshId);
+            if (it == geos.end()) {
+                MeshGeo g;
+                try {
+                    fuel::CollisionMesh cm = fuel::loadCollisionMesh({sub.get(), &usa1}, pm.meshId);
+                    g.pos = std::move(cm.positions), g.idx = std::move(cm.indices);
+                } catch (const std::exception&) {
+                }
+                const size_t n = g.pos.size() / 3;
+                std::vector<uint32_t> order(n);
+                for (uint32_t k = 0; k < n; ++k) order[k] = k;
+                std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return g.pos[3 * a + 1] < g.pos[3 * b + 1]; });
+                for (size_t k = 0; k < std::min<size_t>(64, n); ++k) g.sample.push_back(order[k]);
+                for (size_t k = 0; n > 0 && k < 32; ++k) g.sample.push_back(order[k * n / 32]);
+                if (n > 0) g.sample.push_back(order[n - 1]);
+                for (size_t k = 0; k < n; ++k)
+                    for (int c = 0; c < 3; ++c) g.lo[c] = std::min(g.lo[c], g.pos[3 * k + c]), g.hi[c] = std::max(g.hi[c], g.pos[3 * k + c]);
+                if (const char* dbg = std::getenv("FUEL_MESH_DEBUG"); dbg && std::strtoul(dbg, nullptr, 16) == pm.meshId) {
+                    std::printf("mesh %08x: %zu vertices, %zu triangles, y %.2f..%.2f; lowest:", pm.meshId, n, g.idx.size() / 3, g.lo[1], g.hi[1]);
+                    for (size_t k = 0; k < std::min<size_t>(8, n); ++k) std::printf(" (%.2f %.2f %.2f)", g.pos[3 * order[k]], g.pos[3 * order[k] + 1], g.pos[3 * order[k] + 2]);
+                    std::printf("\n");
+                }
+                it = geos.emplace(pm.meshId, std::move(g)).first;
+            }
+            if (it->second.sample.empty()) continue;
+            Pl p{&it->second, pm.world, {1e9f, 1e9f, 1e9f}, {-1e9f, -1e9f, -1e9f}, pm.meshId, std::filesystem::path(sub->path()).filename().string()};
+            for (int k = 0; k < 8; ++k) {
+                const float v[3] = {(k & 1) ? p.geo->hi[0] : p.geo->lo[0], (k & 2) ? p.geo->hi[1] : p.geo->lo[1], (k & 4) ? p.geo->hi[2] : p.geo->lo[2]};
+                float w[3];
+                xf(p.m, v, w);
+                for (int c = 0; c < 3; ++c) p.lo[c] = std::min(p.lo[c], w[c]), p.hi[c] = std::max(p.hi[c], w[c]);
+            }
+            pls.push_back(std::move(p));
+        }
+    // 32 m spatial hash of the world AABBs.
+    std::unordered_map<int64_t, std::vector<uint32_t>> grid;
+    auto key = [](int64_t cx, int64_t cz) { return (cx << 32) ^ int64_t(uint32_t(int32_t(cz))); };
+    for (uint32_t i = 0; i < pls.size(); ++i)
+        for (int64_t cz = int64_t(std::floor(pls[i].lo[2] / 32)); cz <= int64_t(std::floor(pls[i].hi[2] / 32)); ++cz)
+            for (int64_t cx = int64_t(std::floor(pls[i].lo[0] / 32)); cx <= int64_t(std::floor(pls[i].hi[0] / 32)); ++cx) grid[key(cx, cz)].push_back(i);
+    std::unordered_map<uint32_t, std::vector<float>> worldTris;  // placement -> world vertex positions, on demand
+    auto surfaceBelow = [&](uint32_t self, float x, float y, float z) {
+        float best = -1e9f;
+        auto it = grid.find(key(int64_t(std::floor(x / 32)), int64_t(std::floor(z / 32))));
+        if (it == grid.end()) return best;
+        for (uint32_t q : it->second) {
+            const Pl& Q = pls[q];
+            if (q == self || x < Q.lo[0] || x > Q.hi[0] || z < Q.lo[2] || z > Q.hi[2] || Q.lo[1] > y + 0.5f || Q.hi[1] < best) continue;
+            auto [wt, added] = worldTris.try_emplace(q);
+            if (added) {
+                wt->second.resize(Q.geo->pos.size());
+                for (size_t k = 0; k < Q.geo->pos.size(); k += 3) xf(Q.m, &Q.geo->pos[k], &wt->second[k]);
+            }
+            const std::vector<float>& P = wt->second;
+            const std::vector<uint32_t>& I = Q.geo->idx;
+            for (size_t t = 0; t + 2 < I.size(); t += 3) {
+                const float *a = &P[3 * I[t]], *b = &P[3 * I[t + 1]], *c = &P[3 * I[t + 2]];
+                const float d = (b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2]);
+                if (std::fabs(d) < 1e-9f) continue;
+                const float u = ((x - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (z - a[2])) / d, v = ((b[0] - a[0]) * (z - a[2]) - (x - a[0]) * (b[2] - a[2])) / d;
+                if (u < 0 || v < 0 || u + v > 1) continue;
+                const float h = a[1] + u * (b[1] - a[1]) + v * (c[1] - a[1]);
+                if (h <= y + 0.5f && h > best) best = h;
+            }
+        }
+        return best;
+    };
+    // Another placement's triangles within 0.3 m of a point (an object hung on, or leaning on, another).
+    auto touches = [&](uint32_t self, const float* v) {
+        auto it = grid.find(key(int64_t(std::floor(v[0] / 32)), int64_t(std::floor(v[2] / 32))));
+        if (it == grid.end()) return false;
+        constexpr float r = 0.3f;
+        for (uint32_t q : it->second) {
+            const Pl& Q = pls[q];
+            if (q == self || v[0] < Q.lo[0] - r || v[0] > Q.hi[0] + r || v[1] < Q.lo[1] - r || v[1] > Q.hi[1] + r || v[2] < Q.lo[2] - r ||
+                v[2] > Q.hi[2] + r)
+                continue;
+            auto [wt, added] = worldTris.try_emplace(q);
+            if (added) {
+                wt->second.resize(Q.geo->pos.size());
+                for (size_t k = 0; k < Q.geo->pos.size(); k += 3) xf(Q.m, &Q.geo->pos[k], &wt->second[k]);
+            }
+            const std::vector<float>& P = wt->second;
+            const std::vector<uint32_t>& I = Q.geo->idx;
+            for (size_t t = 0; t + 2 < I.size(); t += 3)
+                if (pointTriangleDistance(v, &P[3 * I[t]], &P[3 * I[t + 1]], &P[3 * I[t + 2]]) < r) return true;
+        }
+        return false;
+    };
+    FloatClasses fc;
+    for (uint32_t i = 0; i < pls.size(); ++i) {
+        const Pl& p = pls[i];
+        ++fc.total;
+        const float origin = p.m[13] - ground.smoothHeightAt(p.m[12], p.m[14]);
+        float minGap = 1e9f, maxAbove = -1e9f;
+        bool byObject = false;
+        for (uint32_t k : p.geo->sample) {
+            float w[3];
+            xf(p.m, &p.geo->pos[3 * k], w);
+            const float g = ground.smoothHeightAt(w[0], w[2]);
+            maxAbove = std::max(maxAbove, w[1] - g);
+            float gap = w[1] - g;
+            if (gap > 0.5f && minGap > 0.5f) {
+                const float s = surfaceBelow(i, w[0], w[1], w[2]);
+                if (w[1] - s < gap) gap = w[1] - s, byObject = byObject || gap <= 0.5f;
+                if (gap > 0.5f && touches(i, w)) gap = 0, byObject = true;
+            }
+            minGap = std::min(minGap, gap);
+        }
+        const char* cls;
+        if (maxAbove < -0.3f) cls = "buried", ++fc.buried;
+        else if (minGap > 0.5f) cls = "floating", ++fc.floating, fc.floating2 += minGap > 2.0f;
+        else if (origin > 0.5f) cls = byObject ? "on-object" : "elevated", ++(byObject ? fc.onObject : fc.elevated);
+        else cls = "ground", ++fc.onGround;
+        fc.sunkOrigin += origin < -0.5f;
+        if (list && (std::strcmp(cls, "ground") != 0 || std::fabs(origin) > 0.5f))
+            std::fprintf(list, "%s\t%s\t%08x\t%.2f\t%.2f\t%.2f\t%+.2f\t%.2f\t%.2f\n", cls, p.file.c_str(), p.mesh, p.m[12], p.m[13], p.m[14], origin,
+                         minGap > 1e8f ? -1.0f : minGap, p.geo->hi[1] - p.geo->lo[1]);
+    }
+    return fc;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -52,6 +374,76 @@ int main(int argc, char** argv) {
             if (a == "--levelled") {  // FUEL's ground (procedural detail) for later --at queries
                 const_cast<fuel::Heightfield&>(hf) = fuel::loadLevelledHeightfield(dpc);
                 std::printf("procedural ground attached\n");
+            } else if (a == "--file-flats" && i + 2 < argc) {  // --file-flats X Z: file flat surfaces holding (X, Z) and the height terms
+                const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr);
+                i += 2;
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                const fuel::GroundSample g = ground.detail->sample(X, Z);
+                std::printf("(%.1f, %.1f): h0 %.2f detail %.2f gulch %.2f flatA %.2f road %.2f flatB %.2f ground %.2f\n", X, Z, g.h0, g.detail, g.gulch,
+                            g.flatA, g.road, g.flatB, g.ground);
+                for (const auto& f : ground.detail->fileFlatsAt(X, Z)) {
+                    std::printf("  flat %u %s%s prio %3d c (%.1f, %.2f, %.1f) len %.1f x %.1f d %+.1f P %.2f str %.2f margin %.1f raw40:", f.index,
+                                f.listB ? "B" : "A", f.ellipse ? " ellipse" : "", f.priority, f.cx, f.cy, f.cz, f.lenX, f.lenZ, f.d, f.P, f.strength,
+                                f.margin);
+                    for (size_t k = 0x40; k < f.raw.size(); ++k) std::printf("%s%02x", (k & 3) ? "" : " ", f.raw[k]);
+                    std::printf("\n");
+                }
+            } else if (a == "--resident") {  // p35: USA1.DPC's own mesh placements away from the origin library
+                size_t n = 0, far = 0;
+                std::unordered_map<uint32_t, size_t> perMesh;
+                for (const fuel::PlacedMesh& pm : fuel::collectPlacedMeshes(dpc, {&dpc})) {
+                    ++n;
+                    if (std::fabs(pm.world[12]) < 50 && std::fabs(pm.world[14]) < 50) continue;
+                    ++far, ++perMesh[pm.meshId];
+                    if (std::getenv("FUEL_RESIDENT_LIST")) std::printf("resident %08x %08x %.1f %.1f %.1f\n", pm.nodeId, pm.meshId, pm.world[12], pm.world[13], pm.world[14]);
+                }
+                std::printf("USA1 resident mesh placements: %zu, away from the origin %zu (%zu meshes)\n", n, far, perMesh.size());
+            } else if (a == "--emu-flat-cmd" && i + 1 < argc) {
+                // Writes an EmuRun.java command file (p35 F1): for file flat surfaces next to the
+                // regression points, the shape FUEL's loader 0x77d480 builds (SetShape 0x79c330 with
+                // ECX = X / (0.5 |X|^2), EDX = Z / (0.5 |Z|^2), float32) and the inside distance
+                // 0x799020 (jitter 0) at points spread over the shape; prints the port's distances.
+                const std::string out = argv[++i];
+                const fuel::Heightfield ground = fuel::loadLevelledHeightfield(dpc);
+                std::ofstream f(out);
+                f.precision(9);
+                const uint32_t obj = 0x23000000, C = 0x23001000, AX = 0x23001010, AZ = 0x23001020, P = 0x23001030;
+                for (const auto& [index, fa, fb] : kEmuFlatPoints) {
+                    const fuel::TerrainDetail::FileFlatInfo info = ground.detail->fileFlat(index, 0, 0);
+                    float v[16];
+                    std::memcpy(v, info.raw.data() + 4, 64);  // X, N, Z, centre (rows of 4)
+                    auto axis = [&](const float* r, uint32_t at) {
+                        const float k = float(1.0 / (0.5 * double(float(std::sqrt(double(r[0]) * r[0] + double(r[1]) * r[1] + double(r[2]) * r[2]))) *
+                                                     double(float(std::sqrt(double(r[0]) * r[0] + double(r[1]) * r[1] + double(r[2]) * r[2])))));
+                        for (int c = 0; c < 3; ++c) f << "wf " << at + 4 * c << " " << float(r[c] * k) << "\n";
+                        f << "wf " << at + 12 << " 0\n";
+                    };
+                    f << "reset\nzero " << obj << " 0xb0\n";
+                    for (int c = 0; c < 3; ++c) f << "wf " << C + 4 * c << " " << v[12 + c] << "\n";
+                    f << "wf " << C + 12 << " 1\n";
+                    axis(v, AX), axis(v + 8, AZ);
+                    f << "pushf " << *reinterpret_cast<const float*>(info.raw.data() + 0x4c) << "\nreg ESI " << obj << "\nreg EAX " << C << "\nreg ECX " << AX
+                      << "\nreg EDX " << AZ << "\ncall 0x79c330\n";
+                    f << "w32 " << obj + 0xa4 << " " << (info.ellipse ? 0x100 : 0) << "\n";  // +0xa5 shape (file +0x82), set by the loader
+                    const float x = v[12] + fa * v[0] + fb * v[8], z = v[14] + fa * v[2] + fb * v[10];
+                    f << "wf " << P << " " << x << "\nwf " << P + 4 << " " << v[13] << "\nwf " << P + 8 << " " << z << "\nwf " << P + 12 << " 1\n";
+                    f << "pushf 0\nreg ESI " << obj << "\nreg EDI " << P << "\ncall 0x799020\n";
+                    std::printf("flat %u (%s) at (%.3f, %.3f): port d %.6f\n", index, info.ellipse ? "ellipse" : "rect", x, z,
+                                ground.detail->fileFlat(index, x, z).d);
+                }
+                std::printf("wrote %s\n", out.c_str());
+            } else if (a == "--float-dump" && i + 1 < argc) {
+                const char* out = argv[++i];
+                std::vector<std::unique_ptr<fuel::DpcFile>> subs;
+                for (const auto& e : std::filesystem::directory_iterator(std::filesystem::path(argv[1]).parent_path())) {
+                    if (e.path().extension() != ".DPC" || e.path().filename() == "USA1.DPC") continue;
+                    try {
+                        auto d = std::make_unique<fuel::DpcFile>(e.path().string());
+                        if (d->isCurrentVersion()) subs.push_back(std::move(d));
+                    } catch (const std::exception&) {
+                    }
+                }
+                dumpPlacements(dpc, subs, fuel::loadLevelledHeightfield(dpc), out);
             } else if (a == "--seat" || a == "--float") {
                 // Placed objects against the map B-spline (old port ground) and FUEL's ground.
                 // --seat: fixed placements within 0.5 / 2 m. --float: every non-FITTOGROUND
@@ -99,6 +491,19 @@ int main(int argc, char** argv) {
                 std::printf("procedural flat surfaces built: %zu, work bumps: %zu\n", ground.detail->proceduralFlatCount(), ground.detail->workBumpCount());
                 std::printf("within 0.5 m: map %zu, FUEL ground %zu; within 2 m: map %zu, FUEL ground %zu\n", onRaw, onNew, nearRaw, nearNew);
                 if (a == "--float") {
+                    // p35: what the origin offsets do not show (see classifyPlacements). FUEL never seats static
+                    // FITTOGROUND placements (only AutoMesh spawns 0x778650 read the keyword), so "all" counts them too.
+                    std::FILE* list = std::getenv("FUEL_FLOAT_CLASSES") ? std::fopen(std::getenv("FUEL_FLOAT_CLASSES"), "w") : nullptr;
+                    const auto c0 = std::chrono::steady_clock::now();
+                    for (bool all : {false, true}) {
+                        const FloatClasses fc = classifyPlacements(dpc, subs, ground, all, all ? list : nullptr);
+                        std::printf("float classes (%s, %zu): on the ground %zu, floating %zu (%zu > 2 m), on another object %zu, elevated origin "
+                                    "(mesh reaches the ground) %zu, buried %zu; origin > 0.5 m under the ground %zu\n",
+                                    all ? "all incl. FITTOGROUND" : "fixed", fc.total, fc.onGround, fc.floating, fc.floating2, fc.onObject, fc.elevated, fc.buried,
+                                    fc.sunkOrigin);
+                    }
+                    if (list) std::fclose(list);
+                    std::printf("float classes: %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count());
                     std::printf("float: off by > 0.5 m: map %zu, FUEL ground %zu (%zu above, %zu below); > 4 m: map %zu, FUEL ground %zu\n",
                                 offRaw05, offNew05, aboveNew, belowNew, offRaw4, offNew4);
                     std::sort(devNew.begin(), devNew.end());
@@ -309,7 +714,8 @@ int main(int argc, char** argv) {
                     double x, z, h;
                 };
                 // Port values (notes p31 "Vectors"), recorded after the morph/LOD port (heights unchanged by it).
-                const Pt pts[] = {{-39570.0, -28068.0, 863.728}, {45850.0, -6250.0, 1153.995}, {62652.4, 12699.0, 896.835},
+                // (45850, -6250) re-recorded by p35 (file flat surfaces half the size, F1; was 1153.995).
+                const Pt pts[] = {{-39570.0, -28068.0, 863.728}, {45850.0, -6250.0, 1154.503}, {62652.4, 12699.0, 896.835},
                                   {-39700.0, -28300.0, 898.577}, {0.0, 0.0, 1750.413}};
                 for (const Pt& q : pts) {
                     const double h = ground.smoothHeightAt(q.x, q.z);
@@ -385,6 +791,25 @@ int main(int argc, char** argv) {
                     const bool okD = std::fabs(gp.dune - 1.0f) < 1e-4f && gp.sand > 0.5f;
                     ++checked, bad += !okD;
                     std::printf("Dune at the Sand Dunes (4900, 35538) = %.3f, SandTexture %.3f (recorded 1, > 0.5) %s\n", gp.dune, gp.sand, okD ? "match" : "MISMATCH");
+                }
+                // (5) Emulated file flat-surface distances (p35 F1): SetShape 0x79c330 fed the axes FUEL's loader
+                // 0x77d480 builds (ECX = X / (0.5 |X|^2), EDX = Z / (0.5 |Z|^2)), then 0x799020 with jitter 0, under
+                // EmuRun.java (command file from --emu-flat-cmd); the points are kEmuFlatPoints in order.
+                {
+                    const double emu[] = {-1.22354739, 1.60087672, -9.73431509, 0.0, 3.21735287, 1.16814735, 6.48721729, 0.645581101, -17.1307408};
+                    size_t k = 0;
+                    for (const EmuFlatPoint& q : kEmuFlatPoints) {
+                        const auto info = ground.detail->fileFlat(q.index, 0, 0);
+                        float v[16];
+                        std::memcpy(v, info.raw.data() + 4, 64);
+                        const float x = v[12] + q.fx * v[0] + q.fz * v[8], z = v[14] + q.fx * v[2] + q.fz * v[10];
+                        const double d = ground.detail->fileFlat(q.index, x, z).d;
+                        const bool ok = std::fabs(d - emu[k]) < 1e-3;
+                        ++checked, bad += !ok;
+                        std::printf("emulated 0x799020 flat %u %s (%.3f, %.3f) = %.6f, port %.6f %s\n", q.index, info.ellipse ? "ellipse" : "rect", x, z,
+                                    emu[k], d, ok ? "match" : "MISMATCH");
+                        ++k;
+                    }
                 }
                 std::printf("terrain vectors: %d of %d match\n", checked - bad, checked);
                 if (bad) return 1;

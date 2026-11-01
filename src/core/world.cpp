@@ -28,8 +28,9 @@ Found find(const std::vector<const DpcFile*>& lookup, uint32_t id) {
     return {};
 }
 
-// FITTOGROUND / GROUNDNORMAL keywords of a node's UserDefine_Z (the engine also
-// accepts the misspelling FITOGROUND, which the data uses five times).
+// FITTOGROUND / GROUNDNORMAL keywords of a node's UserDefine_Z. The engine's keyword search
+// 0x7b1bc0 compares whole tokens case-insensitively (_strnicmp, equal lengths), so the data's
+// five misspelt FITOGROUND never match.
 void groundFlags(const std::vector<const DpcFile*>& lookup, uint32_t userDefine, bool& fit, bool& normal) {
     fit = normal = false;
     if (userDefine == 0) return;
@@ -38,7 +39,7 @@ void groundFlags(const std::vector<const DpcFile*>& lookup, uint32_t userDefine,
     const auto body = f.file->body(*f.entry);
     if (!body) return;
     for (const std::string& line : parseUserDefineBody(*body)) {
-        if (line == "FITTOGROUND" || line == "FITOGROUND") fit = true;
+        if (line == "FITTOGROUND") fit = true;
         if (line == "GROUNDNORMAL") normal = true;
     }
 }

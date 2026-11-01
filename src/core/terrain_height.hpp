@@ -128,6 +128,19 @@ public:
     // Their grass fields are the constructor's (0x74cb50): +0x90 = 1, +0x94 = +0x98 = +0x9c = 0.
     void proceduralFlatsAt(double x, double z, double jitter, const std::function<void(double d, double invMargin)>& fn) const;
     size_t workBumpCount() const;        // built so far
+    // The file flat surfaces (GenWorld_Z records) whose cell box holds (x, z), for diagnostics:
+    // record index, centre, half lengths, priority, list B, ellipse, inside distance (no jitter),
+    // plane height P there, strength, margin, and the record's raw 0x83 bytes.
+    struct FileFlatInfo {
+        uint32_t index;
+        double cx, cy, cz, lenX, lenZ, d, P, strength, margin;
+        int priority;
+        bool listB, ellipse;
+        std::vector<uint8_t> raw;
+    };
+    std::vector<FileFlatInfo> fileFlatsAt(double x, double z) const;
+    // The same for record `index` at any point (d may be negative outside).
+    FileFlatInfo fileFlat(uint32_t index, double x, double z) const;
     // The height with flags 5 (0x64a2a0 | 1): detail, roads and the snow lift, no gulches, flat
     // surfaces or work bumps (what 0x799910 probes the ground with).
     double roadHeight(double x, double z) const;
@@ -174,6 +187,7 @@ private:
     Fractal b5efc_, b4f28_, b1fac_, bfd44_, b7ea4_, b11cec_;  // ground noise bank (p14 G3)
 
     std::vector<Flat> flats_;
+    std::vector<std::vector<uint8_t>> flatRaw_;  // the 0x83-byte records, for diagnostics
     std::unordered_map<uint64_t, std::vector<uint32_t>> flatCells_;
     std::vector<GulchLine> gulchLines_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> gulchCells_;

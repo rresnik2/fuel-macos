@@ -125,13 +125,19 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
         Surface s{};
         const double X[3] = {f32(r + 4), f32(r + 8), f32(r + 12)}, Z[3] = {f32(r + 36), f32(r + 40), f32(r + 44)};
         s.cx = f32(r + 52), s.cz = f32(r + 60);
+        // The file axes span the whole surface: the loader 0x77d480 hands SetShape 0x79c330 the
+        // axis v / (0.5 |v|^2) (0.5 = [0x9960c0]) and SetShape keeps 1 / |axis| = |v| / 2 as the
+        // half extent (+0x74 / +0x78), the distance 0x799020 projects onto the same axes (p35 F1).
         auto ground = [](const double v[3], double& gx, double& gz, double& len) {
-            len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            len = 0.5 * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
             const double h = std::hypot(v[0], v[2]);
             gx = h > 0 ? v[0] * len / h : 0, gz = h > 0 ? v[2] * len / h : 0;
         };
-        ground(X, s.ax, s.az, s.lenX);
-        ground(Z, s.bx, s.bz, s.lenZ);
+        // The loader passes the file X axis as SetShape's ECX (-> +0x30, half extent +0x78) and the
+        // Z axis as EDX (-> +0x20, +0x74); 0x799020 cuts the rounded corners on the side where the
+        // +0x30 projection is negative. Here the first axis is +0x20 (file Z), the second +0x30.
+        ground(Z, s.ax, s.az, s.lenX);
+        ground(X, s.bx, s.bz, s.lenZ);
         if (s.lenX < 1e-3 || s.lenZ < 1e-3) continue;
         s.invMargin = 1.0f / std::max(f32(r + 0x4c), 0.1f);
         s.grassCut = f32(r + 0x54), s.grassNoise = f32(r + 0x58), s.grassAdd = f32(r + 0x5c), s.w300 = f32(r + 0x60);
@@ -207,7 +213,7 @@ double GroundGenerator::insideDistance(const Surface& s, double x, double z) con
     const double u = (dx * s.ax + dz * s.az) / (s.lenX * s.lenX), v = (dx * s.bx + dz * s.bz) / (s.lenZ * s.lenZ);
     if (s.ellipse) {
         const double rr = std::hypot(u, v);
-        if (rr == 0) return std::min(s.lenX, s.lenZ);
+        if (rr == 0) return std::hypot(s.lenX, s.lenZ);  // +0x70 (SetShape 0x79c330)
         const double ex = s.cx + s.ax * (u / rr) + s.bx * (v / rr) - x, ez = s.cz + s.az * (u / rr) + s.bz * (v / rr) - z;
         const double d = std::hypot(ex, ez);
         return rr > 1 ? -d : d;

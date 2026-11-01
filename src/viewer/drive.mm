@@ -367,27 +367,11 @@ WorldStreamer::WorldStreamer(const std::vector<const fuel::DpcFile*>& subWorlds,
 }
 
 void WorldStreamer::setVegetation(const fuel::Vegetation* v, const fuel::Heightfield* terrain) {
+    // Static placements keep their authored height, FITTOGROUND or not: the engine reads that
+    // keyword (and GROUNDNORMAL) only in 0x778650, the AutoMesh spawn of ground elements of kind
+    // 0x17 (0x779440), never for sub-world nodes (p35 F2; the strings' only references, and the
+    // keyword search 0x7b1bc0's only caller).
     vegetation_ = v, terrain_ = terrain;
-    if (terrain == nullptr || seated_) return;
-    seated_ = true;
-    for (Placed& p : placed_) {
-        if (!p.fitToGround) continue;
-        const float x = p.world[12], z = p.world[14];
-        p.world[13] = terrain->smoothHeightAt(x, z);
-        if (!p.groundNormal) continue;
-        // Tilt the object's axes by the rotation that takes +y to the terrain normal.
-        constexpr float e = 2.0f;
-        const float dx = (terrain->smoothHeightAt(x + e, z) - terrain->smoothHeightAt(x - e, z)) / (2 * e);
-        const float dz = (terrain->smoothHeightAt(x, z + e) - terrain->smoothHeightAt(x, z - e)) / (2 * e);
-        const simd_float3 n = simd_normalize(simd_make_float3(-dx, 1, -dz));
-        const simd_float3 axis = simd_cross(simd_make_float3(0, 1, 0), n);
-        if (simd_length(axis) < 1e-5f) continue;
-        const simd_quatf q = simd_quaternion(std::asin(std::min(1.0f, simd_length(axis))), simd_normalize(axis));
-        for (size_t r = 0; r < 3; ++r) {
-            const simd_float3 row = simd_act(q, simd_make_float3(p.world[r * 4], p.world[r * 4 + 1], p.world[r * 4 + 2]));
-            p.world[r * 4] = row.x, p.world[r * 4 + 1] = row.y, p.world[r * 4 + 2] = row.z;
-        }
-    }
 }
 
 // Bounding circle (ground plane) of a placement, from its mesh's bounding sphere.
@@ -857,7 +841,7 @@ std::vector<WorldStreamer::GroundGap> WorldStreamer::groundGaps(double x, double
             if (it == cells_.end()) continue;
             for (uint32_t i : it->second) {
                 const Placed& p = placed_[i];
-                if (p.fitToGround || std::hypot(p.world[12] - x, p.world[14] - z) > radius) continue;
+                if (std::hypot(p.world[12] - x, p.world[14] - z) > radius) continue;
                 const float gap = p.world[13] - terrain_->smoothHeightAt(p.world[12], p.world[14]);
                 if (std::fabs(gap) >= minGap) out.push_back({p.meshId, simd_make_float3(p.world[12], p.world[13], p.world[14]), gap});
             }
