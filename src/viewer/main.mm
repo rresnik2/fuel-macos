@@ -1076,27 +1076,35 @@ std::vector<fuel::CamCheckItem> riderCheckItems(const std::string& dataDir) {
         out.push_back({"Rider tables 0x5d6950/0x5d3660", false, err});
         return out;
     }
-    static const int kMbike[47] = {/* engine table removed from the published history; read from FUEL.exe at run time */};
-    bool ok = true;
-    std::string row;
-    for (int k = 0; k < 47; ++k) ok = ok && t->slots[2][size_t(k)] == kMbike[k], row += " " + std::to_string(t->slots[2][size_t(k)]);
-    out.push_back({"Slot table 0x5d6950 MBIKE actions 0..46", ok, "got" + row});
-    static const int kBase[11] = {/* engine table removed from the published history; read from FUEL.exe at run time */};
-    ok = true, row.clear();
-    for (int a = 0; a < 11; ++a) ok = ok && t->slots[size_t(a)][0] == kBase[a], row += " " + std::to_string(t->slots[size_t(a)][0]);
-    out.push_back({"Slot table 0x5d6950 base slots (11 archetypes)", ok, "got" + row});
-    // R3 action properties {group, priority, mode}
-    auto want = [](int k) -> std::array<int, 3> {
-        return {0, 0, 0};  // engine table removed from the published history; read from FUEL.exe at run time
+    // The emulated tables are compared by an FNV-1a hash of their values (as little-endian int32)
+    // so the engine tables themselves stay out of the repo (hard rule).
+    auto fnv = [](const std::vector<int32_t>& v) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (int32_t x : v) {
+            unsigned char b[4];
+            std::memcpy(b, &x, 4);
+            for (unsigned char c : b) h = (h ^ c) * 0x100000001b3ull;
+        }
+        return h;
     };
-    ok = true;
-    int bad = -1;
+    auto hashItem = [&](const char* name, const std::vector<int32_t>& v, uint64_t want) {
+        char b[64];
+        std::snprintf(b, sizeof b, "hash %016llx", (unsigned long long)fnv(v));
+        out.push_back({name, fnv(v) == want, b});
+    };
+    std::vector<int32_t> v;
+    for (int k = 0; k < 47; ++k) v.push_back(t->slots[2][size_t(k)]);
+    hashItem("Slot table 0x5d6950 MBIKE actions 0..46", v, 0x88f062ef35186e64ull);
+    v.clear();
+    for (int a = 0; a < 11; ++a) v.push_back(t->slots[size_t(a)][0]);
+    hashItem("Slot table 0x5d6950 base slots (11 archetypes)", v, 0x577c694593b576f7ull);
+    // R3 action properties {group, priority, mode}
+    v.clear();
     for (int k = 0; k < 47; ++k) {
-        const auto w = want(k);
         const auto& p = t->props[size_t(k)];
-        if (p.group != w[0] || p.priority != w[1] || p.mode != w[2]) ok = false, bad = bad < 0 ? k : bad;
+        v.insert(v.end(), {int32_t(p.group), int32_t(p.priority), int32_t(p.mode)});
     }
-    out.push_back({"Action props 0x5d3660 (47 actions)", ok, ok ? "all 47 records" : "first difference at action " + std::to_string(bad)});
+    hashItem("Action props 0x5d3660 (47 actions)", v, 0x59ec26e8b8fd045eull);
     const auto s1 = fuel::RiderAnimator::swayTarget({0, 0, 0, 1}, {0, 0, 5}), s2 = fuel::RiderAnimator::swayTarget({0, 0, 0, 1}, {30, 0, 0});
     const bool sOk = std::fabs(s1[1] - 0.025f) < 1e-7f && std::fabs(s2[1] - 0.05f) < 1e-7f && s1[0] == 0 && s1[2] == 0 && s2[0] == 0 && s2[2] == 0;
     char b[96];

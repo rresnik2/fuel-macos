@@ -33,6 +33,7 @@ struct RoadTypeParams {
     float band = 0;      // +0xbc Tbc = T0 - T60
     float core = 0;      // +0xc4 Tc4 = Tbc - T4c
     float flat = 0;      // +0xcc Tcc
+    float clearance = 0; // +0xd0: tree exclusion distance around the road
     float aiSpeedBlend = 0;  // +0xb4 Tb4: the AI's road/off-road weight (IA speed model 0x617000, p29)
     float smooth = 0;    // +0x1f0 * +0x1e4: profile smoothing half-window base (M)
     float smoothMin = 0; // +0x1e8: lower bound of M

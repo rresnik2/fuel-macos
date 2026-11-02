@@ -33,6 +33,9 @@ struct RoadNetwork {
     // segment that comes within kReach of the cell.
     std::unordered_map<uint64_t, std::vector<uint64_t>> segCells;
     static constexpr float kSegCell = 64.0f, kReach = 16.0f;
+    // Tree exclusion distance per road type (road table +0xd0, read from the player's FUEL.exe);
+    // all 0 when the table cannot be rebuilt.
+    std::array<float, 21> clearance{};
 };
 
 // Road surface under (x, z): the surface type a road lays down (ASPHALT = 11 on tarmac

@@ -1,6 +1,7 @@
 #include "roads.hpp"
 
 #include "resources.hpp"
+#include "road_types.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -113,6 +114,8 @@ RoadNetwork loadRoads(const DpcFile& world) {
         }
         net.lines.push_back(std::move(line));
     }
+    if (const auto types = loadRoadTypes(world))
+        for (size_t t = 0; t < net.clearance.size(); ++t) net.clearance[t] = (*types)[t].clearance;
     return net;
 }
 

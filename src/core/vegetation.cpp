@@ -110,10 +110,9 @@ void parseSpeciesScript(const std::vector<uint8_t>& body, Species& sp) {
     }
 }
 
-// Tree exclusion distance around each road type (the engine's road table).
-float roadClearance(int type) {
-    static constexpr float kClear[21] = {/* engine table removed from the published history; read from FUEL.exe at run time */};
-    return type >= 0 && type < 21 ? kClear[type] : 0;
+// Tree exclusion distance around each road type (road table +0xd0).
+float roadClearance(const RoadNetwork& net, int type) {
+    return type >= 0 && type < int(net.clearance.size()) ? net.clearance[size_t(type)] : 0;
 }
 
 // True when a road passes closer than its clearance (the engine only finds roads within 10 m).
@@ -132,7 +131,7 @@ bool nearRoad(const RoadNetwork& net, double x, double z) {
         const double d = std::hypot(x - (ax + bx * t), z - (az + bz * t));
         if (d < best) best = d, type = line.type;
     }
-    return type >= 0 && best < roadClearance(type);
+    return type >= 0 && best < roadClearance(net, type);
 }
 
 struct Ground {

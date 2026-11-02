@@ -32,7 +32,7 @@ std::optional<std::array<RoadTypeParams, 21>> loadRoadTypes(const DpcFile& world
                 q.reach = R.at(0x00), q.crown = R.at(0x24), q.verge = R.at(0x28), q.noise = R.at(0x34);
                 q.fade = R.at(0x4c), q.ditch = R.at(0x50), q.ditchDepth = R.at(0x54), q.stretch = R.at(0x5c);
                 q.bumpAmp = R.at(0x74), q.bumpLen = R.at(0x78), q.waveAmp = R.at(0x7c), q.waveLen = R.at(0x80);
-                q.band = R.at(0xbc), q.core = R.at(0xc4), q.flat = R.at(0xcc);
+                q.band = R.at(0xbc), q.core = R.at(0xc4), q.flat = R.at(0xcc), q.clearance = R.at(0xd0);
                 q.aiSpeedBlend = R.at(0xb4);
                 q.smooth = R.at(0x1f0) * R.at(0x1e4), q.smoothMin = R.at(0x1e8);
                 // Sanity: plausible metres for every road type (a different FUEL.exe fails here).
