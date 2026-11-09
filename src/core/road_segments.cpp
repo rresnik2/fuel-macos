@@ -734,6 +734,46 @@ void RoadSampler::segmentsNear(double x, double z, std::vector<const Segment*>& 
     }
 }
 
+bool RoadSampler::covers(const Segment& s, float x, float z) {  // Segment_Covers 0x6f0d10
+    // |lateral| <= w (+0x3c), then inside the span (0 < t < 1) or within w of the end it lies beyond.
+    const float lat = (s.dz * x - s.dx * z) - s.c30;
+    if (s.w < std::fabs(lat)) return false;
+    const float t = (s.tz * z + s.tx * x) - s.c34;
+    if (t > 0 && 1 > t) return true;
+    const float ex = (t > 0 ? s.bx : s.ax) - x, ez = (t > 0 ? s.bz : s.az) - z;
+    return ez * ez + ex * ex <= s.w * s.w;
+}
+
+bool RoadSampler::nearestCentreline(const std::vector<const Segment*>& segs, float x, float z, double& px, double& pz, float& dirX, float& dirZ) {
+    // 0x6fd3a0: along = (p . (+0x18, +0x1c) - c34) x len, clamped to [0, len]; point = A + D along; the nearest
+    // (0x40ed20 distance, strict < from 1e7: the first wins ties) gives the point and B - A.
+    if (segs.empty()) return false;
+    float best = 1e7f;
+    for (const Segment* sp : segs) {
+        const Segment& s = *sp;
+        float a = ((z * s.tz + s.tx * x) - s.c34) * s.len;
+        if (a < 0) a = 0;
+        if (s.len < a) a = s.len;
+        const float qx = s.dx * a + s.ax, qz = s.dz * a + s.az;
+        const float d = std::sqrt((qz - z) * (qz - z) + (qx - x) * (qx - x));
+        if (d < best) best = d, px = qx, pz = qz, dirX = s.bx - s.ax, dirZ = s.bz - s.az;
+    }
+    return true;
+}
+
+bool RoadSampler::coveringCentreline(double x, double z, double& px, double& pz, float& dirX, float& dirZ) const {
+    // 0x6fb6f0: the segments covering the point, at most 128 (the port walks its 64 m cell's records in order).
+    const auto it = cells_.find(cellKey(int32_t(std::floor(x / kCell)), int32_t(std::floor(z / kCell))));
+    if (it == cells_.end()) return false;
+    const float fx = float(x), fz = float(z);
+    std::vector<const Segment*> cover;
+    for (uint32_t r : it->second) {
+        for (const Segment& s : segmentsOf(r))
+            if (covers(s, fx, fz) && cover.size() < 128) cover.push_back(&s);
+    }
+    return nearestCentreline(cover, fx, fz, px, pz, dirX, dirZ);
+}
+
 // 0x6fac40 / 0x6fb0c0 (+ the closest point of 0x6fb240 / 0x6fb320, 0x6f0e30). Candidates come
 // from the TerraRoad grid in the engine (ascending pool index after sort + dedup); the port walks
 // the records of the 64 m cells under the box in record order. Comparisons are strict (first wins).

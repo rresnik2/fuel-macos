@@ -27,6 +27,7 @@ struct Glyph {
     uint32_t page = 0;
     float top = 0;               // offset from the line top (texels)
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // texel rectangle
+    float scale = 1;             // [port] pad-ux: font texels per page texel (the pad-prompt atlas is drawn finer)
 };
 
 struct Font {
@@ -42,19 +43,24 @@ struct Font {
 
 class MenuAssets {
 public:
-    // Opens DATAS/SHARED, FONTES, LMENU and WORLD/MENU; problems go to `problems`.
-    explicit MenuAssets(const std::string& dataDir);
+    // Opens DATAS/SHARED, FONTES, LMENU and WORLD/MENU; problems go to `problems`. `first`: CommonComponent-relative
+    // DPCs searched before those (P78: the world level's loading library DATAS/LWYOMING, Levels.tsc AddMaterialLib USA1,
+    // whose LOADING_BITMAP replaces LMENU's).
+    // `menuFiles` false: only `first` and the fonts (the loading window opens before anything else is read).
+    explicit MenuAssets(const std::string& dataDir, const std::vector<std::string>& first = {}, bool menuFiles = true);
 
     BitmapRef image(const std::string& name) const;  // empty when unknown
     // 0 = small (SMALL_FONT_PC on PC, else SMALL_FONT), 1 = big (BIG_FONT).
     const Font& font(int index) const { return fonts_[index == 1 ? 1 : 0]; }
     std::vector<std::string> problems;
+    size_t padIcons() const { return padIcons_; }  // PK26: SMALL_FONT's pad icons in the small font at 0x101..0x113
 
 private:
     BitmapRef materialBitmap(uint32_t materialId) const;
     std::vector<std::unique_ptr<DpcFile>> files_;
     std::unordered_map<uint32_t, std::pair<const DpcFile*, uint32_t>> anims_;  // name crc -> anim
     Font fonts_[2];
+    size_t padIcons_ = 0;  // PK26
 };
 
 // Splits UTF-8 text into glyph codes (the bytes of each character as a big-endian number).

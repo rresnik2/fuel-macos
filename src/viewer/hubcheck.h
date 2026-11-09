@@ -2,6 +2,7 @@
 // point lies in an object or on a cliff) and the --hub-check report.
 #pragma once
 
+#include "core/hub_zones.hpp"
 #include "core/hubs.hpp"
 #include "core/terrain.hpp"
 #include "drive.h"
@@ -23,6 +24,16 @@ std::string spawnProblem(DriveSession& drive, WorldStreamer& streamer, fuel::Mes
 HubSpawn placeAtHubPoint(DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer, const fuel::Heightfield& terrain,
                          const fuel::HubPoint& p);
 
-// `fuelview --hub-check`: every hub's camp, teleports and vistas. Returns the exit code.
+// `fuelview --hub-check`: every hub's camp, teleports and vistas, after the hub-presence case. Returns the exit code.
 int runHubCheck(const std::vector<fuel::Hub>& hubs, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer,
-                const fuel::Heightfield& terrain);
+                const fuel::Heightfield& terrain, const fuel::HubZones* zones = nullptr);
+
+// PK03: the hub presence and arrival (fuel::HubPresence) for every hub, headless: the hub record (volume, boundary,
+// END1), a drive from outside into the camp (enter vf46 -> TeleportToHub -> StartHubHUD -> 0x481d70) for an opened, a
+// first-time and a locked hub, the camp menu's Back (0x47f060 -> END1), leave / re-enter, and the zones' hub names.
+// Returns the number of failures.
+int runHubPresenceCheck(const std::vector<fuel::Hub>& hubs, const fuel::HubZones* zones);
+
+// `fuelview --collision-check` (P50): the collision world by class at `spots` and the hub points inside solid bodies.
+int runCollisionCheck(const std::vector<fuel::Hub>& hubs, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer,
+                      const fuel::Heightfield& terrain, const std::vector<std::array<float, 2>>& spots);

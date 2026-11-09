@@ -60,6 +60,9 @@ std::map<std::string, std::vector<float>> parseVehiclesParam(const std::string& 
             current.clear();
         }
     }
+    // P61: the special traffic truck's archive variant is TRAFFIC_TM (BONUS1.DPC / TRAFFIC_TM.DPC); VehiclesDef.tsc ties
+    // MESH_ID_TRAFFIC_TRUCK to TRAFFIC_TM_DYN (AddVehicleParams), so its parameters serve that label too.
+    if (auto t = out.find("TRAFFIC_TRUCK"); t != out.end() && !out.count("TRAFFIC_TM")) out["TRAFFIC_TM"] = t->second;
     return out;
 }
 
@@ -92,6 +95,7 @@ VehicleProxy findVehicleProxy(const DpcFile& dpc, const std::string& variant) {
             ProxyBox bx;
             bx.centre = {c.f32(b, 3), c.f32(b, 7), c.f32(b, 11)};
             bx.halfExtents = {c.f32(b, 12), c.f32(b, 13), c.f32(b, 14)};
+            bx.radius = c.f32(b, 15);
             p.boxes.push_back(bx);
         }
         return p;

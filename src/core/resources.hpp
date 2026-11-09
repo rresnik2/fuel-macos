@@ -36,6 +36,9 @@ struct BitmapInfo {
     uint8_t formatCode = 0;
     PixelFormat format = PixelFormat::Unknown;
     uint8_t alphaKind = 0;  // 0 opaque, 1 alpha test, 2 alpha blend
+    // ---- PK28: obj +0x24 (link bytes 22..25, float): the bitmap's own mip LOD bias, added by 0x84ca80 to the renderer's
+    // global bias (+0x1104 -1.0, +0x1100 0.0) as D3DSAMP_MIPMAPLODBIAS. 0 in 8,525 shipped bitmaps, -1 in 349, -2 in 18.
+    float lodBias = 0;
 
     bool isBlockCompressed() const;
     uint32_t faces() const { return type == Cube ? 6 : 1; }
@@ -60,6 +63,18 @@ struct Material {
     std::array<float, 2> fresnel{};   // reflectance at normal and grazing incidence (0 = none)
     uint16_t textureMask = 0;  // bit i = texture slot i is used
     uint32_t flags = 0;
+    // UV transform (Material_Z::UpdateUVMatrix 0x695ee0; object = body + 0xc). The body stores the
+    // precomputed 3 x 2 matrix uv' = u * row0 + v * row1 + row2 (rows at body 0x20 / 0x30 / 0x40, two
+    // floats each; the cells between them hold other fields), and its inputs: angle (body 0x4c), offset
+    // (0x70, 0x74), scale (0x78, 0x7c). Rotation and scale are about the texture centre (0.5, 0.5).
+    std::array<float, 6> uvMatrix{1, 0, 0, 1, 0, 0};
+    float uvAngle = 0;
+    std::array<float, 2> uvOffset{}, uvScale{1, 1};
+    std::array<float, 4> params{};  // body 0x60 (MtlConstant Params, gMaterial c3)
+    int32_t field28 = -1, field2c = 7;  // body 0x28 / 0x2c, ints (ctor 0x695c50); 0x2c has a MaterialAnim step track
+    bool identityUv() const {
+        return uvMatrix[0] == 1 && uvMatrix[1] == 0 && uvMatrix[2] == 0 && uvMatrix[3] == 1 && uvMatrix[4] == 0 && uvMatrix[5] == 0;
+    }
     // Slot 0 diffuse, 1 envmap, 2 occlusion, 3 normal, 4 specular,
     // 5 normal-local, 6 dirt, 7 add-normal-local, 8 unused.
     std::array<uint32_t, 9> textures{};
@@ -113,6 +128,26 @@ struct Mesh {
     std::vector<IndexBuffer> ibs;
     std::vector<Batch> batches;
     std::vector<std::string> morphTargets;
+    // P85: the morph tables of a vehicle mesh (Mesh_Z +0xfc..+0x118, read by the visual damage 0x7cb550):
+    // a point tree (0x20-byte nodes: min xyz, u16 children (1-based) or 0, max xyz, u16 first pair, u16 count),
+    // (u16 point, u16 group offset) pairs (points = collisionVerts, int16 xyz / 1024), the groups (u16 delta,
+    // u16 n, n vertex indices) and per target the vertex count of its stride-12 VB and the deltas (int16 x4, xyz / 4096).
+    struct MorphTarget {
+        uint32_t flags = 0;    // the VB flags (+0x10)
+        uint16_t vb = 0;       // its stride-12 VB (+0x14)
+        std::vector<uint16_t> vertexDelta;  // per vertex: index into deltas (+0x18 count = the VB's vertex count)
+        std::vector<int16_t> deltas;        // 4 per delta (+0x8 / +0xc)
+    };
+    std::vector<MorphTarget> morphs;
+    std::vector<uint8_t> morphNodes;
+    std::vector<uint16_t> morphPairs;
+    std::vector<uint16_t> morphGroups;
+    // Static collision of the mesh (P46, read by Mesh_Z vtable +0x88 0x80b1d0 / 0x817cf0): BVH nodes (0x20 bytes:
+    // min xyz, u16 children (1-based) or 0, max xyz, u16 first triangle, u16 count), triangles (u16 a, b, c,
+    // material index) and vertices (int16 xyz, metres x 1024).
+    std::vector<uint8_t> collisionNodes;
+    std::vector<uint16_t> collisionTris;
+    std::vector<int16_t> collisionVerts;
 };
 
 MeshLink parseMeshLink(const std::vector<uint8_t>& link);  // throws

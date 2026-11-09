@@ -32,11 +32,14 @@ struct RoadTypeParams {
     float waveLen = 0;   // +0x80 T80
     float band = 0;      // +0xbc Tbc = T0 - T60
     float core = 0;      // +0xc4 Tc4 = Tbc - T4c
+    float cc8 = 0;       // +0xc8: the mission gate width of most road types (0x4fdea0, p38)
     float flat = 0;      // +0xcc Tcc
     float clearance = 0; // +0xd0: tree exclusion distance around the road
     float aiSpeedBlend = 0;  // +0xb4 Tb4: the AI's road/off-road weight (IA speed model 0x617000, p29)
     float smooth = 0;    // +0x1f0 * +0x1e4: profile smoothing half-window base (M)
     float smoothMin = 0; // +0x1e8: lower bound of M
+    uint8_t kind = 0;    // +0x1d8 byte: 14 = gulch/river (minimap river pass, MapHUD 0x4a3750, p40)
+    uint8_t mapClass = 0;  // +0x1d9 byte: minimap class 1 trail .. 4 big road (LOD 0x49f920 / fade 0x49f860, p40)
 };
 
 // The 21 records (index = GwRoad type), or nothing with `error` set when FUEL.exe cannot be

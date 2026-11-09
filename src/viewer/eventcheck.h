@@ -5,9 +5,12 @@
 // event is won through its finish trigger.
 #pragma once
 
+#include <functional>
+
 #include "core/events.hpp"
 #include "core/terrain.hpp"
 #include "drive.h"
 
 int runEventCheck(const std::vector<fuel::Event>& events, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer,
-                  const fuel::Heightfield& terrain, const std::string& only);
+                  const fuel::Heightfield& terrain, const std::string& only,
+                  const std::function<float(float, float)>& gateWidth = {});  // 0x4fdea0 (p38); empty: 25 m gates

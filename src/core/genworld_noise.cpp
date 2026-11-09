@@ -138,6 +138,7 @@ uint32_t genWorldSeed(const DpcFile& world) {
 }
 
 uint8_t positionHash(const Permutation& p, double x, double z) {
+#pragma clang fp contract(off)  // x87: two rounded products, then the sum (no fused multiply-add)
     const double v = x * double(12.317513f) + z * double(10.193578f);
     return p[size_t(int64_t(std::floor(v)) & 255)];  // fistp under round-down (p21 H0)
 }

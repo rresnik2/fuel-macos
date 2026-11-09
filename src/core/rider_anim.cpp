@@ -1,5 +1,7 @@
 #include "rider_anim.hpp"
 
+#include "resources.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -124,6 +126,7 @@ std::array<float, 3> qrotate(const std::array<float, 4>& q, const std::array<flo
     return {v[0] + w * tx + (y * tz - z * ty), v[1] + w * ty + (z * tx - x * tz), v[2] + w * tz + (x * ty - y * tx)};
 }
 std::array<float, 4> conjq(const std::array<float, 4>& q) { return {-q[0], -q[1], -q[2], q[3]}; }
+Q conjQ(const Q& q) { return {-q[0], -q[1], -q[2], q[3]}; }
 
 }  // namespace
 
@@ -133,8 +136,8 @@ std::array<float, 3> RiderAnimator::swayTarget(const std::array<float, 4>& q, co
 }
 
 RiderAnimator::RiderAnimator(const Rider& rider, const RiderTables& tables, const std::string& archetype, int vclass,
-                             const std::vector<float>& P, const std::array<std::array<float, 3>, 4>& ik)
-    : rider_(rider), tables_(tables), arch_(riderArchetypeIndex(archetype)), vclass_(vclass), P_(P), ikTarget_(ik) {
+                             const std::vector<float>& P, const std::array<std::array<float, 3>, 4>& ik, const std::array<double, 3>& seat)
+    : rider_(rider), tables_(tables), arch_(riderArchetypeIndex(archetype)), vclass_(vclass), P_(P), seat_(seat), ikTarget_(ik) {
     head_ = rider.bone("Head");
     hips_ = rider.bone("Hips");
     const char* names[4][3] = {{"LeftHand", "LeftForeArm", "LeftArm"},
@@ -143,6 +146,8 @@ RiderAnimator::RiderAnimator(const Rider& rider, const RiderTables& tables, cons
                                {"RightFoot", "RightLeg", "RightUpLeg"}};
     for (int l = 0; l < 4; ++l)
         for (int k = 0; k < 3; ++k) chain_[size_t(l)][size_t(k)] = rider.bone(names[l][k]);
+    for (int l = 0; l < 4; ++l) limbBone_[size_t(l)] = asoboCrc(names[l][2]);  // the event tracks: LeftArm ... RightUpLeg
+    for (auto& f : handFrame_) f[0] = std::numeric_limits<double>::quiet_NaN();  // PK31: no grip orientation until set
     if (arch_ >= 0 && !rider.hasSlot(tables_.slots[size_t(arch_)][0])) arch_ = -1;
     reset();
     if (arch_ >= 0) pose(RiderDrive{});
@@ -187,6 +192,21 @@ void RiderAnimator::startLayer(int l, int act, float w0, bool oneShot) {
     L.time = 0;
     L.weight = w0;
     L.oneShot = oneShot;
+    applyEvents(L.slot, -1e30, 0, true);  // P76, 0x64f3f0 (PlayBlendAnim vf22): state events with time <= the start time
+}
+
+// P76: 0x7c0480 (after each layer advance, 0x7c02a0) and 0x64f3f0: kinds 0x10 / 0x11 on LeftArm, RightArm, LeftUpLeg,
+// RightUpLeg set / clear node flag 0x400 on that limb (0x675f60 / 0x675f90, subtree); the hand / foot IK (0x6032f0,
+// 0x603b80, 0x602330, 0x602ad0) leaves a flagged limb to the animation. Applied whatever the layer's weight.
+void RiderAnimator::applyEvents(int slot, double from, double to, bool closed) {
+    if (!rider_.hasSlot(slot)) return;
+    std::vector<std::pair<uint32_t, uint32_t>> ev;
+    rider_.events(slot, from, to, closed, ev);
+    for (const auto& [bone, kind] : ev) {
+        if (kind != 0x10 && kind != 0x11) continue;
+        for (size_t l = 0; l < 4; ++l)
+            if (limbBone_[l] == bone && limbOff_[l] != (kind == 0x10)) limbOff_[l] = kind == 0x10, limbT_[l] = 0;
+    }
 }
 
 float RiderAnimator::mixer(Request a, Request b, float dt, bool oneShotRunning) {  // 0x5d3b40
@@ -283,13 +303,8 @@ void RiderAnimator::update(const RiderDrive& d) {
             fallT_ = 0;
             fallStart_ = world_;
             fallOrigin_ = d.pos;
-            const auto hp = hips_ >= 0 ? posOf(world_[size_t(hips_)]) : V3{0, 1, 0};
-            const auto hw = qrotate(d.q, {float(hp[0]), float(hp[1]), float(hp[2])});
-            fallPos_ = {d.pos[0] + hw[0], d.pos[1] + hw[1], d.pos[2] + hw[2]};
-            fallVel_ = {d.vel[0], d.vel[1] + 2.5f, d.vel[2]};
             fallQ_ = d.q;
-            const auto side = qrotate(d.q, {1, 0, 0});
-            fallSpin_ = {side[0] * -4.0f, side[1] * -4.0f, side[2] * -4.0f};
+            ragStart(d);
         }
         fall(d);
         return;
@@ -472,9 +487,16 @@ void RiderAnimator::pose(const RiderDrive& d) {
         Layer& L = layers_[l];
         if (L.action < 0) continue;
         const double dur = rider_.duration(L.slot);
+        const double prev = L.time;
         L.time += dt;
-        if (rider_.loops(L.slot) && !L.oneShot && dur > 0) L.time = std::fmod(L.time, dur);
-        else L.time = std::min(L.time, dur);
+        if (rider_.loops(L.slot) && !L.oneShot && dur > 0) {
+            if (L.time > dur) applyEvents(L.slot, prev, dur, true), applyEvents(L.slot, 0, std::fmod(L.time, dur), false);  // wrap
+            else applyEvents(L.slot, prev, L.time, false);
+            L.time = std::fmod(L.time, dur);
+        } else {
+            L.time = std::min(L.time, dur);
+            applyEvents(L.slot, prev, L.time, L.time >= dur);
+        }
     }
     rider_.sampleLocal(layers_[0].slot, layers_[0].time, base, nullptr);
     for (int l = 1; l < 3; ++l) {
@@ -491,31 +513,35 @@ void RiderAnimator::pose(const RiderDrive& d) {
             base[b].q = slerp(base[b].q, other[b].q, f);
         }
     }
-    // R7: rider root offset = sway output * P632 (vehicle frame), on the skeleton root
+    // 0x5ca410: the pilot object sits at the vehicle's node 61 (its skeleton's Head bone, seat_) plus the sway
+    // output * P632 (R7, vehicle frame); the rider's skeleton root carries both here.
     const float p632 = P_.size() > 632 ? P_[632] : 0;
+    std::array<double, 3> rootOff = seat_;
     if (p632 != 0) {
         const auto loc = qrotate(conjq(d.q), swayOut_);
-        for (size_t b = 0; b < base.size(); ++b)
-            if (rider_.parent(int(b)) < 0)
-                for (int k = 0; k < 3; ++k) base[b].t[size_t(k)] += double(loc[size_t(k)] * p632);
+        for (int k = 0; k < 3; ++k) rootOff[size_t(k)] += double(loc[size_t(k)] * p632);
     }
-    // R6: head levelling for the player's bike/quad rider
-    if (d.player && (vclass_ == 1 || vclass_ == 3) && head_ >= 0) headLevel(d, base, levelHead_, levelHead_ ? 1.1f : (stance_ == 4 ? 1.1f : 1.8f));
+    for (size_t b = 0; b < base.size(); ++b)
+        if (rider_.parent(int(b)) < 0)
+            for (int k = 0; k < 3; ++k) base[b].t[size_t(k)] += rootOff[size_t(k)];
+    // R6 (0x5d5800): levelling for the player's bike/quad rider. It works on node 25 of the rider's node array =
+    // the Hips in the bone-name registry (P59), not the head: the whole rider is turned toward the horizon.
+    if (d.player && (vclass_ == 1 || vclass_ == 3) && hips_ >= 0) headLevel(d, base, levelHead_, levelHead_ ? 1.1f : (stance_ == 4 ? 1.1f : 1.8f));
     world_ = rider_.worlds(base);
     if (d.player) ik(base, dt);
 }
 
 void RiderAnimator::headLevel(const RiderDrive& d, std::vector<Rider::BoneTRS>& local, bool level, float rate) {
-    const Q anim = local[size_t(head_)].q;
+    const Q anim = local[size_t(hips_)].q;
     Q target = anim;
     if (level) {
-        // the head kept level with the horizon: undo the vehicle's tilt (shortest arc from its up to world up)
+        // the rider kept level with the horizon: undo the vehicle's tilt (shortest arc from its up to world up)
         const std::vector<Mat4> w = rider_.worlds(local);
-        const int p = rider_.parent(head_);
+        const int p = rider_.parent(hips_);
         const M3 V = vehRot(d.q);
         const auto vu = qrotate(d.q, {0, 1, 0});
         const M3 C = fromTo({vu[0], vu[1], vu[2]}, {0, 1, 0});
-        const M3 Mh = rot3Of(w[size_t(head_)]);
+        const M3 Mh = rot3Of(w[size_t(hips_)]);
         const M3 desiredModel = mul3(mul3(mul3(Mh, V), C), transpose(V));
         const M3 parentM = p >= 0 ? rot3Of(w[size_t(p)]) : M3{1, 0, 0, 0, 1, 0, 0, 0, 1};
         const Q lvl = quatOf(mul3(desiredModel, transpose(parentM)));
@@ -523,117 +549,449 @@ void RiderAnimator::headLevel(const RiderDrive& d, std::vector<Rider::BoneTRS>& 
     }
     if (!headInit_) headQ_ = target, headInit_ = true;
     headQ_ = slerp(headQ_, target, smoothK(rate, d.dt));
-    local[size_t(head_)].q = headQ_;
+    local[size_t(hips_)].q = headQ_;
 }
 
-void RiderAnimator::ik(std::vector<Rider::BoneTRS>& local, float dt) {
-    // R9, approximated: an analytic two-bone solve per limb toward the vehicle's IK point (the engine iterates
-    // a Jacobian, up to 15 steps, 5 mm; joint limits elbow 0.1..3.0 rad), eased in over 0.5 s (rate 1.4).
-    ikT_ += dt;
-    bool any = false;
-    for (int l = 0; l < 4; ++l) {
-        const auto& tg = ikTarget_[size_t(l)];
-        const auto& ch = chain_[size_t(l)];
-        if (!std::isnan(tg[0]) && ch[0] >= 0 && ch[1] >= 0 && ch[2] >= 0) any = true;
+namespace {
+Q qmulH(const Q& a, const Q& b) {  // Hamilton a x b
+    return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+V3 qrotD(const Q& q, const V3& v) {  // q v q* (0x410510)
+    const Q r = qmulH(qmulH(q, {v[0], v[1], v[2], 0}), {-q[0], -q[1], -q[2], q[3]});
+    return {r[0], r[1], r[2]};
+}
+Q qnorm(Q q) {  // Quat_Normalise 0x41d4b0
+    const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (n > 0)
+        for (double& c : q) c /= n;
+    return q;
+}
+}  // namespace
+
+// ---- PK31: IK_SolveJacobian 0x601220
+bool ikSolveJacobian(const IkJoint* joints, int count, const IkAccess& io, const V3& target, int* passes, bool* lockedOut) {
+#pragma clang fp contract(off)  // x87 has no fused multiply-add (a singular J^T J must stay det == 0)
+    count = std::min(count, 3);
+    bool locked[3] = {false, false, false};
+    V3 eff = io.effector();
+    V3 e = sub(target, eff);
+    if (passes) *passes = 0;
+    if (dot(e, e) < 2.5e-5) return false;
+    struct LockOut {
+        bool* out;
+        bool* l;
+        ~LockOut() {
+            if (out)
+                for (int j = 0; j < 3; ++j) out[j] = l[j];
+        }
+    } lockOut{lockedOut, locked};
+    for (int k = -2; k != 13; ++k) {
+        if (passes) ++*passes;
+        // Jacobian columns (rows of M = J^T)
+        double M[3][3] = {};
+        for (int j = 0; j < count; ++j) {
+            if (locked[j]) continue;
+            const V3 w = qrotD(io.worldQ(j), joints[j].axis);
+            const V3 c = cross(w, sub(eff, io.jointPos(j)));
+            M[j][0] = c[0], M[j][1] = c[1], M[j][2] = c[2];
+        }
+        // A = J^T J; d = A^-1 J^T e, or J^T e when A is singular (det == 0)
+        double A[3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) A[i][j] = M[i][0] * M[j][0] + M[i][1] * M[j][1] + M[i][2] * M[j][2];
+        double g[3];
+        for (int j = 0; j < 3; ++j) g[j] = M[j][0] * e[0] + M[j][1] * e[1] + M[j][2] * e[2];
+        const double c00 = A[1][1] * A[2][2] - A[1][2] * A[2][1], c01 = A[1][2] * A[2][0] - A[1][0] * A[2][2], c02 = A[1][0] * A[2][1] - A[1][1] * A[2][0];
+        const double det = A[0][0] * c00 + A[0][1] * c01 + A[0][2] * c02;
+        double th[3];
+        if (det != 0) {
+            const double inv[3][3] = {{c00 / det, (A[0][2] * A[2][1] - A[0][1] * A[2][2]) / det, (A[0][1] * A[1][2] - A[0][2] * A[1][1]) / det},
+                                      {c01 / det, (A[0][0] * A[2][2] - A[0][2] * A[2][0]) / det, (A[0][2] * A[1][0] - A[0][0] * A[1][2]) / det},
+                                      {c02 / det, (A[0][1] * A[2][0] - A[0][0] * A[2][1]) / det, (A[0][0] * A[1][1] - A[0][1] * A[1][0]) / det}};
+            for (int j = 0; j < 3; ++j) th[j] = float(inv[j][0] * g[0] + inv[j][1] * g[1] + inv[j][2] * g[2]);
+        } else {
+            for (int j = 0; j < 3; ++j) th[j] = float(g[j]);
+        }
+        for (int j = 0; j < count; ++j) {
+            if (locked[j]) th[j] = 0;
+            th[j] = float(std::atan(th[j]));
+        }
+        // 0x601a50: max |theta| <= 0.25 / max(k, 1) (over all three slots)
+        const double lim = float(0.25 / float(k > 0 ? k : 1));
+        const double mx = std::max({std::fabs(th[0]), std::fabs(th[1]), std::fabs(th[2])});
+        if (lim < mx) {
+            const double f = float(lim / mx);
+            for (double& t : th) t = float(t * f);
+        }
+        for (int j = 0; j < count; ++j) {
+            const IkJoint& J = joints[j];
+            Q& ql = io.local(j);
+            const Q qold = ql;
+            const double sh = std::sin(th[j] * 0.5), ch = std::cos(th[j] * 0.5);
+            Q q = qmulH(qold, {J.axis[0] * sh, J.axis[1] * sh, J.axis[2] * sh, ch});
+            if (J.limited && !locked[j]) {
+                const double sdot = (q[2] * J.axis[2] + q[0] * J.axis[0]) + q[1] * J.axis[1];
+                double lim2 = sdot;
+                bool out = false;
+                if (sdot < J.lo) lim2 = J.lo, out = true;
+                else if (sdot > J.hi) lim2 = J.hi, out = true;
+                if (out) {
+                    locked[j] = true;
+                    const double c = lim2 - sdot;
+                    if (c != 0) {
+                        const double s2 = std::sin(c * 0.5), c2 = std::cos(c * 0.5);
+                        q = qmulH(qold, {J.axis[0] * s2, J.axis[1] * s2, J.axis[2] * s2, c2});
+                    }
+                }
+            }
+            ql = qnorm(q);
+        }
+        io.fk();
+        eff = io.effector();
+        e = sub(target, eff);
+        if (dot(e, e) < 2.5e-5) return true;
     }
-    if (!any) return;
+    return true;  // AL = 1 once a pass ran (uVar15), reached or not
+}
+
+// R9 (PK31: 0x604630 -> hands 0x6032f0 / 0x603b80, feet 0x602330 / 0x602ad0), the player's rider only. Per limb:
+//  - limb let go by the animation (flag 0x400 on LeftArm / RightArm / LeftUpLeg / RightUpLeg, P76): "was off" = 1;
+//    during 0.5 s after the switch (blend-out flag), when the animated effector is over 0.025 m from the cached
+//    position the cached quats SmoothQuat (rate 1.4) toward the animation and are written back; else the cache
+//    takes the animation pose and the blend ends.
+//  - IK on: blend timer 0, blend-out flag on; coming back from "off" the cache takes the animated pose and effector
+//    position; the chain (IK_AddJoint 0x6011b0): joint 0 = the mid node (elbow / knee) about its own rotation
+//    vector (Quat_ToRotationVector 0x41d280 of its local quat, normalised; (0, 1, 0) under 0.001), hands limited to
+//    [0.1, 3.0]; joint 1 = the root node (upper arm / leg) about that same axis carried into its frame (right hand
+//    limited to [-10, 0], the others free); joint 2 = the root node about its local z, free; solved toward the
+//    vehicle's IK point (0x601220). Solved effector within 0.05 m of the cached position: the cache takes the
+//    solution; else the cache SmoothQuats (rate 1.6) toward it, is written back and the cached position updated.
+//  - hands: 0x604410 sets the hand's local quaternion so its world orientation is the IK box's.
+void RiderAnimator::ik(std::vector<Rider::BoneTRS>& local, float dt) {
+    for (float& t : limbT_) t += dt;
     std::vector<Mat4>& world = world_;
-    const double ease = 1.0 - std::pow(1.4, -30.30303 * double(ikT_));
-    auto rotateBone = [&](int b, const M3& Rmodel) {  // rotate bone b's model-space orientation by Rmodel (row)
-        const int p = rider_.parent(b);
-        const M3 W = rot3Of(world[size_t(b)]);
-        const M3 Pm = p >= 0 ? rot3Of(world[size_t(p)]) : M3{1, 0, 0, 0, 1, 0, 0, 0, 1};
-        local[size_t(b)].q = quatOf(mul3(mul3(W, Rmodel), transpose(Pm)));
-        world = rider_.worlds(local);
-    };
+    auto worldQ = [&](int b) { return quatOf(rot3Of(world[size_t(b)])); };
+    auto fk = [&] { world = rider_.worlds(local); };
+    auto smoothQ = [&](Q& c, const Q& tq, float rate) { c = qnorm(slerp(c, tq, smoothK(rate, dt))); };
     for (int l = 0; l < 4; ++l) {
         const auto& tg = ikTarget_[size_t(l)];
-        const auto& ch = chain_[size_t(l)];
+        const auto& ch = chain_[size_t(l)];  // {end, mid, root}
         if (std::isnan(tg[0]) || ch[0] < 0 || ch[1] < 0 || ch[2] < 0) continue;
-        const V3 a = posOf(world[size_t(ch[2])]), b = posOf(world[size_t(ch[1])]), c = posOf(world[size_t(ch[0])]);
-        V3 t{tg[0], tg[1], tg[2]};
-        t = add(c, scl(sub(t, c), ease));
-        const double la = length(sub(b, a)), lb = length(sub(c, b));
-        if (la < 1e-4 || lb < 1e-4) continue;
-        V3 dir = sub(t, a);
-        double dd = length(dir);
-        if (dd < 1e-4) continue;
-        dir = scl(dir, 1.0 / dd);
-        // joint limit on the bend (pi - interior angle) 0.1 .. 3.0 rad
-        const double dMax = std::sqrt(la * la + lb * lb - 2 * la * lb * std::cos(M_PI - 0.1));
-        const double dMin = std::sqrt(la * la + lb * lb - 2 * la * lb * std::cos(M_PI - 3.0));
-        dd = std::clamp(dd, dMin, dMax);
-        const double cosA = std::clamp((la * la + dd * dd - lb * lb) / (2 * la * dd), -1.0, 1.0);
-        V3 pole = sub(sub(b, a), scl(dir, dot(sub(b, a), dir)));
-        if (length(pole) < 1e-6) pole = cross(dir, {1, 0, 0});
-        pole = unit(pole);
-        const V3 bNew = add(a, add(scl(dir, la * cosA), scl(pole, la * std::sqrt(std::max(0.0, 1 - cosA * cosA)))));
-        rotateBone(ch[2], fromTo(unit(sub(b, a)), unit(sub(bNew, a))));
-        const V3 b2 = posOf(world[size_t(ch[1])]), c2 = posOf(world[size_t(ch[0])]);
-        const V3 tReach = add(a, scl(dir, dd));
-        rotateBone(ch[1], fromTo(unit(sub(c2, b2)), unit(sub(tReach, b2))));
+        LimbIk& L = limbIk_[size_t(l)];
+        const bool hand = l < 2;
+        ikResult_[size_t(l)] = -1;
+        auto readAnim = [&] {
+            for (int k = 0; k < 3; ++k) L.q[size_t(k)] = local[size_t(ch[size_t(k)])].q;
+        };
+        auto writeCache = [&] {
+            for (int k = 0; k < 3; ++k) local[size_t(ch[size_t(k)])].q = L.q[size_t(k)] = qnorm(L.q[size_t(k)]);
+            fk();
+        };
+        const V3 effNow = posOf(world[size_t(ch[0])]);
+        if (limbOff_[size_t(l)]) {
+            L.wasOff = true;
+            if (L.blendOut && L.blendT < 0.5f) {
+                L.blendT += dt;
+                if (length(sub(effNow, L.pos)) > 0.025) {
+                    for (int k = 0; k < 3; ++k) smoothQ(L.q[size_t(k)], local[size_t(ch[size_t(k)])].q, 1.4f);
+                    writeCache();
+                    L.pos = posOf(world[size_t(ch[0])]);
+                    continue;
+                }
+                L.blendOut = false;
+                readAnim();
+                continue;
+            }
+            L.blendOut = false;
+            continue;
+        }
+        L.blendT = 0;
+        L.blendOut = true;
+        if (L.wasOff) {
+            L.wasOff = false;
+            readAnim();
+            L.pos = effNow;
+        }
+        // the chain
+        const int mid = ch[1], root = ch[2];
+        IkJoint J[3];
+        {
+            const Q qm = local[size_t(mid)].q;
+            const double w = std::clamp(qm[3], -1.0, 1.0), sn = std::sqrt(std::max(0.0, 1.0 - w * w));
+            V3 rv{0, 0, 0};
+            if (sn > 1e-6) rv = scl(V3{qm[0], qm[1], qm[2]}, 2.0 * std::acos(w) / sn);
+            J[0].axis = length(rv) < 0.001 ? V3{0, 1, 0} : unit(rv);
+        }
+        J[1].axis = qrotD(qmulH(conjQ(worldQ(root)), worldQ(mid)), J[0].axis);
+        J[2].axis = {0, 0, 1};
+        if (hand) J[0].limited = true, J[0].lo = 0.1, J[0].hi = 3.0;
+        J[1].lo = -10, J[1].hi = l == 1 ? 0.0 : 10.0, J[1].limited = l == 1;
+        if (l == 0) J[1].lo = 0, J[1].hi = 10;
+        const int nodes[3] = {mid, root, root};
+        IkAccess io;
+        io.local = [&](int j) -> Q& { return local[size_t(nodes[j])].q; };
+        io.worldQ = [&](int j) { return worldQ(nodes[j]); };
+        io.jointPos = [&](int j) { return posOf(world[size_t(nodes[j])]); };
+        io.effector = [&] { return posOf(world[size_t(ch[0])]); };
+        io.fk = fk;
+        int passes = 0;
+        ikSolveJacobian(J, 3, io, {tg[0], tg[1], tg[2]}, &passes);
+        ikResult_[size_t(l)] = passes;
+        const V3 solved = posOf(world[size_t(ch[0])]);
+        if (length(sub(solved, L.pos)) <= 0.05) {
+            readAnim();
+        } else {
+            for (int k = 0; k < 3; ++k) smoothQ(L.q[size_t(k)], local[size_t(ch[size_t(k)])].q, 1.6f);
+            writeCache();
+            L.pos = posOf(world[size_t(ch[0])]);
+        }
+        // 0x604410: the hand turned to the grip box
+        if (hand && !std::isnan(handFrame_[size_t(l)][0])) {
+            const int b = ch[0], p = rider_.parent(b);
+            const M3 Pm = p >= 0 ? rot3Of(world[size_t(p)]) : M3{1, 0, 0, 0, 1, 0, 0, 0, 1};
+            local[size_t(b)].q = quatOf(mul3(handFrame_[size_t(l)], transpose(Pm)));
+            fk();
+        }
+    }
+}
+
+// R8 / P46: FUEL's ragdoll (0x605650): 10 IT_DYN_PILOT bodies at the rider's nodes [25, 31, 28, 59, 56, 51, 32, 29,
+// 30, 27] with density 4000 (bodies 0 and 5) or 500, joined by 13 joints: type C (0x604f30) 1-0 and 2-0 (anchors
+// 0.2125 down, 0.05 to the side, 0.15 forward of body 0: the hips), a ball (0x6047f0) 5-0 (0.2 up: the spine), type B
+// (0x604cc0) 3-5 and 4-5 (0.175 to the side, 0.35 up: the shoulders), and two type A (0x604a60) per limb 6-1, 7-2,
+// 8-3, 9-4 (knees, elbows; A places body B at the anchor distance from body A). Body 1/3 sit on -x (left), 2/4 on +x.
+// Every body starts with the vehicle's velocity (0x6078d0), gravity -9.81 and damping 0.1 (0x601e00); the skeleton
+// root follows body 0 and the other bodies drive their nodes (0x606f40 / 0x606e00); the other nodes ease to their
+// rest pose over 0.33 s (0x607bd0).
+// Port: the bodies are points solved as position constraints (the joints' rest lengths from the pose at the ejection,
+// plus braces that keep the two torso bodies rigid) against the terrain; the joint types' limits and the engine's
+// joint impulses (0x71ea90) are not ported, nor the bodies' shapes and their contacts with objects.
+void RiderAnimator::ragStart(const RiderDrive& d) {
+    static const char* const kBones[10] = {"Hips", "LeftUpLeg", "RightUpLeg", "LeftArm", "RightArm", "Spine2", "LeftLeg", "RightLeg",
+                                           "LeftForeArm", "RightForeArm"};
+    ragOk_ = true;
+    ragSettled_ = false;  // PK31: 0x71b2f0 on the first step
+    for (int i = 0; i < 10; ++i) {
+        int b = rider_.bone(kBones[i]);
+        if (b < 0 && i == 5) b = rider_.bone("Spine1");
+        if (b < 0 && i == 5) b = rider_.bone("Spine");
+        if (b < 0 || size_t(b) >= world_.size()) {
+            ragOk_ = false;
+            return;
+        }
+        RagBody& r = rag_[size_t(i)];
+        r.bone = b;
+        const V3 m = posOf(world_[size_t(b)]);
+        const auto w = qrotate(d.q, {float(m[0]), float(m[1]), float(m[2])});
+        r.x = r.prev = {double(w[0]), double(w[1]), double(w[2])};
+        r.v = {double(d.vel[0]), double(d.vel[1]), double(d.vel[2])};
+        r.invMass = 1.0 / (i == 0 || i == 5 ? 4000.0 : 500.0);
+    }
+    static const int kLinks[][2] = {{1, 0}, {2, 0}, {5, 0}, {3, 5}, {4, 5}, {6, 1}, {7, 2}, {8, 3}, {9, 4},
+                                    // port braces standing in for the torso bodies' extent and the joint anchors
+                                    {1, 2}, {3, 4}, {1, 5}, {2, 5}, {3, 0}, {4, 0}};
+    ragLinks_.clear();
+    for (const auto& l : kLinks)
+        ragLinks_.push_back({l[0], l[1], length(sub(rag_[size_t(l[0])].x, rag_[size_t(l[1])].x))});
+}
+
+void RiderAnimator::ragStep(const RiderDrive& d) {
+    constexpr int kSub = 4;
+    constexpr double kR = 0.12;  // contact radius of a body
+    const double h = double(d.dt) / kSub;
+    if (!(h > 0)) return;
+    // PK31 (from PK30, notes/pk30.md 3): the placement settle 0x71b2f0 (PhysIsland_Step 0x685170) runs once on an island
+    // with a body whose +0x5ac == 0, and IT_DynPilotMove_G (0x601e50 / 0x601ea0) leaves it 0 on all 10 ragdoll bodies:
+    // 5 rounds of y -= 0.01 on every body, then 0x71b5c0 lifts each by min(max over its contacts 0..n-2 of n.y x
+    // depth, 0.05) (the last contact is skipped). The port's bodies have one contact each (the ground), the skipped
+    // one, so they keep the 5 cm drop; the ground constraint below pushes them out as the solver would.
+    if (!ragSettled_) {
+        ragSettled_ = true;
+        for (RagBody& r : rag_)
+            for (int k = 0; k < 5; ++k) r.x[1] -= 0.01, r.prev[1] -= 0.01;
+    }
+    for (int s = 0; s < kSub; ++s) {
+        for (RagBody& r : rag_) {
+            r.v[1] -= 9.81 * h;
+            r.v = scl(r.v, std::max(0.0, 1.0 - 0.1 * h));
+            r.prev = r.x;
+            r.x = add(r.x, scl(r.v, h));
+        }
+        for (int it = 0; it < 6; ++it) {
+            for (const RagLink& l : ragLinks_) {
+                RagBody &a = rag_[size_t(l.a)], &b = rag_[size_t(l.b)];
+                const V3 dlt = sub(b.x, a.x);
+                const double len = length(dlt), w = a.invMass + b.invMass;
+                if (len < 1e-9 || w <= 0) continue;
+                const V3 corr = scl(dlt, (len - l.rest) / (len * w));
+                a.x = add(a.x, scl(corr, a.invMass));
+                b.x = sub(b.x, scl(corr, b.invMass));
+            }
+            for (RagBody& r : rag_) {
+                const double g = d.ground ? double(d.ground(r.x[0] + fallOrigin_[0], r.x[2] + fallOrigin_[2])) - fallOrigin_[1] : -1e9;
+                if (r.x[1] < g + kR) r.x[1] = g + kR;
+            }
+        }
+        for (RagBody& r : rag_) {
+            r.v = scl(sub(r.x, r.prev), 1.0 / h);
+            const double g = d.ground ? double(d.ground(r.x[0] + fallOrigin_[0], r.x[2] + fallOrigin_[2])) - fallOrigin_[1] : -1e9;
+            if (r.x[1] <= g + kR + 1e-6) {  // ground friction on the sliding body
+                const double k = std::max(0.0, 1.0 - 4.0 * h);
+                r.v[0] *= k, r.v[2] *= k;
+            }
+        }
     }
 }
 
 void RiderAnimator::fall(const RiderDrive& d) {
-    // R8, approximated: FUEL builds a 10-body ragdoll (nodes 25,31,28,59,56,51,32,29,30,27, masses 4000/500,
-    // ~13 joints; U-R2) on its rigid bodies. The port throws the rider as one tumbling body with gravity
-    // -9.81 that slides to rest on the terrain, keeping the last riding pose eased toward a limp one.
-    const float dt = d.dt;
-    fallT_ += dt;
-    fallVel_[1] -= 9.81f * dt;
-    for (int k = 0; k < 3; ++k) fallPos_[size_t(k)] += double(fallVel_[size_t(k)] * dt);
-    const float g = d.ground ? d.ground(fallPos_[0], fallPos_[2]) : -1e9f;
-    bool onGround = false;
-    if (fallPos_[1] < double(g) + 0.25) {
-        fallPos_[1] = double(g) + 0.25;
-        if (fallVel_[1] < 0) fallVel_[1] = -0.25f * fallVel_[1];
-        const float f = std::max(0.0f, 1.0f - 4.0f * dt);
-        fallVel_[0] *= f, fallVel_[2] *= f;
-        for (float& s : fallSpin_) s *= std::max(0.0f, 1.0f - 6.0f * dt);
-        onGround = true;
-    }
-    // tumble: integrate the spin until the body lies flat
-    const float sl = std::sqrt(fallSpin_[0] * fallSpin_[0] + fallSpin_[1] * fallSpin_[1] + fallSpin_[2] * fallSpin_[2]);
-    if (sl > 1e-4f && !(onGround && sl < 0.3f)) {
-        const float h = sl * dt * 0.5f, s = std::sin(h) / sl;
-        const std::array<float, 4> dq{fallSpin_[0] * s, fallSpin_[1] * s, fallSpin_[2] * s, std::cos(h)};
-        const auto& q = fallQ_;
-        fallQ_ = {dq[3] * q[0] + dq[0] * q[3] + dq[1] * q[2] - dq[2] * q[1], dq[3] * q[1] - dq[0] * q[2] + dq[1] * q[3] + dq[2] * q[0],
-                  dq[3] * q[2] + dq[0] * q[1] - dq[1] * q[0] + dq[2] * q[3], dq[3] * q[3] - dq[0] * q[0] - dq[1] * q[1] - dq[2] * q[2]};
-    }
-    // limbs ease (0x607bd0: 0.33 s) from the riding pose toward the bind pose (arms and legs spread)
+    fallT_ += d.dt;
+    // The non-ragdoll nodes ease (0x607bd0, 0.33 s) from the riding pose toward the rest pose.
     const double e = std::min(1.0, double(fallT_) * 3.0303) * 0.5;
     std::vector<Rider::BoneTRS> bind = rider_.bindLocal();
-    std::vector<Rider::BoneTRS> ride = bind;
-    // reconstruct the riding locals from fallStart_ rotations
+    std::vector<Rider::BoneTRS> local = bind;
     for (size_t b = 0; b < bind.size() && b < fallStart_.size(); ++b) {
         const int p = rider_.parent(int(b));
         const M3 R = rot3Of(fallStart_[b]);
         const M3 Pm = p >= 0 ? rot3Of(fallStart_[size_t(p)]) : M3{1, 0, 0, 0, 1, 0, 0, 0, 1};
-        ride[b].q = slerp(quatOf(mul3(R, transpose(Pm))), bind[b].q, p >= 0 ? e : 0.0);
+        local[b].q = slerp(quatOf(mul3(R, transpose(Pm))), bind[b].q, p >= 0 ? e : 0.0);
     }
-    std::vector<Mat4> w = rider_.worlds(ride);
-    // place: hips at fallPos_, orientation fallQ_, all relative to fallOrigin_
-    const V3 hp = hips_ >= 0 ? posOf(w[size_t(hips_)]) : V3{0, 0, 0};
-    const M3 R = vehRot(fallQ_);
+    if (!ragOk_) return;
+    ragStep(d);
+    // World = model x the vehicle rotation at the ejection; then the root (body 0) and the driven limbs.
+    const M3 V = vehRot(fallQ_);
+    auto worldOf = [&](const std::vector<Rider::BoneTRS>& loc) {
+        std::vector<Mat4> w = rider_.worlds(loc);
+        for (Mat4& m : w) {
+            for (int r = 0; r < 4; ++r) {
+                const double x = m[size_t(r * 4)], y = m[size_t(r * 4 + 1)], z = m[size_t(r * 4 + 2)];
+                m[size_t(r * 4)] = x * V[0] + y * V[3] + z * V[6];
+                m[size_t(r * 4 + 1)] = x * V[1] + y * V[4] + z * V[7];
+                m[size_t(r * 4 + 2)] = x * V[2] + y * V[5] + z * V[8];
+            }
+        }
+        return w;
+    };
+    // Rotate bone b (world rotation, about its own position) by R (row-vector), through its local rotation.
+    auto rotateBone = [&](std::vector<Mat4>& w, int b, const M3& R) {
+        const int p = rider_.parent(b);
+        const M3 W = rot3Of(w[size_t(b)]);
+        const M3 Pm = p >= 0 ? rot3Of(w[size_t(p)]) : V;
+        local[size_t(b)].q = quatOf(mul3(mul3(W, R), transpose(Pm)));
+    };
+    std::vector<Mat4> w = worldOf(local);
+    // Root: the pose's hip line and spine onto the bodies' (1 -> 2 and 0 -> 5).
+    {
+        const auto& B = rag_;
+        const V3 pr = unit(sub(posOf(w[size_t(B[2].bone)]), posOf(w[size_t(B[1].bone)])));
+        const V3 pu = unit(sub(posOf(w[size_t(B[5].bone)]), posOf(w[size_t(B[0].bone)])));
+        const V3 rr = unit(sub(B[2].x, B[1].x)), ru = unit(sub(B[5].x, B[0].x));
+        const M3 R1 = fromTo(pu, ru);
+        const V3 pr1 = {pr[0] * R1[0] + pr[1] * R1[3] + pr[2] * R1[6], pr[0] * R1[1] + pr[1] * R1[4] + pr[2] * R1[7],
+                        pr[0] * R1[2] + pr[1] * R1[5] + pr[2] * R1[8]};
+        auto flat = [&](const V3& v) { return unit(sub(v, scl(ru, dot(v, ru)))); };
+        const M3 R2 = fromTo(flat(pr1), flat(rr));
+        const int root = B[0].bone;
+        int top = root;
+        while (rider_.parent(top) >= 0) top = rider_.parent(top);
+        rotateBone(w, top, mul3(R1, R2));
+        w = worldOf(local);
+    }
+    // Limbs: upper bone toward its lower body (1 -> 6, 2 -> 7, 3 -> 8, 4 -> 9).
+    for (const auto& pr : {std::array<int, 2>{1, 6}, {2, 7}, {3, 8}, {4, 9}}) {
+        const RagBody &u = rag_[size_t(pr[0])], &l = rag_[size_t(pr[1])];
+        const V3 cur = unit(sub(posOf(w[size_t(l.bone)]), posOf(w[size_t(u.bone)])));
+        rotateBone(w, u.bone, fromTo(cur, unit(sub(l.x, u.x))));
+        w = worldOf(local);
+    }
+    // Place: body 0 at its position.
+    const V3 off = sub(rag_[0].x, posOf(w[size_t(rag_[0].bone)]));
     world_.resize(w.size());
     for (size_t b = 0; b < w.size(); ++b) {
         Mat4 m = w[b];
-        const V3 p = sub(posOf(m), hp);
-        // rotation rows times R
-        for (int r = 0; r < 3; ++r) {
-            const double x = m[size_t(r * 4)], y = m[size_t(r * 4 + 1)], z = m[size_t(r * 4 + 2)];
-            m[size_t(r * 4)] = x * R[0] + y * R[3] + z * R[6];
-            m[size_t(r * 4 + 1)] = x * R[1] + y * R[4] + z * R[7];
-            m[size_t(r * 4 + 2)] = x * R[2] + y * R[5] + z * R[8];
-        }
-        const V3 pr = {p[0] * R[0] + p[1] * R[3] + p[2] * R[6], p[0] * R[1] + p[1] * R[4] + p[2] * R[7], p[0] * R[2] + p[1] * R[5] + p[2] * R[8]};
-        m[12] = pr[0] + (fallPos_[0] - fallOrigin_[0]);
-        m[13] = pr[1] + (fallPos_[1] - fallOrigin_[1]);
-        m[14] = pr[2] + (fallPos_[2] - fallOrigin_[2]);
+        m[12] += off[0], m[13] += off[1], m[14] += off[2];
         world_[b] = m;
     }
 }
+
+// ---- PK31: AI racer lean (0x61c0c0 / 0x61c1b0 / 0x61c150); the x87 temporaries are doubles, the stores floats.
+void AiLean::spring(float& v, float& x, float dt, float a, float b, float rate, float limit) {
+#pragma clang fp contract(off)  // x87 has no fused multiply-add (a singular J^T J must stay det == 0)
+    v = float(double(v) - (double(a) * double(b) + double(x) * 10.0) * double(dt));
+    // Math_ExpSmooth 0x4100b0 (target 0): within 1e-6 snap, else v += (0 - v)(1 - 1 / rate^(30.30303 dt)).
+    const float d = 0.0f - v;
+    if (std::fabs(d) < 1e-6f) v = 0.0f;
+    else v = float((1.0 - 1.0 / std::pow(double(rate), double(dt) * 30.30303)) * double(d) + double(v));
+    float nx = float(double(v) * double(dt) + double(x));
+    if (limit <= nx) nx = limit;  // fcom C0|C3: limit <= x
+    if (!(-limit < nx)) nx = -limit;
+    x = nx;
+}
+
+std::array<float, 4> AiLean::quatMul(const std::array<float, 4>& a, const std::array<float, 4>& b) {
+#pragma clang fp contract(off)  // x87 has no fused multiply-add (a singular J^T J must stay det == 0)
+    // 0x410260 operation order: ax bw and ay bw pass through float stores.
+    const double t0 = float(double(a[0]) * b[3]), t1 = float(double(a[1]) * b[3]);
+    const double w = double(b[3]) * a[3] - ((double(a[2]) * b[2] + double(b[1]) * a[1]) + double(a[0]) * b[0]);
+    const double x = (double(a[2]) * b[1] - double(a[1]) * b[2]) + (double(b[0]) * a[3] + t0);
+    const double y = (double(a[0]) * b[2] - double(a[2]) * b[0]) + (double(b[1]) * a[3] + t1);
+    const double z = (double(a[1]) * b[0] - double(b[1]) * a[0]) + (double(b[2]) * a[3] + double(b[3]) * a[2]);
+    return {float(x), float(y), float(z), float(w)};
+}
+
+void AiLean::step(float dt, const std::array<float, 3>& acc, const std::array<float, 4>& orient, bool bike) {
+#pragma clang fp contract(off)  // x87 has no fused multiply-add (a singular J^T J must stay det == 0)
+    const auto F = qrotate(orient, {0, 0, 1}), R = qrotate(orient, {1, 0, 0}), U = qrotate(orient, {0, 1, 0});  // 0x410510
+    auto dotA = [&acc](const std::array<float, 3>& e) { return float((double(acc[2]) * e[2] + double(acc[1]) * e[1]) + double(acc[0]) * e[0]); };
+    auto axisAngle = [](const std::array<float, 3>& ax, float deg) {  // 0x40f8b0 with deg * 0.017453292 (0x9dc18c)
+        const float ang = float(double(deg) * double(0.017453292f));
+        const double h = double(ang) * 0.5;
+        const float s = float(std::sin(h)), c = float(std::cos(h));
+        return std::array<float, 4>{ax[0] * s, ax[1] * s, s * ax[2], c};
+    };
+    // pitch about the right axis from the forward acceleration
+    spring(v[0], x[0], dt, dotA(F), 20.0f, 1.04f, bike ? 3.5f : 2.0f);
+    q = axisAngle(R, x[0]);
+    // roll about the forward axis from the lateral acceleration (bikes lean into the turn, the others away, 6 deg)
+    const float lat = dotA(R);
+    if (bike) spring(v[1], x[1], dt, lat, 20.0f, 1.05f, 45.0f);
+    else spring(v[1], x[1], dt, -lat, 18.0f, 1.05f, 6.0f);
+    q = quatMul(axisAngle(F, x[1]), q);
+    // yaw about the up axis
+    spring(v[2], x[2], dt, -lat, 10.0f, 1.06f, 45.0f);
+    q = quatMul(q, axisAngle(U, x[2]));
+}
+
+std::vector<RankReactions::Gesture> RankReactions::update(float dt, const std::vector<int>& order, const std::vector<Rec>& recs) {
+    std::vector<Gesture> out;
+    const size_t n = recs.size();
+    if (rank_.size() != n) rank_.assign(n, -1), cool_.assign(n, 0.0f), list_.clear();
+    for (size_t i = 0; i < n; ++i) cool_[i] -= dt;  // 0x5c1e..: +0x17c -= dt
+    const std::vector<int> list = list_.empty() ? order : list_;
+    const int count = int(list.size());
+    for (int i = 0; i < count; ++i) {
+        const int id = list[size_t(i)];
+        if (id < 0 || size_t(id) >= n || !recs[size_t(id)].racing) continue;
+        const int was = rank_[size_t(id)];
+        rank_[size_t(id)] = i;
+        if (was == -1 || i == was) continue;
+        const int delta = i - was;
+        const int nb = delta < 1 ? i + 1 : i - 1;
+        if (nb < 0 || nb >= count) continue;
+        // 0x5c2370 (ECX = the neighbour's record, arg 1 = this record, arg 2 = delta)
+        const int other = list[size_t(nb)];
+        if (other < 0 || size_t(other) >= n || cool_[size_t(id)] > 0.0f) continue;
+        const Rec &me = recs[size_t(id)], &o = recs[size_t(other)];
+        const float ex = o.x - me.x, ez = o.z - me.z;
+        if (!(std::sqrt(ez * ez + ex * ex) < 25.0f)) continue;
+        const float side = me.dx * ez + -me.dz * ex;
+        const int base = side > 0 ? (delta > 0 ? 29 : 21) : (delta > 0 ? 33 : 25);
+        out.push_back({id, base});
+        cool_[size_t(id)] = 1.0f;
+    }
+    list_ = order;
+    return out;
+}
+// ---- end PK31
 
 }  // namespace fuel

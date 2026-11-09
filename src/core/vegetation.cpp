@@ -1,5 +1,6 @@
 #include "vegetation.hpp"
 #include "world.hpp"
+#include "road_segments.hpp"
 
 #include "assembly.hpp"
 #include "resources.hpp"
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -25,7 +27,13 @@ constexpr float kMaxSlopeNy = 0.866f;   // 30 degrees
 constexpr float kFadeNy = 0.707f;       // density fades out within ~0.6 degrees past 45
 constexpr float kRoadQuery = 10.0f;     // the engine looks for roads within 10 m
 constexpr float kSizeScale = 6.0f;      // species size range x 6
-constexpr float kSink = 0.25f;          // plants are set 25 cm into the ground
+
+// A float32 store under FUEL's round-down x87 mode (notes p21 H0).
+double f32down(double v) {
+    float f = float(v);
+    if (double(f) > v) f = std::nextafter(f, -std::numeric_limits<float>::infinity());
+    return double(f);
+}
 
 uint32_t rd32(const std::vector<uint8_t>& b, size_t o) {
     if (o + 4 > b.size()) throw std::runtime_error("GenWorld_Z body too short");
@@ -91,15 +99,21 @@ void parseSpeciesScript(const std::vector<uint8_t>& body, Species& sp) {
         }
         q = end;
         if (n == 0) continue;
+        // 0x7832c0: the number reader 0x6862e0 returns the digits as an x87 value; fmul 0.01f (and fsub / fadd
+        // 0.001f for ranges) in 53 bits, fstp to the float field under round-down (USA1's values are all integers).
+        const double pct = double(0.01f);
         auto range = [&](Species::Range& r) {
             if (n < 2) return;
-            r.lo = v[0] * 0.01f - 0.001f;
-            r.hi = v[1] * 0.01f + 0.001f;
+            r.lo = float(f32down(double(v[0]) * pct - double(0.001f)));
+            r.hi = float(f32down(double(v[1]) * pct + double(0.001f)));
         };
-        if (key == "12/11/2007 19:25") range(sp.size);
-        else if (key == "12/11/2007 19:29") sp.groundAlign = v[0] * 0.01f;
-        else if (key == "12/11/2007 19:30") sp.tilt = v[0] * 0.017453292f;
-        else if (key == "12/11/2007 20:01") sp.weight = v[0] * 0.01f;
+        auto percent = [&] { return float(f32down(double(v[0]) * pct)); };
+        if (key == "12/11/2007 19:25") range(sp.size);  // record +0x44 / +0x48: the plant size (draw and trunks)
+        else if (key == "12/11/2007 19:29") sp.groundAlign = percent();
+        else if (key == "12/11/2007 19:30") sp.tilt = float(f32down(double(v[0]) * double(0.017453292f)));
+        else if (key == "12/11/2007 20:01") sp.weight = percent();
+        else if (key == "25/01/2009 13:52") sp.trunk = percent();  // 0x7832c0 at 0x7839ed, store 0x783a13 -> record +0x78
+        else if (key == "12/11/2007 20:00") sp.flags = uint32_t(std::trunc(v[0]));  // fistp with RC = chop (0xc00) -> +0xf4
         else if (key == "12/11/2007 19:32") range(sp.humidity);
         else if (key == "12/11/2007 19:34") range(sp.density);
         else if (key == "17/04/2008 19:32") range(sp.stormed);
@@ -225,11 +239,11 @@ Mat3 alignUp(const float up[3]) {
 
 // The engine's instance randomness: four chained permutation draws.
 void instance(const Vegetation& v, const Species& s, double x, double z, const Ground& g, Plant& p) {
-    const float r0 = float(positionHash(v.perm, x + double(425.23886f), z)) / 255.0f;
+    const float r0 = float(plantNoise(v, float(x), float(z)));  // 0x784370 / 0x787c70
     const float r1 = float(positionHash(v.perm, double(r0) * double(931.9283f) + x, z)) / 255.0f;
     const float r2 = float(positionHash(v.perm, double(r1) * double(931.9283f) + x, z)) / 255.0f;
     const float r3 = float(positionHash(v.perm, double(r2) * double(931.9283f) + x, z)) / 255.0f;
-    const float size = kSizeScale * (s.size.hi * (1 - r0) + s.size.lo * r0);
+    const float size = plantScale(v, s, float(x), float(z));
     float up[3] = {g.n[0] * s.groundAlign, 1 - s.groundAlign + g.n[1] * s.groundAlign, g.n[2] * s.groundAlign};
     const float len = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
     for (float& c : up) c /= len;
@@ -238,10 +252,32 @@ void instance(const Vegetation& v, const Species& s, double x, double z, const G
     // Columns of m are the images of the mesh axes.
     for (int axis = 0; axis < 3; ++axis)
         for (int c = 0; c < 3; ++c) p.axes[size_t(axis)][size_t(c)] = m[size_t(c)][size_t(axis)] * size;
-    p.position = {float(x), g.y - kSink, float(z)};
+    p.position = {float(x), g.y - kPlantSink, float(z)};
 }
 
 }  // namespace
+
+double plantNoise(const Vegetation& v, float x, float z) {
+#pragma clang fp contract(off)
+    // fld x; fadd 425.23886f; fmul 12.317513f; fld z; fmul 10.193578f; faddp; fstp float; fistp (floor).
+    const double h = f32down((double(x) + double(425.23886f)) * double(12.317513f) + double(z) * double(10.193578f));
+    return double(v.perm[size_t(int64_t(std::floor(h)) & 255)]) * double(0.003921569f);
+}
+
+float plantScale(const Vegetation& v, const Species& s, float x, float z) {
+#pragma clang fp contract(off)
+    const double n = f32down(plantNoise(v, x, z));  // 0x784400 keeps n as a float (fst [esp+0x2c])
+    return float(f32down(((1 - n) * double(s.size.hi) + double(s.size.lo) * n) * double(kSizeScale)));
+}
+
+float trunkRadius(const Vegetation& v, const Species& s, float x, float z) {
+#pragma clang fp contract(off)
+    // 0x78531d: fld [rec+0x78]; fstp [ebx]; call 0x784370; fld1; fsub st, st(1); fmul [rec+0x48]; fld [rec+0x44];
+    // fmulp st(2); faddp; fmul [ebx]; fmul 6.0; fst [ebx]; 2.0 <= r ? 2.0 : r (0x788bd3 for bushes: the same).
+    const double n = plantNoise(v, x, z);
+    const double r = ((1 - n) * double(s.size.hi) + double(s.size.lo) * n) * double(s.trunk) * 6.0;
+    return r >= 2.0 ? 2.0f : float(f32down(r));
+}
 
 Vegetation loadVegetation(const DpcFile& world) {
     const std::vector<uint32_t> gens = world.ids(kGenWorldClass);
@@ -299,6 +335,27 @@ Vegetation loadVegetation(const DpcFile& world) {
         }
         p += size_t(n) * 4;
     }
+    // The 0x40-byte GenWorld records follow the groups: u32 n, n x 0x83-byte flat surfaces, u32 n, n x 0x40 (0x77c690).
+    try {
+        size_t q = p;
+        const uint32_t nFlat = rd32(b, q);
+        q += 4 + size_t(nFlat) * 0x83;
+        const uint32_t nBox = rd32(b, q);
+        q += 4;
+        if (nBox < 100000 && q + size_t(nBox) * 0x40 <= b.size()) {
+            for (uint32_t i = 0; i < nBox; ++i, q += 0x40) {
+                PlantClearance::Box box;
+                float f[16];
+                std::memcpy(f, &b[q], sizeof f);
+                for (int k = 0; k < 12; ++k) box.m[size_t(k)] = f[k];
+                for (int k = 0; k < 3; ++k) box.ext[size_t(k)] = f[12 + k];
+                box.radius = f[15];
+                v.clearance.boxes.push_back(box);
+            }
+            v.clearance.index();
+        }
+    } catch (const std::exception&) {
+    }
     auto loadMap = [&](size_t slot) {
         Raster r;
         if (slot < maps.size() && maps[slot] != 0)
@@ -328,32 +385,174 @@ void scatterPlants(const Vegetation& v, const Heightfield& terrain, const RoadNe
                 const std::vector<Species>& species = tree ? v.trees : v.bushes;
                 if (species.empty() || (impostors && !tree)) continue;
                 const float gx = float(cx * kCell), gz = float(cz * kCell);
-                // Jitter: the engine rounds this sum in single precision.
-                const float hsum = gz * 10.193578f + gx * 12.317513f + (tree ? kTreeSalt : kBushSalt);
+                // Jitter (0x7840c0 trees, 0x787a40 bushes): x87 sums (53 bits) stored as float32 under round-down,
+                // then fistp (floor): hash = x * 12.317513 + z * 10.193578 + salt; the plant point x + nibble x 1.2
+                // (exact in 53 bits) is stored as a float too, and every later hash reads that float (P52).
+                const double hsum = f32down(double(gx) * double(12.317513f) + double(gz) * double(10.193578f) + double(tree ? kTreeSalt : kBushSalt));
                 const uint8_t jb = v.perm[size_t(int64_t(std::floor(hsum)) & 255)];
-                const double px = gx + float(jb & 15) * kJitter, pz = gz + float(jb >> 4) * kJitter;
+                const double px = f32down(double(gx) + double(jb & 15) * double(kJitter)), pz = f32down(double(gz) + double(jb >> 4) * double(kJitter));
                 const double dist = std::hypot(px - x, pz - z);
                 if (dist > radius || dist < inner) continue;
                 const Ground g = groundAt(terrain, px, pz);
                 const float density = densityAt(v, px, pz, g.n[1]);
                 const float r = float(positionHash(v.perm, px, pz)) / 255.0f;
                 if (tree && !(r < density)) continue;
-                if (roads != nullptr && nearRoad(*roads, px, pz)) continue;
+                // Trees_Filter 0x783d60 / Bushes_Filter 0x7876e0 (P70b): RoadQuery 0x6fb2a0 (r = 10) on the TerraRoad
+                // segments = the segment with the smallest edge distance and its closest centreline point; reject when
+                // that centreline is nearer than T[+0xd0] (0xa678b0); nearer than T[+0x00]: "near road", which later
+                // needs n.y >= 0.707 [0x9dc0c8] (0x64e130 normal). Without FUEL's segments: the port's polyline test.
+                bool nearRoadSlope = false;
+                if (terrain.roads) {
+                    const RoadSampler::Nearest nr = terrain.roads->nearestRoad(px, pz, kRoadQuery);
+                    if (nr.seg != nullptr) {
+                        const float dx = float(px) - nr.px, dz = float(pz) - nr.pz;
+                        const float d = std::sqrt(dz * dz + dx * dx);
+                        const RoadType& T = terrain.roads->types().types[std::min<size_t>(nr.seg->type, 20)];
+                        if (d < T.at(0xd0)) continue;
+                        nearRoadSlope = d < T.at(0x00);
+                    }
+                } else if (roads != nullptr && nearRoad(*roads, px, pz)) {
+                    continue;
+                }
                 if (g.y > kTreeline || g.n[1] < kMaxSlopeNy) continue;
+                if (nearRoadSlope && g.n[1] < 0.707f) continue;
                 // Trees_Filter / Bushes_Filter: Trees_Excluded (0x7831e0), farm fields (point bit 19)
                 // and rock cover > 0.1 (bit 11), decoded in ground_point.cpp.
                 if (ground != nullptr && ground->rejectsPlant(px, pz)) continue;
                 if (blocked && blocked(px, pz)) continue;
+                // Decor_FreeOfObjects 0x557650: GenWorld record boxes, mission gates, POIs (PK05).
+                if (!v.clearance.free(float(px), g.y, float(pz), kPlantSphereRadius)) continue;
                 const int pick = pickSpecies(species, v, px, pz, g, density, r, impostors);
                 if (pick < 0) continue;
                 const Species& sp = species[size_t(pick)];
                 Plant plant;
                 plant.meshId = impostors ? sp.impostor : sp.full;
+                plant.tree = tree;
+                plant.species = uint16_t(pick + 1);
                 instance(v, sp, px, pz, g, plant);
                 out.push_back(plant);
             }
         }
     }
+}
+
+// ---- P94: FUEL's decor kinds and fades (vegetation.hpp).
+double decorLeafSize(double px, double pz, double camX, double camZ) {
+    constexpr double kRoot = 12288.0, kSplit = 2.0625, kMinChunk = 24.01;
+    double size = kRoot;
+    double ox = std::round(px / kRoot) * kRoot, oz = std::round(pz / kRoot) * kRoot;
+    while (size > kMinChunk) {
+        const double r = size * kSplit;
+        if ((ox - camX) * (ox - camX) + (oz - camZ) * (oz - camZ) >= r * r) break;
+        ox += (px >= ox ? 0.25 : -0.25) * size;
+        oz += (pz >= oz ? 0.25 : -0.25) * size;
+        size *= 0.5;
+    }
+    return size;
+}
+
+float decorAtt(DecorFade kind, double px, double pz, double eyeX, double eyeZ, float dxz) {
+    if (kind == DecorFade::None) return 1.0f;
+    auto att = [dxz](float min, float k) { return 1.0f - std::clamp((dxz - min) * k, 0.0f, 1.0f); };
+    const double C = decorLeafSize(px, pz, eyeX, eyeZ);
+    if (kind == DecorFade::Mesh) return C < 60.0 ? att(132.5f, 1.0f / 30.0f) : 0.0f;  // kinds 0 / 1
+    if (C < 30.0) return 0.0f;
+    if (C < 60.0) return att(147.5f, -1.0f / 30.0f);  // kind 0x16
+    if (kind == DecorFade::TreeCard) return C < 600.0 ? att(1200.0f, 1.0f / 100.0f) : 0.0f;  // kind 0x14
+    return C < 100.0 ? att(250.0f, 1.0f / 50.0f) : 0.0f;  // kind 0x15
+}
+// ---- P94 end
+
+}  // namespace fuel
+
+namespace fuel {
+
+// ---- PK05: Decor_FreeOfObjects 0x557650 and its three sub-tests.
+namespace {
+constexpr double kClearCell = 128.0;
+int64_t clearKey(int64_t cx, int64_t cz) { return (cx << 32) ^ (cz & 0xffffffff); }
+template <typename F>
+void forCells(float x0, float z0, float x1, float z1, F&& f) {
+    for (int64_t cz = int64_t(std::floor(z0 / kClearCell)); cz <= int64_t(std::floor(z1 / kClearCell)); ++cz)
+        for (int64_t cx = int64_t(std::floor(x0 / kClearCell)); cx <= int64_t(std::floor(x1 / kClearCell)); ++cx) f(clearKey(cx, cz));
+}
+}  // namespace
+
+void PlantClearance::index() {
+    boxGrid_.cells.clear();
+    gateGrid_.cells.clear();
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        const Box& b = boxes[i];
+        forCells(b.m[3] - b.radius, b.m[11] - b.radius, b.m[3] + b.radius, b.m[11] + b.radius,
+                 [&](int64_t k) { boxGrid_.cells[k].push_back(uint32_t(i)); });
+    }
+    for (size_t i = 0; i < gates.size(); ++i) {
+        const Gate& g = gates[i];
+        forCells(g.x - g.box, g.z - g.box, g.x + g.box, g.z + g.box, [&](int64_t k) { gateGrid_.cells[k].push_back(uint32_t(i)); });
+    }
+}
+
+// 0x6404a0: the grid query over (x - r, z - r)..(x + r, z + r) (record rectangles = position +- float 15), then 0x73f460 per
+// record: the sphere centre in the record's frame, squared distance to the box of half extents +0x30..+0x38 (> r^2 stops).
+bool PlantClearance::hitsBox(float x, float y, float z, float r) const {
+    if (boxes.empty()) return false;
+    bool hit = false;
+    forCells(x - r, z - r, x + r, z + r, [&](int64_t k) {
+        if (hit) return;
+        const auto it = boxGrid_.cells.find(k);
+        if (it == boxGrid_.cells.end()) return;
+        for (uint32_t i : it->second) {
+            const Box& b = boxes[i];
+            if (x + r < b.m[3] - b.radius || x - r > b.m[3] + b.radius || z + r < b.m[11] - b.radius || z - r > b.m[11] + b.radius) continue;
+            const float dx = x - b.m[3], dy = y - b.m[7], dz = z - b.m[11];
+            const float local[3] = {b.m[0] * dx + b.m[1] * dy + b.m[2] * dz, b.m[4] * dx + b.m[5] * dy + b.m[6] * dz,
+                                    dz * b.m[10] + b.m[9] * dy + b.m[8] * dx};
+            const float r2 = r * r;
+            float sum = 0;
+            bool inside = true;
+            for (int a = 0; a < 3; ++a) {
+                float d = 0;
+                if (-b.ext[size_t(a)] > local[a]) d = b.ext[size_t(a)] + local[a];
+                else if (b.ext[size_t(a)] < local[a]) d = local[a] - b.ext[size_t(a)];
+                else { continue; }
+                sum += d * d;
+                if (sum > r2) { inside = false; break; }
+            }
+            if (inside) { hit = true; return; }
+        }
+    });
+    return hit;
+}
+
+// 0x4f8a80 + 0x4f8e00. The grid hands back the gates whose box (start / finish ((n + 1) / 2 + 1) x 10, checkpoints +-25)
+// overlaps the sphere's box; each blocks when the xz distance is below road width + half + r (the half is the box size).
+bool PlantClearance::missionsFree(float x, float z, float r) const {
+    if (gates.empty()) return true;
+    bool free = true;
+    forCells(x - r, z - r, x + r, z + r, [&](int64_t k) {
+        if (!free) return;
+        const auto it = gateGrid_.cells.find(k);
+        if (it == gateGrid_.cells.end()) return;
+        for (uint32_t i : it->second) {
+            const Gate& g = gates[i];
+            if (x + r < g.x - g.box || x - r > g.x + g.box || z + r < g.z - g.box || z - r > g.z + g.box) continue;
+            const float dx = x - g.x, dz = z - g.z;
+            const float half = g.box + r;
+            const float d = std::sqrt(dx * dx + dz * dz);
+            if (!(g.road + half <= d)) { free = false; return; }
+        }
+    });
+    return free;
+}
+
+// 0x4ed9e0: POIs of the grid cells around the sphere; any within r + 25 (xz, strictly) blocks.
+bool PlantClearance::poisFree(float x, float z, float r) const {
+    const float lim = (r + 25.0f) * (r + 25.0f);
+    for (const auto& p : pois) {
+        const float dx = x - p[0], dz = z - p[1];
+        if (dz * dz + dx * dx < lim) return false;
+    }
+    return true;
 }
 
 }  // namespace fuel

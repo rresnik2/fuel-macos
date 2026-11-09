@@ -1,5 +1,6 @@
 #include "fuel_contacts.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace fuel::fv {
@@ -253,6 +254,19 @@ void attachWheel(Contact& c, WheelRec& rec, const Vec3& bodyUp) {
     rec.nDepth += c.n * c.depth;
 }
 
+void reducePerWheel(std::vector<Contact>& contacts) {
+    // asm 0x71b7e0: the scan runs over count - 1 records (the last contact is never a candidate).
+    std::vector<Contact*> cand;
+    for (size_t i = 0; i + 1 < contacts.size() && cand.size() < 256; ++i)
+        if (contacts[i].m.c != 0 && contacts[i].m.c != 1) cand.push_back(&contacts[i]);
+    if (cand.size() < 2) return;
+    // 0x725a80 is an unstable quicksort on R[0x36]; equal depths keep the stable order here.
+    std::stable_sort(cand.begin(), cand.end(), [](const Contact* a, const Contact* b) { return a->depth > b->depth; });
+    for (size_t i = 0; i < cand.size(); ++i)
+        for (size_t j = i + 1; j < cand.size(); ++j)
+            if (cand[i]->wheel == cand[j]->wheel && dot(cand[i]->n, cand[j]->n) > 0) cand[j]->depth = 0;
+}
+
 bool prepareImpulse(Contact& c) {
     c.impN = c.impF = false;
     if (c.m.c == 0) {
@@ -361,6 +375,26 @@ Tri makeTri(const Vec3& v0, const Vec3& v1, const Vec3& v2, int surface) {
     t.centroid = (v0 + v1 + v2) * 0.33333334f;
     t.boundR = std::max({len(t.centroid - v0), len(t.centroid - v1), len(t.centroid - v2)});
     t.surface = surface;
+    // 0x768d50 (P46): the box-triangle fields.
+    t.e2 = t.e1 - t.e0;
+    t.N = nn;
+    t.Nlen = l;
+    t.invNlen = l > 0 ? 1.0f / l : 0.0f;
+    auto unit = [](Vec3 v, float w, Vec3& out, float& outW) {  // 0x530b40
+        const float q = len2(v);
+        if (q > 1e-6f) {
+            const float k = 1.0f / std::sqrt(q);
+            v = v * k, w *= k;
+        }
+        out = v, outW = w;
+    };
+    t.planeN[0] = -t.n, t.planeW[0] = 0;
+    unit(cross(t.n, t.e0), 1.0f, t.planeN[1], t.planeW[1]);
+    t.planeW[1] = 0;
+    unit(cross(t.n, t.e2), 1.0f, t.planeN[2], t.planeW[2]);
+    t.planeW[2] = -dot(t.planeN[2], t.e0);
+    unit(cross(t.e1, t.n), 1.0f, t.planeN[3], t.planeW[3]);
+    t.planeW[3] = 0;
     return t;
 }
 

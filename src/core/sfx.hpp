@@ -130,9 +130,88 @@ struct Emitter {
             for (Particle& p : live) p.motion = 2;
     }
     void setPosition(const V3& p) { prevPos = pos, pos = p; }  // vf+0x14 0x4c4a60
+    bool dying = false;  // PK23: +7 (vf02 0x4c56b0)
+    void kill();         // PK23: vf02 0x4c56b0
 };
 
+// ---- PK23: the emitter setters (shared with core/vehicle_fx) ----
+void setRange(Well512& r, Emitter::R& x, float lo, float hi);                 // a range and its current draw
+void setRange3One(Well512& r, Emitter::R3& x, const V3& lo, const V3& hi);    // 0x4c4b10 + 0x4c4cf0: one random
+void redraw3(Well512& r, Emitter::R3& x);                                     // per axis (0x4c4da0 / 0x4c5eb0 / 0x4c5f80)
+void setColours(Well512& r, Emitter& e, const C4& a, const C4& b);            // 0x4c4bf0 + 0x4c4f70
+Emitter makeEmitter(Well512& r);                                              // SfxEmitter_Ctor 0x4c4730
+// ---- PK23 end
+
 class System;
+
+// ---- Tyre tracks: SpecialEffectsEmitter_G<SpecialEffectsRibbonTrail_G> (ctor 0x5f3050, vtable 0x9c42ec) and its
+// particle SpecialEffectsRibbonTrail_G (ctor 0x5df0d0, vtable 0x9c3f00, 200 B). Kind 0x1b: decal.vhl / decal.phl.
+// One ribbon is a strip of up to 32 points laid every 0.5 m along the wheel's path (step 0x5eec30); the vertex
+// strip is rebuilt by the particle step 0x5df2c0 (two vertices per point, +- the half width across the path).
+struct RibbonPoint {        // the four arrays the step appends to (+0x94 colour, +0x9c, +0xa4 normal, +0xb4 position)
+    V3 pos{};
+    C4 colour{1, 1, 1, 1};  // emitter +0x114 (the wheel's ground colour +0xe8)
+    float deep = 0, tarmac = 0;  // emitter +0xb4 (wheel compression +0x64), +0xb8 (ground class 0 fraction)
+    V3 normal{0, 1, 0};     // emitter +0x90 (wheel +0xfc: the vehicle's up axis, 0x5ceb10)
+    float u = 0;            // the u 0x5df2c0 gave the point's vertices
+};
+struct Ribbon {
+    std::vector<RibbonPoint> pts;
+    V3 at{};                // +0x14 position (emitter + offset while it follows)
+    V3 start{};             // +0x20 the emitter offset at the emission (+0xd8, 0 for the tracks)
+    float halfWidth = 0.2f; // +0x58 = emitter size (+0xfc)
+    float uBase = 0;        // +0x60 u at point `base`
+    int base = 0;           // +0x8c first point the next rebuild starts from (n - 3)
+    int prevBase = 0;       // +0x8c as the last rebuild found it
+    float spacing = 0.5f;   // +0x80 (0x5df0d0)
+    float uPerMetre = 0.3f; // +0x5c (0x5df0d0)
+    float age = 0, life = 1;  // +0x54, +0x50 (the emitter life P5110..P5111; only used once fading)
+    float colourAlpha = 1;  // +0x70
+    uint8_t flags = 0x1e;   // +0x10 = emitter +0x58
+    uint8_t motion = 1;     // +0x11: 1 grows with the emitter, 2 frozen
+    bool fade = false;      // alpha fn 1 - t after the kill 0x5eeba0 (else 0x4beae0 = 1)
+    bool dead = false;      // +0x68
+};
+// The decal vertex (VS_Decal, 0x38 B per vertex in FUEL): what 0x5df2c0 writes.
+struct DecalVertex {
+    V3 pos{};
+    float u = 0, v = 0;
+    V3 tangent{};          // uvscale.zw + positionRotation.w: vertex(j) - vertex(j + 2) (backwards along the strip)
+    C4 rgba{1, 1, 1, 1};   // rgb = the point colour; a = 0 at the end pairs, 1 (or the fade) inside
+    V3 normal{0, 1, 0};
+    float lift = 0.0625f;  // normal.w: the shader moves the vertex along the normal (0x3d800000)
+    float deep = 0, tarmac = 0;
+};
+struct TrackEmitter {
+    bool stopped = true, burstDone = false;  // +4, +5
+    V3 pos{}, prevPos{}, lastEmit{};
+    float halfWidth = 0.2f;  // size range +0x100/+0x104 (0.8 x wheel +0x68 while running)
+    C4 colour{1, 1, 1, 1};   // +0x114
+    float deep = 0, tarmac = 0;
+    V3 normal{0, 1, 0};
+    float lifeLo = 0, lifeHi = 0;  // +0x10c / +0x110 = P5110, P5111
+    std::vector<Ribbon> ribbons;
+    void start() {  // 0x5f3330
+        if (stopped) lastEmit = pos, stopped = burstDone = false;
+    }
+    void stop() {  // 0x5f41c0: the ribbons stop following
+        stopped = true;
+        for (Ribbon& r : ribbons) r.motion = 2;
+    }
+    void setPosition(const V3& p) { prevPos = pos, pos = p; }
+    uint8_t flags = 0x1e;  // PK23: +0x58 (0x5f3050)
+    bool dying = false;    // PK23: +7
+    void kill();           // PK23: vf02 0x5eeb20
+};
+// PK23: 0x5f0b70: the track's last ribbon's last point snaps to `contact` (+0xac) when the track runs, the ribbon is not
+// frozen, has two points or more and that point is within 2 m of the wheel emitter's position `wheelPos` (+8).
+void trackHeadSnap(TrackEmitter& t, const V3& wheelPos, const V3& contact);
+// 0x5df2c0's strip (two vertices per point) for one ribbon, appended to `out`.
+void ribbonVertices(const Ribbon& r, std::vector<DecalVertex>& out);
+// 0x5df2c0's u bookkeeping: the u of the points from +0x8c on, +0x60 / +0x8c advanced (run by every step).
+void ribbonRebuild(Ribbon& r);
+// 0x5df240: the u the next ribbon starts from = +0x60 + 0.3 x the ribbon's length.
+float ribbonEndU(const Ribbon& r);
 
 // ---- The wheel emitter (SpecialEffectsWheelEmitter_G 0x5efad0 / PlayerWheel 0x5cf0f0) -------------
 // What the vehicle feeds every frame (0x5ceb60), per wheel.
@@ -152,15 +231,25 @@ struct WheelInput {
     // +0x24..+0x38 = veh+0x104c..0x1060 = VehiclePP 671..676 (Pn at veh+0x5d4 + 4(n-1)): size factors of
     // dust (+0x24), chunks (+0x28), stones (+0x2c), projections (+0x30), +0x34, +0x38.
     std::array<float, 6> intensity{1, 1, 1, 1, 1, 1};
+    float width = 0.25f;   // +0x68 = veh+0x69c/0x6a0 (VehiclePP 51 / 52 by w & 1): the track is 0.8 x this wide
+    V3 up{0, 1, 0};        // +0xfc (0x5ceb10): the vehicle's up axis, the tracks' normal
+    V3 trackPos{};         // +0xac: where the track emitter sits (contact + body x offset veh+0x1630[w])
+    float cameraDistSq = 0;  // emitter +0x18 (0x5f7af0: squared distance to the camera, set every frame)
 };
 
 class WheelEmitter {
 public:
-    WheelEmitter(System& sys, bool player);
+    // `water` = +0x3c: the per-vehicle emitter of 0x5ce530 (mist +0x48 and spray +0x50, atlas 46) instead of the
+    // per-wheel set (dust, stones, projections, chunks, track).
+    WheelEmitter(System& sys, bool player, bool water = false);
     void update(float dt, const WheelInput& in);
     void stopAll();
-    // Sub-emitters (+0x40 track ribbon is not ported: kind 0x1b decal).
+    void kill();                               // PK23: vf02 0x5f0a20
+    bool dead() const { return dead_; }        // PK23: +6
     Emitter dust, stones, projection, chunks;  // +0x44, +0x58, +0x4c, +0x5c
+    Emitter mist, spray;                       // +0x48, +0x50 (water form)
+    TrackEmitter track;                        // +0x40 (kind 0x1b)
+    bool water() const { return water_; }
     int mode = 3;  // +0xf8
 
 private:
@@ -168,12 +257,14 @@ private:
     void baseUpdate(float dt, const WheelInput& in);   // 0x5f0ef0
     void playerUpdate(const WheelInput& in);           // 0x5eefc0
     void surfaceRules(const WheelInput& in, bool rainFlag);  // 0x5f29d0
+    void waterSetup();  // 0x5efc00 with +0x3c set
     System& sys_;
-    bool player_;
+    bool player_, water_ = false;
     V3 pos_{}, prev_{};
     float phase_ = 0;          // +0x60 (+= 4 dt, 0x5f0b50)
     bool havePos_ = false;
     bool stopped_ = true;      // +4 of the wheel emitter
+    bool dead_ = false;        // PK23: +6 (killed)
 };
 
 // ---- The effects system: clock, emitters, particles --------------------------------------------------
@@ -190,6 +281,7 @@ public:
     struct WheelFeed {
         int key = 0;
         bool player = false;
+        bool water = false;   // the per-vehicle emitter of 0x5ce530 (key vehicle * 16 + 15)
         bool active = false;  // loaded and within 200 m (0x5ceb60 conditions)
         WheelInput in;
     };
@@ -199,13 +291,24 @@ public:
     void runEmitter(Emitter& e, float dt, const V3& eye);
     // Everything to draw this frame: the GPU particles still alive and every emitter's CPU particles.
     void collect(std::vector<const Particle*>& out) const;
+    // Every tyre-track ribbon's decal strip (0x5df2c0), as triangle-strip pieces of `stride` vertices.
+    void collectTracks(std::vector<DecalVertex>& out, std::vector<uint32_t>& counts) const;
+    // Track emitter step (0x5f3ef0 with the ribbon emitter's particle loop 0x5f4480 / step 0x5eec30).
+    void runTrack(TrackEmitter& e, float dt, const V3& eye);
     size_t gpuCount() const { return gpu_.size(); }
     size_t wheelCount() const { return wheels_.size(); }
+    const WheelEmitter* wheel(int key) const {  // the emitter fed with `key` (null when none)
+        for (const Wheel& w : wheels_)
+            if (w.key == key && !w.w->dead()) return w.w.get();  // PK23: not a killed one
+        return nullptr;
+    }
 
 private:
     int emit(Emitter& e);                        // 0x4c56e0
     void initParticle(Emitter& e, Particle& p);  // 0x4c5a90
     void stepParticle(Emitter& e, Particle& p, float dt);  // 0x4c5ce0 + 0x5deca0
+    Ribbon* emitRibbon(TrackEmitter& e);                   // 0x5f41f0 + init 0x5f4570
+    void stepRibbon(TrackEmitter& e, size_t i, float dt);   // 0x5eec30
     const Tables& t_;
     Well512 rng_;
     float clock_ = 0;
@@ -217,5 +320,20 @@ private:
     std::vector<Wheel> wheels_;
     std::vector<Particle> gpu_;  // fire-and-forget (FXParticlesDraw_G buckets), dead at spawn + life
 };
+
+// ---- beam-colour: the navigator beams (FX_NAVIGATOR3D_LINE, 0x4bf820; notes beam-colour.md) -----------------
+// 0x4bf820 sets the ribbon particle's +0x60 = 0.05 and +0x5c = 0.9 every frame; 0x5fba20 writes vertex k's u = +0x60 +
+// +0x5c k / (n - 1) (k 0 = the icon's ground, n - 1 = the band point) and v 0 / 1 for the two sides; vh_billboard passes
+// uvscale.xy straight to ph_billboard. No FX atlas rect is applied (entry 0x1d's is mirrored: u0 1, du -1).
+inline float navBeamU(size_t k, size_t n) { return n > 1 ? 0.05f + 0.9f * float(k) / float(n - 1) : 0.05f; }
+// The particle colour: the record's rgb x 8 (0x9dbfbc, half floats +0x6a..), alpha = the record's a (Fade_One).
+inline std::array<float, 4> navBeamParticleColour(const std::array<float, 4>& record) {
+    return {record[0] * 8.0f, record[1] * 8.0f, record[2] * 8.0f, record[3]};
+}
+// ph_billboard (sfx.phl): colour = diffuse x texel, rgb x 2, sfxClip (a < 0.01 is discarded), PackHDRSample = identity
+// on PC (hlsl_math.h): an unlit HDR value, alpha-blended into the scene before the exposure and the tone map.
+inline std::array<float, 4> navBeamPixel(const std::array<float, 4>& particle, const std::array<float, 4>& texel) {
+    return {particle[0] * texel[0] * 2.0f, particle[1] * texel[1] * 2.0f, particle[2] * texel[2] * 2.0f, particle[3] * texel[3]};
+}
 
 }  // namespace fuel::sfx

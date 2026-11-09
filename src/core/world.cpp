@@ -3,9 +3,11 @@
 #include "assembly.hpp"
 #include "reader.hpp"
 #include "resources.hpp"
+#include "surface_patch.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <functional>
@@ -47,6 +49,62 @@ void groundFlags(const std::vector<const DpcFile*>& lookup, uint32_t userDefine,
     }
 }
 
+// The CONDITION_OBJECT governing each node (0x512da0 registers one per node holding the keyword;
+// 0x513ed0 applies it to the node and, with SONS, to every node below it).
+class ConditionResolver {
+public:
+    explicit ConditionResolver(const std::vector<const DpcFile*>& lookup) : lookup_(lookup) {}
+
+    // Returns the condition and sets `holder` to the node that carries it.
+    std::shared_ptr<const ObjectCondition> governing(uint32_t node, uint32_t& holder) {
+        holder = 0;
+        if (auto own = ownOf(node)) return holder = node, own;
+        uint32_t n = parentOf(node);
+        for (int depth = 0; n != 0 && depth < 64; ++depth, n = parentOf(n)) {
+            auto c = ownOf(n);
+            if (c && c->sons) return holder = n, c;
+        }
+        return nullptr;
+    }
+
+private:
+    struct Info {
+        uint32_t parent = 0, userDefine = 0;
+    };
+    const Info& info(uint32_t node) {
+        auto it = info_.find(node);
+        if (it != info_.end()) return it->second;
+        Info in;
+        const Found f = find(lookup_, node);
+        if (f.entry != nullptr && f.entry->classCrc == kNodeClass) try {
+                if (const auto b = f.file->body(*f.entry)) {
+                    const Node nd = parseNodeBody(*b);
+                    in.parent = nd.parent, in.userDefine = nd.userDefine;
+                }
+            } catch (const std::exception&) {
+            }
+        return info_.emplace(node, in).first->second;
+    }
+    uint32_t parentOf(uint32_t node) { return info(node).parent; }
+    std::shared_ptr<const ObjectCondition> ownOf(uint32_t node) {
+        const uint32_t ud = info(node).userDefine;
+        if (ud == 0) return nullptr;
+        auto it = byUserDefine_.find(ud);
+        if (it != byUserDefine_.end()) return it->second;
+        std::shared_ptr<const ObjectCondition> c;
+        const Found f = find(lookup_, ud);
+        if (f.entry != nullptr && f.entry->classCrc == kUserDefineClass) try {
+                if (const auto b = f.file->body(*f.entry))
+                    if (auto oc = parseObjectCondition(parseUserDefineBody(*b))) c = std::make_shared<const ObjectCondition>(std::move(*oc));
+            } catch (const std::exception&) {
+            }
+        return byUserDefine_.emplace(ud, c).first->second;
+    }
+    const std::vector<const DpcFile*>& lookup_;
+    std::unordered_map<uint32_t, Info> info_;
+    std::unordered_map<uint32_t, std::shared_ptr<const ObjectCondition>> byUserDefine_;
+};
+
 }  // namespace
 
 namespace {
@@ -60,26 +118,33 @@ float linkViewDistance(const Found& f) {
     return std::isfinite(v) ? v : 0;
 }
 
-// Meshes of one LOD-level object: a Mesh_Z, or every mesh of a Skin_Z.
+// Object link u32 at link offset 92 (Object_Z +0x60): the object flags (Lod 0x400000, 8 = not in the
+// collision hash, 0x65ef40).
+uint32_t linkFlags(const Found& f) {
+    const std::vector<uint8_t> link = f.file->link(*f.entry);
+    if (link.size() < 96) return 0;
+    uint32_t v;
+    std::memcpy(&v, &link[92], 4);
+    return v;
+}
+
+// Meshes of one LOD-level object: a Mesh_Z, or every mesh of a Skin_Z. A Surface_Z (P73) stands for itself: the
+// renderer bakes its patches under the Surface_Z ID (surface_patch.hpp).
 std::vector<uint32_t> levelMeshes(const Found& obj) {
     if (obj.entry == nullptr) return {};
-    if (obj.entry->classCrc == cls::Mesh) return {obj.entry->id};
+    if (obj.entry->classCrc == cls::Mesh || obj.entry->classCrc == cls::Surface) return {obj.entry->id};
     if (obj.entry->classCrc == kSkinClass)
         if (const auto skinBody = obj.file->body(*obj.entry)) return parseSkinBody(*skinBody).meshes;
     return {};
 }
 
-void collect(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup, uint32_t nodeId, std::vector<PlacedMesh>& out) {
-    const auto body = dpc.body(*dpc.find(nodeId));
-    if (!body) return;
-    const Node node = parseNodeBody(*body);
-    const Found obj = find(lookup, node.object);
+// The mesh entries of object `objectId` (a Lod_Z or a Mesh_Z / Skin_Z) on top of `base` (node fields).
+void collectObject(const std::vector<const DpcFile*>& lookup, uint32_t objectId, const PlacedMesh& baseIn, std::vector<PlacedMesh>& out) {
+    const Found obj = find(lookup, objectId);
     if (obj.entry == nullptr) return;
-    PlacedMesh base;
-    base.nodeId = nodeId;
-    base.world = node.world;
-    base.lodScale = node.lodScale;
-    groundFlags(lookup, node.userDefine, base.fitToGround, base.groundNormal);
+    PlacedMesh base = baseIn;
+    base.objectId = objectId;
+    base.objectFlags = linkFlags(obj);
     std::vector<std::vector<uint32_t>> levels;  // meshes per level
     std::vector<std::vector<float>> views;
     auto addLevel = [&](const Found& o) {
@@ -112,6 +177,7 @@ void collect(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup, uint
     for (size_t j = 0; j < levels[0].size(); ++j) {  // one entry per mesh of the first level
         PlacedMesh pm = base;
         pm.meshId = levels[0][j];
+        pm.collisionFirst = j == 0;
         for (size_t k = 0; k < levels.size(); ++k) {
             const size_t i = std::min(j, levels[k].size() - 1);
             pm.levels.push_back(levels[k][i]);
@@ -121,13 +187,31 @@ void collect(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup, uint
     }
 }
 
+void collect(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup, uint32_t nodeId, std::vector<PlacedMesh>& out,
+             ConditionResolver* conditions) {
+    const auto body = dpc.body(*dpc.find(nodeId));
+    if (!body) return;
+    const Node node = parseNodeBody(*body);
+    if (find(lookup, node.object).entry == nullptr) return;
+    PlacedMesh base;
+    base.nodeId = nodeId;
+    base.nodeFlags = node.flags;
+    if (const std::vector<uint8_t> nl = dpc.link(*dpc.find(nodeId)); nl.size() >= 4) std::memcpy(&base.nodeName, nl.data(), 4);
+    base.world = node.world;
+    base.lodScale = node.lodScale;
+    groundFlags(lookup, node.userDefine, base.fitToGround, base.groundNormal);
+    if (conditions) base.condition = conditions->governing(nodeId, base.conditionNode);
+    collectObject(lookup, node.object, base, out);
+}
+
 }  // namespace
 
 std::vector<PlacedMesh> collectPlacedMeshes(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup) {
     std::vector<PlacedMesh> out;
+    ConditionResolver conditions(lookup);
     for (uint32_t nodeId : dpc.ids(kNodeClass)) {
         try {
-            collect(dpc, lookup, nodeId, out);
+            collect(dpc, lookup, nodeId, out, &conditions);
         } catch (const std::exception&) {
             // Nodes that do not parse are skipped.
         }
@@ -138,7 +222,19 @@ std::vector<PlacedMesh> collectPlacedMeshes(const DpcFile& dpc, const std::vecto
 std::vector<PlacedMesh> collectNodeMeshes(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup, uint32_t nodeId) {
     std::vector<PlacedMesh> out;
     try {
-        if (dpc.find(nodeId) != nullptr) collect(dpc, lookup, nodeId, out);
+        ConditionResolver conditions(lookup);
+        if (dpc.find(nodeId) != nullptr) collect(dpc, lookup, nodeId, out, &conditions);
+    } catch (const std::exception&) {
+    }
+    return out;
+}
+
+std::vector<PlacedMesh> collectObjectMeshes(const std::vector<const DpcFile*>& lookup, uint32_t objectId) {
+    std::vector<PlacedMesh> out;
+    try {
+        PlacedMesh base;
+        base.world = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        collectObject(lookup, objectId, base, out);
     } catch (const std::exception&) {
     }
     return out;
@@ -168,10 +264,11 @@ std::vector<PlacedMesh> collectWorldRootMeshes(const DpcFile& usa1, const std::v
         under[n] = r;
         return r;
     };
+    ConditionResolver conditions(lookup);
     for (uint32_t nodeId : usa1.ids(kNodeClass)) {
         if (!reaches(nodeId, 0)) continue;
         try {
-            collect(usa1, lookup, nodeId, out);
+            collect(usa1, lookup, nodeId, out, &conditions);
         } catch (const std::exception&) {
         }
     }
@@ -187,6 +284,15 @@ int lodLevel(const PlacedMesh& p, float d, const LodView& v) {
     std::memcpy(&bits, &x, 4);
     const int level = int(bits >> 23) - 0x7e;  // floor(log2 x) + 1 (0x884170)
     return std::clamp(level, 0, hi);
+}
+
+int lodSwitchLevel(float d, float baseDistance, float nodeScale, int lo, int hi, const LodView& v) {  // P104
+    if (hi <= lo) return lo;
+    const float x = d / (v.K * baseDistance * nodeScale * v.viewScale);
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    const int level = int(bits >> 23) - 0x7e;  // floor(log2 x) + 1 (0x884170)
+    return std::clamp(level, lo, hi);
 }
 
 float lodFade(float viewDist, float nearFade, float hardCull, float s, float d, const LodView& v) {
@@ -208,12 +314,18 @@ float lodFade(float viewDist, float nearFade, float hardCull, float s, float d, 
 
 float placementAlpha(const PlacedMesh& p, int level, float d, const LodView& v) {
     const float s = p.lodScale * v.viewScale;
+    float a = 1.0f;  // view+0x160 before each object (0x752bf0: param_2[0x58] = 1.0)
     if (p.lod && (p.viewDist != 0 || p.hardCull != 0 || p.nearFade != 0)) {
-        const float a = lodFade(p.viewDist, p.nearFade, p.hardCull, s, d, v);
+        a = lodFade(p.viewDist, p.nearFade, p.hardCull, s, d, v);
         if (!(a >= 0.01f)) return 0;  // [0x99614c]
     }
-    // Mesh_Z::Draw 0x80a280: the level mesh's own fade (its +0x11c / +0x124 are taken as 0).
+    // Mesh_Z::Draw 0x80a280: the level mesh's own fade (its +0x11c / +0x124 are taken as 0). P94: Mesh_Z::Draw returns
+    // before writing view+0x160 when its view distance, near fade and hard cull are all 0 (and node+0x5c >= 1, true for
+    // every USA1 node): the Lod's alpha then stays. (The port used to reset it to 1 there, so a Lod whose level meshes
+    // have no view distance of their own appeared at full alpha at the end of its fade instead of fading in.)
     const float view = level < int(p.levelView.size()) ? p.levelView[size_t(level)] : 0.0f;
+    static const bool legacy = std::getenv("FUEL_POP_LEGACY") != nullptr;  // the pre-P94 reset to 1 (A/B comparisons)
+    if (view == 0 && !legacy) return a;
     return std::max(0.0f, lodFade(view, 0, 0, s, d, v));
 }
 

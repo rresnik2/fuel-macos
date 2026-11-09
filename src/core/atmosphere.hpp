@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 
 namespace fuel {
 
@@ -35,8 +36,22 @@ struct Weather {
 struct AtmosphereInput {
     double timeOfDay = 8 * 3600;  // seconds (WeatherManager +0xac)
     Weather weather;
-    float brightness = 1.0f;      // the Brightness option G = 0.5 + 1.5 slider (A+0); default Unknown (U2): 1
+    float brightness = 1.0f;      // the Brightness option G = 0.5 + 1.5 slider (A+0); default 1 (0x553c80 reset: g_Game +0x24c = 1.0f)
     F3 camera = {0, 0, 0};        // world position (metres)
+    // P105: W+0xbc, the lowest ground near the camera (GenWorld_LowestGround 0x77a240, every GenWorld frame
+    // 0x77a3b0): the minimum of the coarse map height (0x445570) on a 5 x 5 lattice, +-2000 m in 1000 m steps
+    // around the camera. The frame then sets scatter P7 = W+0xbc + 1000 (0x77a407..0x77a422: the scale height of
+    // the low haze layer), and the weather hook 0x6409d0 adds it to the cloud layer bottom / top (P10, P11).
+    // NaN = no world (the decode's L5 vectors: P7 keeps Scatter_InitParams' 500, P10 / P11 without it).
+    float lowestGround = std::numeric_limits<float>::quiet_NaN();
+    // ---- PK17: World_SetTimeAndCloud 0x6408a0's own cloud argument, read only by Atmo_UpdateSun 0x780920's intensity
+    // term (exposure, bloom); the sky colour keeps the weather hook's S+0x68. < 0: the weather's cloud (the per-frame
+    // apply 0x5bba30 passes the same value). The pause backdrop 0x46abd0 passes 0.
+    float sunCloud = -1.0f;
+    // ---- end PK17
+    // DUSK: true = the pre-DUSK port (the lifted DLIGHT_DIR as the sun direction of theta, SC3, s and DSKY_DIR), for
+    // A/B captures only (FUEL_DUSK_OLD_SUN=1).
+    bool legacyLiftedSun = false;
 };
 
 // Everything the shaders take per frame.
@@ -46,8 +61,9 @@ struct Atmosphere {
     float sunHeight = 0;    // signed y of the sun before the night mirror
     bool day = true;
     float theta = 0;        // zenith angle of sunRaw (S+0x40)
-    F3 lightDir{};          // DLIGHT_DIR: normalize(x, max(|y|, 0.05) + 0.25, z) (A+0xbc)
-    F3 skyDir{};            // DSKY_DIR: normalize(0.3 L.x, 1, 0.3 L.z)
+    F3 sunDir{};            // DUSK: S+0x4c = normalize(x, max(|y|, 0.05), z): theta, sun position (SC3, s), DSKY_DIR
+    F3 lightDir{};          // DLIGHT_DIR: normalize(S+0x4c + (0, 0.25, 0)) (A+0xbc)
+    F3 skyDir{};            // DSKY_DIR: normalize(0.3 S+0x4c.x, 1, 0.3 S+0x4c.z) (0x779d40)
     // Exposure, bloom, blue shift (A+0x4..0x24 -> viewport, 0x77a3b0)
     float intensity = 0;    // I (A+0x8)
     float screenLuminance = 0, minExposure = 0, maxExposure = 0, bloomLumScale = 0;
@@ -73,12 +89,26 @@ enum ScatterConst { kSC1, kSC2, kTERM, kBETA1, kBETADASH1, kBETA2, kBETADASH2, k
 // The full per-frame evaluation.
 Atmosphere computeAtmosphere(const AtmosphereInput& in);
 
+// ---- PK04: the day clock and SetDayClock 0x46ab10.
+// [0xa2e82c] is a 40-bit millisecond clock (read by clock_ms 0x6dded0, advanced by 0x6ddfa0 from LevelManipulator
+// while not paused); WeatherManager_G 0x5b89e0 turns it into the time of day: clock_s x PP371 (96) + 28800 (08:00),
+// unless the race override (+0x114) or ForceDayTime ([0xa022c0] < 86400) holds it.
+// SetDayClock(t) zeroes the five bytes, then 0x6ddfa0 adds ftol(t x 1000 + 0.5) ms (1 less when that is <= 0),
+// then World_SetTimeAndCloud 0x6408a0(world, t, cloud 0) (the next weather apply replaces it; nothing to port).
+// Callers: first arrival at a hub (0x47d9c0 -> 0x481e40) with t = 43200 -> 08:00 (43200 x 96 = 48 whole days);
+// the pause menu 0x46abd0 (450 s -> 20:00).
+uint64_t setDayClockMs(double t);                            // the clock (ms, 40 bits) after SetDayClock(t)
+double dayClockTimeOfDay(uint64_t clockMs, float pp371);     // 0x5b89e0 +0xac (seconds, not wrapped)
+// ---- end PK04
+
 // Pieces (exposed for the checks).
 F3 sunDirection(double timeOfDay, float* signedY);         // 0x780920 sun path (un-mirrored)
 F3 preethamTau(float theta);                               // 0x781d70, turbidity 3
 void lightColours(Atmosphere& a, float cloud);             // DLIGHT / DSKY colours from a.theta, a.day (a.blueShift set)
 std::array<float, 13> scatterDefaults();                   // 0x780ce0
-void applyWeather(std::array<float, 13>& P, const Weather& w);  // 0x6409d0
+void applyWeather(std::array<float, 13>& P, const Weather& w, float lowestGround = 0);  // 0x6409d0 (W+0xbc)
+// P105: GenWorld_LowestGround 0x77a240: min of height(x, z) over the 5 x 5 lattice camera +-2000 m, 1000 m steps.
+float lowestGroundNear(double camX, double camZ, float (*height)(double, double, const void*), const void* ctx);
 // scatterintegral (scattering.h / 0x7813d0): density integral along a segment of length `len` between heights.
 float scatterIntegral(const Atmosphere& a, float len, float y1, float y2);
 // scatteringbase: extinction and inscatter seen from `eye` for a point `p`.

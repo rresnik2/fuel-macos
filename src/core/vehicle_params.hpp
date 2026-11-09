@@ -33,6 +33,7 @@ struct ProxySphere {
 };
 struct ProxyBox {
     std::array<float, 3> centre{}, halfExtents{};
+    float radius = 0;  // the record's bounding radius (+0xa0 of the engine's box)
 };
 struct VehicleProxy {
     std::vector<ProxySphere> spheres;

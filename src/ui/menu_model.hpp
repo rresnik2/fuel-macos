@@ -6,6 +6,7 @@
 // parsed from the player's files at run time.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -56,6 +57,12 @@ struct Item {
     bool focus = false;
     std::string dynText;   // text of Dyn items (and overrides for others when non-empty)
     bool hasDynText = false;
+    // PK18: images draw at (x - W a7 / 2, y - H a8 / 2) (0x612020), W x H = +0x90 / +0x94 in the normal state (the halos
+    // set it, 0x4701a0) else w x h; 0 = w / h. Text items: the marquee offset +0xd0 / +0xd4 (0x614bb0) and the focus
+    // jitter +0x18 / +0x1c (0x46f6f0).
+    float drawW = 0, drawH = 0;
+    mutable float scrollX = 0, scrollY = 0;  // drawn const: the marquee advances at draw time (Menu::drawItem)
+    float offX = 0, offY = 0;
 
     bool isText() const { return kind != ItemKind::Image && kind != ItemKind::FillRect; }
     bool isButton() const { return kind == ItemKind::ButtonTT || kind == ItemKind::ButtonDyn || kind == ItemKind::ListBoxTT; }
@@ -101,6 +108,9 @@ struct VehicleInfo {
     int tier = 0;
     uint32_t nameText = 0;
     std::vector<float> bars;  // AddVehicleInterfaceParams: performance bars 0..1
+    std::string picture;      // P66: AddVehicleInfo 5th argument (record +0x4c, "VEH_QUAD_ROAD_2"): the garage
+                              // carousel's picture (0x47a7d0 entry +4 = crc of it, drawn by 0x60abf0)
+    std::vector<std::array<uint8_t, 3>> colors;  // P66: AddVehicleColor R<r>G<g>B<b> (0x56acb0: +0x8c + 12 i = v / 510)
 };
 std::vector<VehicleInfo> loadVehicleInfos(const std::string& dataDir);
 

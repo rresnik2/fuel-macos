@@ -141,10 +141,14 @@ public:
     std::vector<FileFlatInfo> fileFlatsAt(double x, double z) const;
     // The same for record `index` at any point (d may be negative outside).
     FileFlatInfo fileFlat(uint32_t index, double x, double z) const;
+    size_t fileFlatCount() const { return flatRaw_.size(); }
+    const MapSampler& slot11() const { return map11_; }  // loaded, never read (the 0x7006f0 lake term is 0 in USA1)
     // The height with flags 5 (0x64a2a0 | 1): detail, roads and the snow lift, no gulches, flat
     // surfaces or work bumps (what 0x799910 probes the ground with).
     double roadHeight(double x, double z) const;
     size_t gulchLineCount() const;
+    // Gulch_Query 0x7a0620 (P80): the gulch profile 0x7a00e0 at (x, z) is above 0.001 (AutoMesh rejects non-GulchSide rules).
+    bool inGulch(double x, double z) const { return gulchDepth(x, z) > 0.001; }
     size_t roadLineCount() const;
 
 private:

@@ -1,7 +1,9 @@
 #include "ui/menu_check.hpp"
+#include "ui/menu.h"  // [upgrades U3] runUpgradePageCheck
 
 #include "ui/menu_assets.hpp"
 #include "ui/menu_model.hpp"
+#include "ui/tsc.hpp"  // PK25
 
 #include "core/dpc.hpp"
 #include "core/resources.hpp"
@@ -120,12 +122,32 @@ int runMenuCheck(const std::string& dataDir, const std::string& language) {
         std::printf("menu check: %-5s %s: %zu text refs, %zu not in the table, %zu characters without a glyph\n", lang, t.file.c_str(), refs, missing, lacks.size());
         if (!lacks.empty()) problems.push_back(std::string(lang) + ": characters without a glyph");
     }
+    // PK25: the in-game alert dialogs (resGIGD.tsc, FrontGlobalInGameData_G vf24 0x442990) and what MCAlert shows: the
+    // four dialogs, their pictures, and the texts of the save / load error flows (TT 9118, 9038, 9019 are absent on PC).
+    {
+        TscReader rd((std::filesystem::path(dataDir) / "CommonComponent").string());
+        std::set<std::string> dialogs, pictures;
+        rd.run("resGIGD.tsc", {}, [&](const TscLine& l) {
+            std::string c = l.args[0];
+            for (char& ch : c) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+            if (c == "MENUDIALOG" && l.args.size() > 1) dialogs.insert(l.args[1]);
+            if (c == "MENUPROPERTYIMAGE" && l.args.size() > 1) pictures.insert(l.args[1]);
+        });
+        for (const char* d : {"PADAlert", "InfosText", "MCAlert", "IGMsgBox"})
+            if (!dialogs.count(d)) problems.push_back(std::string("resGIGD.tsc: no dialog ") + d);
+        for (const std::string& n : pictures)
+            if (!assets.image(n)) problems.push_back("resGIGD.tsc: picture not loaded: " + n);
+        for (uint32_t tt : {9024u, 9045u, 9113u, 9034u, 9023u, 489u, 490u})
+            if (!text.get(tt)) problems.push_back("alert text TT " + std::to_string(tt) + " missing");
+        std::printf("menu check: alerts: %zu resGIGD dialogs, %zu pictures, MCAlert texts present\n", dialogs.size(), pictures.size());
+    }
     for (const std::string& p : problems) std::printf("menu check: %s\n", p.c_str());
     std::printf("menu check: %zu pages, %zu items, %zu text refs (%zu strings in %s), %zu image refs (%zu names in no DPC), fonts %s %zu glyphs / %s %zu glyphs\n",
                 ms.pages.size(), items, texts, text.strings.size(), text.file.c_str(), images, absentImages, assets.font(0).name.c_str(),
                 assets.font(0).glyphs.size(), assets.font(1).name.c_str(), assets.font(1).glyphs.size());
     std::printf("menu check: %s (%zu problems)\n", problems.empty() ? "ok" : "PROBLEMS", problems.size());
-    return problems.empty() ? 0 : 1;
+    // [upgrades U3] the garage's UPGRADES page (garage_upgrades.mm), on its own scratch career / settings.txt
+    return (problems.empty() ? 0 : 1) + runUpgradePageCheck(dataDir) + runDevModeCheck(dataDir);  // [dev mode]
 }
 
 }  // namespace fuel::ui

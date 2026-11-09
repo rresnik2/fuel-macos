@@ -1,0 +1,12 @@
+# PHYSIQUE (port deviation): copies the player's custom rider assets (rider.fra + DDS textures, built outside the repo)
+# into FUEL.app/Contents/Resources/rider when the folder exists. Run by the FUEL_app target: cmake -DSRC=.. -DDST=.. -P
+if(EXISTS "${SRC}/rider.fra")
+  file(REMOVE_RECURSE "${DST}")
+  file(MAKE_DIRECTORY "${DST}")
+  file(GLOB _files "${SRC}/rider.fra" "${SRC}/*.dds")
+  file(COPY ${_files} DESTINATION "${DST}")
+  list(LENGTH _files _n)
+  message(STATUS "custom rider: ${_n} files from ${SRC}")
+else()
+  message(STATUS "custom rider: none at ${SRC} (FUEL's rider only)")
+endif()

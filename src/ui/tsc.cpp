@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -17,6 +18,39 @@ std::string lower(std::string s) {
 }
 
 }  // namespace
+
+// 0x7c2890 (PK10): scanning starts after the last '"' of the line; every %<digits> there with 1 <= N <= the frame's
+// parameter count is replaced by parameter N. The result holds only the text from that point on (what precedes
+// the last quote is dropped, as in the game). A '%' without digits makes the whole line run unexpanded (returns
+// false), as does a line without '%'. The game loops forever on an out-of-range %N (0x7c2890 re-finds the same
+// '%'); the port keeps the text "%N" instead.
+bool expandScriptParams(const std::string& line, const std::vector<std::string>& params, std::string* out) {
+    const size_t q = line.rfind('"');
+    size_t at = q == std::string::npos ? 0 : q + 1;
+    size_t pct = line.find('%', at);
+    if (pct == std::string::npos) return false;
+    std::string res;
+    for (;;) {
+        res.append(line, at, pct - at);
+        size_t d = pct + 1;
+        while (d < line.size() && line[d] >= '0' && line[d] <= '9') ++d;
+        if (d == pct + 1) return false;
+        const long n = std::atol(line.substr(pct + 1, d - pct - 1).c_str());
+        if (n > 0 && size_t(n) <= params.size()) {
+            res += params[size_t(n - 1)];
+            at = d;
+        } else {
+            res.append(line, pct, d - pct);  // out of range: the game hangs here
+            at = d;
+        }
+        pct = line.find('%', at);
+        if (pct == std::string::npos) {
+            res.append(line, at, std::string::npos);
+            *out = res;
+            return true;
+        }
+    }
+}
 
 std::string findPathNoCase(const std::string& root, const std::string& rel) {
     std::string r = rel;
@@ -110,16 +144,12 @@ void TscReader::runFile(const std::string& path, const std::vector<std::string>&
     int lineNo = 0;
     while (std::getline(ss, raw)) {
         ++lineNo;
-        // %1.. substitution (BSource parameters).
-        std::string line;
-        for (size_t i = 0; i < raw.size(); ++i) {
-            if (raw[i] == '%' && i + 1 < raw.size() && std::isdigit(static_cast<unsigned char>(raw[i + 1]))) {
-                const size_t k = size_t(raw[i + 1] - '1');
-                if (k < params.size()) line += params[k];
-                ++i;
-            } else {
-                line += raw[i];
-            }
+        // %N expansion (PK10, 0x7c2890): see expandScriptParams.
+        std::string line = raw;
+        if (!params.empty()) {
+            const std::string body = raw.substr(0, raw.find("//"));  // 0x7c2340 cuts the comment first
+            std::string out;
+            if (expandScriptParams(body, params, &out)) line = out;
         }
         std::vector<std::string> a = splitTscLine(line, &inBlock);
         if (a.empty()) continue;
@@ -159,7 +189,10 @@ void TscReader::runFile(const std::string& path, const std::vector<std::string>&
                 problems.push_back(path + ":" + std::to_string(lineNo) + ": BSource not found: " + a[1]);
                 continue;
             }
-            runFile(inc, std::vector<std::string>(a.begin() + 2, a.end()), fn, depth + 1);
+            // 0x7c1fb0: the frame holds 32 parameter slots (0x40 bytes each, +0x29c).
+            std::vector<std::string> pp(a.begin() + 2, a.end());
+            if (pp.size() > 32) pp.resize(32);
+            runFile(inc, pp, fn, depth + 1);
         }
     }
 }

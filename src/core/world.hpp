@@ -2,9 +2,11 @@
 #pragma once
 
 #include "dpc.hpp"
+#include "object_script.hpp"
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,11 +15,27 @@ namespace fuel {
 struct PlacedMesh {
     uint32_t meshId = 0;
     uint32_t nodeId = 0;
+    // The node's object (Lod_Z or Mesh_Z) and flags (node+0x2c): FUEL's static collision is the object's
+    // (static_collision.hpp), for nodes with 0x8000000 and without 0x40000. collisionFirst marks the first
+    // entry of a node (a Skin level gives one entry per mesh; the collision belongs to the node once).
+    uint32_t objectId = 0;
+    uint32_t nodeFlags = 0;
+    bool collisionFirst = false;
+    // P50: the object's flags (Object_Z +0x60 = link +0x5c; bit 8 keeps the node out of the collision hash,
+    // 0x65ef40) and the node's name (Node_Z link u32 0 = AsoboCRC of the name; a clone.tsc class name makes the
+    // node a game object of that class, e.g. IT_DYNOBJ_G, static_collision.hpp).
+    uint32_t objectFlags = 0;
+    uint32_t nodeName = 0;
     std::array<float, 16> world{};  // row-vector convention (translation in 12..14)
     // The node's UserDefine_Z says FITTOGROUND / GROUNDNORMAL. Informational: the engine
     // applies these keywords only to AutoMesh spawns (0x778650), never to static placements,
     // which keep their authored matrix (p35 F2).
     bool fitToGround = false, groundNormal = false;
+    // The CONDITION_OBJECT that shows or hides this placement (p38, object_script.hpp): the node's
+    // own, else the nearest ancestor's "CONDITION_OBJECT SONS" (0x513ed0 walks the nodes below it);
+    // null when none. conditionNode = the node holding it.
+    std::shared_ptr<const ObjectCondition> condition;
+    uint32_t conditionNode = 0;
     // Per-object level of detail and fade (Lod_Z::Draw 0x884170, ComputeFade 0x672950, Mesh_Z::Draw
     // 0x80a280; decode p6 W7/W8, P31 out-F 1.5, p36). levels[k] = the mesh of this slot at level k
     // (levels[0] == meshId); levelView[k] = that Mesh_Z's own view distance (link +88, 0 = none).
@@ -28,6 +46,16 @@ struct PlacedMesh {
     std::vector<float> levelView;
     bool lod = false;
     float baseDistance = 1, viewDist = 0, nearFade = 0, hardCull = 0, lodScale = 1;
+    // P94: an AutoMesh / RoadMesh spawn's cell (automesh.hpp autoCellHolds). FUEL holds the object while the decor
+    // quadtree leaf at (x, z), seen from the camera, is a chunk that generates it (size < maxC) and the rule's emit
+    // cull (radius, viewDist, noOcclusion) passes: decided per frame as the camera moves (0x78d390 / 0x78e2c0 run
+    // when a chunk is made). The port generates a superset on its worker and the renderer applies this every frame.
+    struct AutoCell {
+        double x = 0, z = 0;
+        float maxC = 0, radius = 0, viewDist = -1;
+        bool noOcclusion = false, on = false;
+    };
+    AutoCell autoCell;
 };
 
 // The view's LOD factors in FUEL's main view (p36): Lod_Z::Draw uses x = d / (K D s) with
@@ -43,6 +71,10 @@ struct LodView {
 // Lod_Z::Draw's level for a camera distance d (0 .. levels-1), and the fade alpha (0..1) of
 // ComputeFade for a Lod (or Mesh) with these fields; alpha < 0.01 is not drawn.
 int lodLevel(const PlacedMesh& p, float d, const LodView& v = {});
+// P104: the same switch for any Lod_Z: level floor(log2(d / (K D s))) + 1 with s = nodeScale x viewScale, clamped to
+// [lo, hi] (Lod_Z::Draw 0x884170: hi = levels - 1, lo = 1 with the LodData flag 0x400000 << view, lo = hi = 0 with
+// 0x20000 << view).
+int lodSwitchLevel(float d, float baseDistance, float nodeScale, int lo, int hi, const LodView& v = {});
 float lodFade(float viewDist, float nearFade, float hardCull, float s, float d, const LodView& v = {});
 // The alpha FUEL draws the placement with at distance d: the Lod's fade gates the draw
 // (>= 0.01), then the level's Mesh_Z::Draw recomputes it with the mesh's own view distance.
@@ -55,6 +87,9 @@ float placementAlpha(const PlacedMesh& p, int level, float d, const LodView& v =
 std::vector<PlacedMesh> collectPlacedMeshes(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup);
 // The mesh entries of one node of `dpc` (as collectPlacedMeshes makes them); empty if none.
 std::vector<PlacedMesh> collectNodeMeshes(const DpcFile& dpc, const std::vector<const DpcFile*>& lookup, uint32_t nodeId);
+// The mesh entries object `objectId` (Lod_Z, Mesh_Z or Skin_Z) gives a node, at the identity matrix with no node fields
+// (P55: the IT_DYNOBJ_G pieces a breakable decor object turns into are Lod_Z objects found by name).
+std::vector<PlacedMesh> collectObjectMeshes(const std::vector<const DpcFile*>& lookup, uint32_t objectId);
 // USA1.DPC's own placements that FUEL draws (p36): the nodes under the World_Z root node (World_Z
 // body u32 0, WorldResources +0x18; ad136f97 in USA1), including the resident WorldRef groups whose
 // roots USA1 already links under it. The other trees (the object library under 6e863158 that

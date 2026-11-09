@@ -118,6 +118,7 @@ CaptureView prepareCapture(const CaptureSpot& spot, DriveSession& drive, WorldSt
     }
     streamer.settle(drive.position(), renderer, drive.physics());
     renderer.setInstanceWorlds(drive.partWorlds());
+    setCarOcclusion(drive, renderer);  // P74
 
     CaptureView v;
     v.vehicle = drive.position();

@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fuel {
@@ -62,6 +63,20 @@ struct AutoMeshRule {
     uint32_t roadTypes = 0;  // RoadMesh road-class keywords as a mask of GwRoad types
 };
 
+// Polyline_Offset 0x6f7360 (called by RoadChain_OffsetCurve 0x6f8f80 from 0x78e2c0): every point moved by d along
+// the left normal (-dz, dx) of the central-difference direction (end points: their one segment); only the first 512
+// points (0x6f7360's buffer). 0x78e2c0 passes d = side x (half width + SideDist), or MiddleDist.
+std::vector<std::array<double, 2>> offsetPolyline(const std::vector<std::array<double, 2>>& p, double d);
+// PK32: the RoadMesh ShortCut search 0x78e030 (rule keyword ShortCut, byte +0xe3): from polyline point `start`, stepping
+// `step` (+1 / -1) up to the last point (count - 1) or point 0, the nearest point Q with 50 < |Q - (px, pz)| < 300 whose
+// along-road length from the sample is more than 1.5 x that straight distance (the road loops back); stops once the
+// straight distance passes 300. Returns false when there is none.
+bool roadShortCut(const std::vector<std::array<double, 2>>& pts, int start, int count, int step, double px, double pz, double& qx, double& qz);
+
+// P94: whether FUEL holds the AutoMesh / RoadMesh object of `cell` for a camera at (camX, camZ): the decor leaf
+// holding the cell is a chunk below cell.maxC and passes the rule's emit cull (0x78cbf0 / 0x78e2c0).
+bool autoCellHolds(const PlacedMesh::AutoCell& cell, double camX, double camZ);
+
 class AutoMesh {
 public:
     // Reads the two rule files under `commonComponent` and resolves the templates in USA1.
@@ -69,6 +84,10 @@ public:
     bool valid() const { return !lists_[0].empty() || !lists_[3].empty(); }
     size_t ruleCount(int list) const { return lists_[size_t(list)].size(); }
     size_t templateCount() const { return templates_.size(); }
+    const std::vector<AutoMeshRule>& rules(int list) const { return lists_[size_t(list)]; }
+    // P84: the nodes of the template a rule (name CRC) spawns, at the template's own matrices; empty when the rule
+    // has no template in USA1.
+    std::vector<PlacedMesh> templateParts(uint32_t crc) const;
 
     struct Context {
         const Heightfield* terrain = nullptr;     // with detail (ground 0x64e810, flat surfaces)
@@ -84,7 +103,27 @@ public:
     // that generates them, after the emit cull. Cells are cached (placement is deterministic), so
     // later calls only compute new cells. Thread: one caller at a time.
     // `roadFrom` (optional) receives the index in `out` where the road objects start.
-    void generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out, size_t* roadFrom = nullptr);
+    // `collect` (optional, P44) receives the fuel barrels among the cell spawns: rules IT_Fuel01 / IT_Fuel02,
+    // the IT_DYNCOLLECT1_G / IT_DYNCOLLECT2_G collectibles of clone.tsc (0x51d900: +0xa0 = 100, 0x51dad0: 400),
+    // with the range of `out` holding their meshes.
+    struct Collectible {
+        double x = 0, y = 0, z = 0;
+        float amount = 0, radius = 0;  // radius: the rule's template radius (+0x50)
+        size_t first = 0, count = 0;
+    };
+    // P49: the spawns whose template is an IT_DECORMESH_G with a sound of its own (bank symbol 0: the burnt-forest
+    // fires DebrisFeu_*; IT_DECORMESH_G activation 0x516cb0 registers the node with 5 / 50 m). `decor` (optional)
+    // receives their origin and the rule's name CRC; the rules are given by setDecorSoundRules.
+    struct DecorSound {
+        double x = 0, y = 0, z = 0;
+        uint32_t crc = 0;
+    };
+    void setDecorSoundRules(std::unordered_set<uint32_t> crcs) { decorSound_ = std::move(crcs); }
+    // P94: `slack` (metres) makes the result a superset: every object FUEL holds for a camera anywhere within
+    // `slack` of (camX, camZ) (the chunk test with the camera that much nearer). Each object carries its cell
+    // (PlacedMesh::autoCell) so that the renderer keeps exactly FUEL's set for the camera of the frame.
+    void generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out, size_t* roadFrom = nullptr,
+                  std::vector<Collectible>* collect = nullptr, std::vector<DecorSound>* decor = nullptr, double slack = 0);
     struct Stats {
         size_t cells = 0, cellObjects = 0, roadObjects = 0, parts = 0;
     };
@@ -100,6 +139,7 @@ private:
         std::array<double, 16> rootInverse{};
         std::vector<Part> parts;
     };
+    std::unordered_set<uint32_t> decorSound_;
     std::vector<Template> templates_;
     std::unordered_map<uint32_t, int> templateOf_;  // rule crc -> templates_ index (-1 none)
     std::array<std::vector<AutoMeshRule>, 4> lists_;  // class 0, 1, 2, RoadMesh (5)

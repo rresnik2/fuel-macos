@@ -1,5 +1,6 @@
 #include "hubs.hpp"
 
+#include "assembly.hpp"
 #include "dpc.hpp"
 #include "resources.hpp"
 #include "world.hpp"
@@ -125,6 +126,122 @@ std::vector<std::vector<std::array<float, 3>>> loadSplineGraphs(const DpcFile& u
 
 float yawToward(float fx, float fz, float tx, float tz) { return std::atan2(tx - fx, tz - fz); }
 
+// 0x577630 (HubVolumeAgent_G init via 0x5771d0): the hub volume is the USA1.DPC node whose object is a
+// CollisionVol_Z and whose UserDefine's first line is the hub id ("MOUNTAIN 2"); its DIRECT children are matched by
+// name CRC: CAMERA_CAREER -> H+0x1f0 with its first child TARGET_CAREER -> H+0x1fc (also START1, END1, CAMERA_HUB /
+// TARGET_HUB, HUB_BOUNDARIES; the shipped volumes have no SHOP / CHALLENGE cameras). TeleportToHub 0x5495a0 puts the
+// player at CAMERA_CAREER x, z (y from the ground), facing atan2(T.x - C.x, T.z - C.z) (0x40f550).
+// PK03: also the volume's boxes, END1 (H+0x18c..+0x194: the node's world translation) and HUB_BOUNDARIES: its object
+// (node +0x98, a Spline_Z: u32 n, n x 12-B points, u32 m, m x 0xf0-B segment records, 5 floats; loader 0x777d00) gives
+// 8 points per record (record +0x1c + 0x1c k, 3 floats) through the node's world matrix (0x4126b0), (x, z) pushed to
+// H+0x40 (0x482170) in record order. Returns hub id (upper case) -> record.
+struct VolumeRec {
+    HubPoint camp;
+    bool hasCamp = false;
+    std::vector<HubBox> boxes;
+    std::vector<std::array<float, 2>> boundary;
+    HubPoint end1;
+    bool hasEnd1 = false;
+};
+std::map<std::string, VolumeRec> hubVolumes(const DpcFile& usa1) {
+    constexpr uint32_t kNodeClass = 0x85D02528, kCollisionVolClass = 0x8EF49632, kUserDefineClass = 0x52F79F96;
+    const uint32_t kCameraCareer = asoboCrc("CAMERA_CAREER"), kTargetCareer = asoboCrc("TARGET_CAREER");
+    const uint32_t kEnd1 = asoboCrc("END1"), kBoundaries = asoboCrc("HUB_BOUNDARIES"), kSpline = 0x43A9B06Fu;  // Spline_Z (p4-dpc-classes)
+    std::map<uint32_t, Node> nodes;
+    std::map<uint32_t, uint32_t> names;
+    for (uint32_t id : usa1.ids(kNodeClass)) try {
+            const DpcFile::Entry* e = usa1.find(id);
+            if (e == nullptr) continue;
+            const auto b = usa1.body(*e);
+            if (!b) continue;
+            nodes[id] = parseNodeBody(*b);
+            const std::vector<uint8_t> link = usa1.link(*e);  // link +0: AsoboCrc of the node name (short node link)
+            uint32_t nm = 0;
+            if (link.size() >= 4) std::memcpy(&nm, link.data(), 4);
+            names[id] = nm;
+        } catch (const std::exception&) {
+        }
+    auto xform = [](const std::array<float, 16>& m, const float* p) {  // 0x4126b0, row vectors
+        return std::array<float, 3>{p[0] * m[0] + p[1] * m[4] + p[2] * m[8] + m[12], p[0] * m[1] + p[1] * m[5] + p[2] * m[9] + m[13],
+                                    p[0] * m[2] + p[1] * m[6] + p[2] * m[10] + m[14]};
+    };
+    std::map<std::string, VolumeRec> out;
+    for (const auto& [id, n] : nodes) {
+        if (n.userDefine == 0 || n.object == 0 || n.child == 0) continue;
+        const DpcFile::Entry* oe = usa1.find(n.object);
+        const DpcFile::Entry* ue = usa1.find(n.userDefine);
+        if (oe == nullptr || oe->classCrc != kCollisionVolClass || ue == nullptr || ue->classCrc != kUserDefineClass) continue;
+        std::vector<std::string> lines;
+        try {
+            if (const auto b = usa1.body(*ue)) lines = parseUserDefineBody(*b);
+        } catch (const std::exception&) {
+        }
+        if (lines.empty()) continue;
+        std::string hubId = upper(lines[0]);
+        while (!hubId.empty() && (hubId.back() == ' ' || hubId.back() == '\r' || hubId.back() == '\t')) hubId.pop_back();
+        VolumeRec rec;
+        // The boxes: CollisionVol_Z body u32 n, n x 0x80 (matrix, inverse), each x the node matrix.
+        if (const auto vb = usa1.body(*oe); vb && vb->size() >= 4) {
+            uint32_t nb = 0;
+            std::memcpy(&nb, vb->data(), 4);
+            for (uint32_t k = 0; k < nb && 4 + size_t(k + 1) * 0x80 <= vb->size(); ++k) {
+                float b[16];
+                std::memcpy(b, vb->data() + 4 + size_t(k) * 0x80, 64);
+                float m[16];
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c) {
+                        float s = 0;
+                        for (int i = 0; i < 4; ++i) s += b[r * 4 + i] * n.world[size_t(i * 4 + c)];
+                        m[r * 4 + c] = s;
+                    }
+                HubBox box;
+                for (int r = 0; r < 3; ++r) {
+                    const float len = std::sqrt(m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2]);
+                    box.half[size_t(r)] = len;
+                    for (int c = 0; c < 3; ++c) box.axis[size_t(r)][size_t(c)] = len > 0 ? m[r * 4 + c] / len : float(r == c);
+                }
+                box.centre = {m[12], m[13], m[14]};
+                rec.boxes.push_back(box);
+            }
+        }
+        // Direct children: first child (+0xa4), then the sibling chain (+0xac, Node::prev as in world_missions.cpp).
+        for (uint32_t c = n.child, guard = 0; c != 0 && guard < 4096; ++guard) {
+            const auto it = nodes.find(c);
+            if (it == nodes.end()) break;
+            const Node& cn = it->second;
+            if (!rec.hasCamp && names[c] == kCameraCareer && cn.child != 0 && names[cn.child] == kTargetCareer) {
+                const Node& t = nodes[cn.child];
+                rec.camp.x = cn.world[12], rec.camp.z = cn.world[14];
+                rec.camp.yaw = yawToward(rec.camp.x, rec.camp.z, t.world[12], t.world[14]);
+                rec.hasCamp = true;
+            } else if (names[c] == kEnd1) {
+                rec.end1.name = hubId + "_END1";
+                rec.end1.x = cn.world[12], rec.end1.z = cn.world[14];
+                rec.hasEnd1 = true;
+            } else if (names[c] == kBoundaries && cn.object != 0) {
+                const DpcFile::Entry* se = usa1.find(cn.object);
+                const auto sb = se != nullptr && se->classCrc == kSpline ? usa1.body(*se) : std::nullopt;
+                if (sb && sb->size() >= 8) {
+                    uint32_t np = 0, ns = 0;
+                    std::memcpy(&np, sb->data(), 4);
+                    const size_t off = 4 + size_t(np) * 12;
+                    if (off + 4 <= sb->size()) std::memcpy(&ns, sb->data() + off, 4);
+                    for (uint32_t k = 0; k < ns && off + 4 + size_t(k + 1) * 0xf0 <= sb->size(); ++k)
+                        for (int j = 0; j < 8; ++j) {
+                            float p[3];
+                            std::memcpy(p, sb->data() + off + 4 + size_t(k) * 0xf0 + 0x1c + size_t(j) * 0x1c, 12);
+                            const auto w = xform(cn.world, p);
+                            rec.boundary.push_back({w[0], w[2]});
+                        }
+                }
+            }
+            c = cn.prev;
+        }
+        out.emplace(hubId, std::move(rec));
+    }
+    return out;
+}
+
 }  // namespace
 
 std::vector<Hub> loadHubs(const std::string& dataDir) {
@@ -170,11 +287,15 @@ std::vector<Hub> loadHubs(const std::string& dataDir) {
     //    the camp is the graph's point nearest its centre (a spot on a road). The heading runs along
     //    the road there, or toward the objects round the camp when there is no graph, and points
     //    into the camp (toward the objects, or the hub's teleports when those are too close to tell).
+    //    P76: FUEL's own camp is the hub volume's CAMERA_CAREER node (0x577630 / 0x5495a0, hubVolumeCamps); the
+    //    heuristic below is only the fallback for a hub without a volume (none in the shipped USA1.DPC).
     std::vector<Region> regions;
     std::vector<std::vector<std::array<float, 3>>> graphs;
+    std::map<std::string, VolumeRec> volumeCamps;
     try {
         const fs::path world = fs::path(dataDir) / "CommonComponent/WORLD";
         DpcFile usa1((world / "USA1.DPC").string());
+        volumeCamps = hubVolumes(usa1);
         graphs = loadSplineGraphs(usa1);
         std::vector<fs::path> files;
         for (const auto& e : fs::directory_iterator(world))
@@ -249,7 +370,13 @@ std::vector<Hub> loadHubs(const std::string& dataDir) {
         HubPoint& camp = h.camp;
         camp.name = spelled[i] + "_Camp";
         const Xz tele = cent[i].c;
-        if (regionOf[i] < 0) {  // no sub-world: the middle of the hub's teleports, facing north
+        const auto vc = volumeCamps.find(upper(spelled[i]));
+        if (vc != volumeCamps.end()) {  // PK03: the hub record's volume, boundary and END1
+            h.volume = vc->second.boxes, h.boundary = vc->second.boundary, h.end1 = vc->second.end1, h.hasEnd1 = vc->second.hasEnd1;
+        }
+        if (vc != volumeCamps.end() && vc->second.hasCamp) {
+            camp.x = vc->second.camp.x, camp.z = vc->second.camp.z, camp.yaw = vc->second.camp.yaw;
+        } else if (regionOf[i] < 0) {  // no sub-world: the middle of the hub's teleports, facing north
             camp.x = tele.x, camp.z = tele.z;
         } else {
             const Region& r = regions[size_t(regionOf[i])];
@@ -349,6 +476,135 @@ bool nudgeToClearSpot(float& x, float& z, const std::function<bool(float, float)
         }
     }
     return false;
+}
+
+// ---- PK03: hub presence and arrival ---------------------------------------------------------------------------------
+
+bool HubBox::contains(float x, float y, float z) const {
+    const float d[3] = {x - centre[0], y - centre[1], z - centre[2]};
+    for (size_t i = 0; i < 3; ++i)
+        if (std::fabs(d[0] * axis[i][0] + d[1] * axis[i][1] + d[2] * axis[i][2]) > half[i]) return false;
+    return true;
+}
+
+// 0x7652b0 (ESI = the point, args = points, count): for each edge (P[i], P[i+1], the last back to P[0]) whose z range
+// holds pz half-open ((a.z < pz <= b.z) or (b.z < pz <= a.z)): right of both ends counts, left of (or on) both does
+// not, otherwise the cross product of the edge taken upward (low z end first) with the point counts when < 0.
+// Returns the parity.
+bool insideBoundary(const Hub& hub, float px, float pz) {
+    const auto& P = hub.boundary;
+    const size_t n = P.size();
+    unsigned c = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const auto& a = P[i];
+        const auto& b = P[i + 1 == n ? 0 : i + 1];
+        if (!((a[1] < pz && pz <= b[1]) || (b[1] < pz && pz <= a[1]))) continue;
+        if (px > b[0] && px > a[0]) {
+            ++c;
+            continue;
+        }
+        if (px <= b[0] && px <= a[0]) continue;
+        const auto& lo = a[1] <= b[1] ? a : b;
+        const auto& hi = a[1] <= b[1] ? b : a;
+        const float f = (pz - lo[1]) * (hi[0] - lo[0]) - (px - lo[0]) * (hi[1] - lo[1]);
+        if (f < 0) ++c;
+    }
+    return (c & 1) != 0;
+}
+
+void HubPresence::volumes(float x, float y, float z, bool race, int zone) {
+    zone_ = zone;  // 0x62f680: +0x374 = Zone_FindContaining(player position) while a player exists
+    inside_.resize(hubs_.size(), false);
+    std::vector<int> left, entered;
+    for (size_t h = 0; h < hubs_.size(); ++h) {
+        bool in = false;
+        for (const HubBox& b : hubs_[h].volume) in = in || b.contains(x, y, z);
+        if (in != inside_[h]) (in ? entered : left).push_back(int(h));
+        inside_[h] = in;
+    }
+    // Both handlers run only while no race runs (MissionStatus game+0x334c +0x48 is 0 or 1), for the player's vehicle
+    // (agent +0x60 & 8; the port tests the player's position only).
+    if (race) return;
+    for (int h : left)  // vf44 0x577c90: this volume's hub is the pending one -> 0x577dc0 clears +0x954 and +0x958
+        if (h == pending_) pending_ = -1, request_ = false;
+    for (int h : entered)  // vf46 0x577bf0: +0x954 = this hub, +0x958 = 1, unless the pause mode is 2 (0x46e650)
+        if (pauseMode(x, z, race) != 2) pending_ = h, request_ = true;
+}
+
+bool HubPresence::inPendingBoundary(float x, float z) const {
+    // 0x481a40: a pending hub, game+0x2b8 clear (set by a loaded save's OK 0x4ce8e0 [U: who clears it]; the port never
+    // sets it), a player, and its position (x, z) inside the hub's boundary (0x7652b0 on H+0x40).
+    return pending_ >= 0 && size_t(pending_) < hubs_.size() && insideBoundary(hubs_[size_t(pending_)], x, z);
+}
+
+int HubPresence::pauseMode(float x, float z, bool race) const {
+    if (race) return 3;  // 0x46e650: race +0x3b8 online -> 4 (no online play in the port)
+    return inPendingBoundary(x, z) ? 2 : 1;
+}
+
+void HubPresence::startHubHUD(int hub) {
+    if (hub < 0 || size_t(hub) >= hubs_.size()) return;
+    pending_ = hub;   // StartHubHUD 0x5492d0: +0x954 = the hub record of uid argv[1]
+    menuMode_ = 2;    // +0x94 = 2
+    state_ = Wait;    // 0x47d970: "SetHudsVisibleState OFF", state 0xc4, title / items / tutorial refresh
+}
+
+HubPresence::Action HubPresence::update(float x, float z, bool race, bool movie, bool key) {
+    Action a;
+    switch (state_) {
+        case Idle:  // 0x481b60
+            // [U] first: IGP (+0x31fc -> +0x908) object +0x5c set and the 0x443260 object's +0x5c < 3 -> wait; the port has
+            // neither object. Then no race running (+0x48 0 / 1) and 0x481a40 -> "TeleportToHub <uid>", +0x958 = 0.
+            if (request_ && !race && inPendingBoundary(x, z)) {
+                a.kind = Action::TeleportToHub, a.hub = pending_;
+                request_ = false;
+            }
+            break;
+        case Wait:  // 0x481c90: once the storage is idle (save object +0x76; the port saves synchronously) -> 0x481d70
+            if (pending_ < 0) break;
+            if (career_.unlocked && !career_.unlocked(pending_)) {  // 0x579720 fails -> 0x47da10
+                state_ = Alert;                                      // vf22(vf09()) then +0x944 = 0xc7 (TT_PAGE_HUB_ALERT)
+                a.kind = Action::OpenAlert;
+                break;
+            }
+            if (career_.arrive) career_.arrive(pending_);  // game+0x33c0 = H+0x168, 0x56ca20(game+0xe4)
+            if (career_.opened && !career_.opened(pending_)) {
+                // 0x47d9c0 -> 0x481e40: LevelManipulator byte +0x3d = 0 [U], SetDayClock(43200.0), `ChoosePlayMovie <Hub_Name>`
+                // (spaces -> '_', VideoComponent/<Hub>.bik) [port: no movie, Bink stays replaced]; then state 0xc5.
+                if (career_.setDayClock) career_.setDayClock(43200.0);
+                state_ = Open;
+                break;
+            }
+            a.kind = Action::OpenMenu;  // vf22(vf09(), 0) and MusicManager_G +0x190 |= 8 (state stays 0xc4 until the close)
+            break;
+        case Open:  // 0x481cd0: a player, and MENU_BACK / MENU_VALID or no movie playing
+            if (pending_ >= 0 && (key || !movie)) {
+                if (career_.open) career_.open(pending_);  // +0x248 = 1, 0x57a100, 0x57a240, +0x80 = 1 (save at the close)
+                a.kind = Action::OpenMenu;                  // vf22(1, 0)
+            }
+            break;
+        default: break;  // 0xc7: the popup's OK (0x4ce850 -> 0x47f060)
+    }
+    return a;
+}
+
+void HubPresence::drop() {
+    pending_ = -1;  // 0x47ee80 / 0x47f060: row +0x948 = 0, +0x88 = 2, +0x94c = 0, +0x954 = 0, state 0xc3
+    state_ = Idle;
+}
+
+bool HubPresence::end1(float& tx, float& tz) const {
+    if (pending_ < 0 || size_t(pending_) >= hubs_.size() || !hubs_[size_t(pending_)].hasEnd1) return false;
+    tx = hubs_[size_t(pending_)].end1.x, tz = hubs_[size_t(pending_)].end1.z;
+    return true;
+}
+
+bool HubPresence::menuClosed(bool back, float& tx, float& tz) {
+    // 0x46fd60 / 0x46ea50: back or START with +0x94 == 2 -> 0x47f060 (only with a pending hub: TLP 0x4caa90 to its END1);
+    // every other close: vt+0x20 + 0x47ee80.
+    const bool tlp = back && menuMode_ == 2 && end1(tx, tz);
+    drop();
+    return tlp;
 }
 
 }  // namespace fuel

@@ -42,11 +42,14 @@ struct VehicleInput {
     bool sliding = false;          // 0x52f100 VehMove_IsSlidingMajority
     float airtime = 0;             // phys+0x1258
     float heightAbove = 0;         // phys+0x13b8
-    int wreck = 0;                 // phys+0x1420: 0 ok, 2 drowned, other wrecked
+    int wreck = 0;                 // phys+0x1420: 0 ok, 2 in a tornado (0x5bc950; p23's "drowned"), other wrecked
     bool anyWheelLoaded = true;    // 0x52e620
     float maxBumps = 0;            // 0x526a30 (BUMPS WHEEL of the ground under the wheels)
     float speedFrac = 0;           // 0x423380
     bool boost = false;            // player byte +0x2f61 (the port has no boost latch: false)
+    // [nitro] the port's nitrous (physics/nitro.hpp): degrees added to the FOV target (x the speed ramp of FUEL's boost
+    // FOV, clamp(|v| x 0.1, 0, 1)) and the speed blur added; 0 without a boost.
+    float nitroFov = 0, nitroBlur = 0;
     Vec3 targetNode;               // node #15 of the vehicle hierarchy, model space (U-C1; the port uses the origin)
     const std::vector<float>* P = nullptr;  // VehiclePP block (index = parameter number)
 };
@@ -64,6 +67,8 @@ struct WorldQueries {
         float d = 0;
     };
     std::function<void(double x, double y, double z, float r, std::vector<Contact>& out)> overlap;
+    // P61: Tornado_NearestPosition 0x5bcaa0 (the nearest agent of the tornado list); false when there is none.
+    std::function<bool(double x, double z, double out[3])> tornado;
 };
 
 struct CameraPose {

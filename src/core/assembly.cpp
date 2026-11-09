@@ -2,8 +2,11 @@
 
 #include "reader.hpp"
 #include "resources.hpp"
+#include "vehicle_lights.hpp"
+#include "vehicle_fx.hpp"  // PK23
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -78,7 +81,7 @@ std::optional<std::string> withoutLodSuffix(const std::string& name) {
 // Named points: m spheres {centre, radius, type, name}, then k boxes {3x4
 // frame, half extents + radius, type, name}. "+POINT" references only use
 // the spheres (spec S4, S18).
-std::vector<NamedSphere> readNamedPoints(ByteReader& r) {
+std::vector<NamedSphere> readNamedPoints(ByteReader& r, std::vector<NamedBox>* boxes = nullptr) {
     std::vector<NamedSphere> spheres(r.count(100000));
     for (NamedSphere& s : spheres) {
         for (float& c : s.centre) c = r.f32();
@@ -86,7 +89,19 @@ std::vector<NamedSphere> readNamedPoints(ByteReader& r) {
         s.type = r.u32();
         s.name = r.u32();
     }
-    r.skipArray(72, 100000);
+    if (boxes == nullptr) {
+        r.skipArray(72, 100000);
+        return spheres;
+    }
+    // The 0x48-byte boxes (Lod_Z +0x78, n = +0x74 >> 14; Lod_Z::vf24 0x87ee90 finds one by its name at +0x44).
+    boxes->resize(r.count(100000));
+    for (NamedBox& b : *boxes) {
+        for (float& f : b.rows) f = r.f32();
+        for (float& f : b.half) f = r.f32();
+        b.radius = r.f32();
+        b.type = r.u32();
+        b.name = r.u32();
+    }
     return spheres;
 }
 
@@ -187,7 +202,9 @@ Node parseNodeBody(const std::vector<uint8_t>& body) {
     n.objectData = r.u32();
     n.userDefine = r.u32();
     n.light = r.u32();
-    r.raw(8 + 0x34);  // two unused links, the transform block up to node+0x44
+    r.raw(8 + 0x1c);  // two unused links, the transform block up to node+0x2c
+    n.flags = r.u32();
+    r.raw(0x14);
     n.lodScale = r.f32();
     r.raw(0x82 - 0x38);
     for (float& f : n.world) f = r.f32();
@@ -211,6 +228,22 @@ std::vector<NamedSphere> parseMeshLinkSpheres(const std::vector<uint8_t>& link) 
     return readNamedPoints(r);
 }
 
+std::vector<NamedBox> parseMeshLinkBoxes(const std::vector<uint8_t>& link) {
+    ByteReader r(link, std::min<size_t>(98, link.size()));
+    r.skipArray(4, kListLimit);
+    r.raw(12);
+    r.skipArray(24, 100000);  // spheres
+    std::vector<NamedBox> boxes(r.count(100000));
+    for (NamedBox& b : boxes) {
+        for (float& f : b.rows) f = r.f32();
+        for (float& f : b.half) f = r.f32();
+        b.radius = r.f32();
+        b.type = r.u32();
+        b.name = r.u32();
+    }
+    return boxes;
+}
+
 std::vector<NodeGroup> parseGameObjBody(const std::vector<uint8_t>& body) {
     // Groups: u32 name length; name; u32 value; u32 n; Node_Z IDs (spec S3).
     ByteReader r(body);
@@ -231,7 +264,7 @@ Lod parseLodBody(const std::vector<uint8_t>& body) {
     // registry pair lists, a pointer (spec S4, S11).
     ByteReader r(body);
     Lod l;
-    l.spheres = readNamedPoints(r);
+    l.spheres = readNamedPoints(r, &l.boxes);
     l.nearFade = r.f32();
     l.hardCull = r.f32();
     l.baseDistance = r.f32();
@@ -305,11 +338,32 @@ Skel parseSkelBody(const std::vector<uint8_t>& body) {
     }
     r.skipArray(4, kListLimit);  // Material_Z
     r.skipArray(4, kListLimit);  // MeshData_Z
-    for (uint32_t i = 0, n = r.count(kListLimit); i < n; ++i) r.skipArray(4, kListLimit);
+    s.palettes.resize(r.count(kListLimit));
+    for (auto& l : s.palettes) l = r.u32Array(kListLimit);
     r.skipArray(4, kListLimit);
-    r.skipArray(28, kListLimit);  // spheres + u32
-    r.skipArray(28, kListLimit);
-    r.skipArray(76, kListLimit);  // boxes + u32
+    // ---- PK22: the named spheres (centre, radius, type, name +0x14, u32) and boxes (16 floats, type, name +0x44, u32)
+    for (int set = 0; set < 2; ++set) {  // spheres + u32 (two lists; 0x66bd60 searches the one at +0x40 / +0x44)
+        const uint32_t n = r.count(kListLimit);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint8_t* e = r.raw(28);
+            vlinks::NamedPoint p;
+            std::memcpy(p.c.data(), e, 12);
+            std::memcpy(&p.r, e + 12, 4);
+            std::memcpy(&p.name, e + 0x14, 4);
+            s.points.push_back(p);
+        }
+    }
+    {
+        const uint32_t n = r.count(kListLimit);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint8_t* e = r.raw(76);
+            vlinks::NamedObb b;
+            std::memcpy(b.box.data(), e, 64);
+            std::memcpy(&b.name, e + 0x44, 4);
+            s.boxes.push_back(b);
+        }
+    }
+    // ---- PK22 end
     r.expectEnd();
     return s;
 }
@@ -572,6 +626,25 @@ const VehicleVariant* VehicleAssembler::find(const std::string& selector) const 
     return nullptr;
 }
 
+std::array<float, 3> carOcclusionExtents(const Lod* lod, uint32_t* boxName) {
+    // 0x5cc410: e = (0.75, 0.75, 0.75) (0x9960b8); vf24("CAR_OCCLUSION") -> e = box +0x30; else vf24("DURL") -> e = box
+    // +0x30 + 0.75; then Omni_Z 0x690510 (+0x108 = e, radius |e|). vf24 returns the first box of that name.
+    static const uint32_t kCarOcclusion = asoboCrc("CAR_OCCLUSION"), kDurl = asoboCrc("DURL");
+    if (boxName) *boxName = 0;
+    if (lod == nullptr) return {0.75f, 0.75f, 0.75f};
+    for (const NamedBox& b : lod->boxes)
+        if (b.name == kCarOcclusion) {
+            if (boxName) *boxName = kCarOcclusion;
+            return b.half;
+        }
+    for (const NamedBox& b : lod->boxes)
+        if (b.name == kDurl) {
+            if (boxName) *boxName = kDurl;
+            return {b.half[0] + 0.75f, b.half[1] + 0.75f, b.half[2] + 0.75f};
+        }
+    return {0.75f, 0.75f, 0.75f};
+}
+
 AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int lod) const {
     if (lod < 1) throw std::invalid_argument("LOD levels start at 1");
     Resources& R = *res_;
@@ -581,6 +654,7 @@ AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int l
     out.gameObjId = variant.gameObjId;
     out.name = variant.name;
     out.lod = lod;
+    out.dpc = &dpc_, out.names = &names_;  // [upgrades U5]
 
     // The groups drawn at this LOD: the ones without a LOD suffix (COMMON) and <V>_LOD<lod>.
     std::vector<bool> chosen(groups.size());
@@ -617,6 +691,43 @@ AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int l
         const Skel& s = R.skel(sk);
         if (std::none_of(s.bones.begin(), s.bones.end(), [](const Bone& b) { return b.userDefine != 0; })) continue;
         if (!out.skeleton || s.bones.size() > R.skel(*out.skeleton).bones.size()) out.skeleton = sk;
+    }
+
+    // P74: the vehicle agent's Lod_Z (0x5cc410 reads agent +0x58 -> node +0x98): of the variant's parent-less nodes
+    // holding a Lod_Z, the one with the LOD chain (most levels; the other root Lod_Z has one Skin_Z). Data: every
+    // CAR_OCCLUSION box of BUGGY / TRUCK / SUV / MUSCLE / BIKE / BONUS1 sits in that Lod_Z, none in the other one.
+    {
+        uint32_t best = 0;
+        size_t levels = 0;
+        for (const auto& [group, n] : chosenNodes) {
+            const Node& nd = R.node(n);
+            if (nd.parent != 0 || !R.has(nd.object, cls::Lod)) continue;
+            const size_t k = R.lod(nd.object).objects.size();
+            if (k > levels) best = nd.object, levels = k, out.lodNodeScale = nd.lodScale;
+        }
+        out.occlusionLod = best;
+        if (best != 0) {  // P104
+            out.lodLevels = int(levels);
+            out.lodBaseDistance = R.lod(best).baseDistance;
+            const std::vector<uint8_t> l = R.link(best);
+            float v = 0;
+            if (l.size() >= 92) std::memcpy(&v, &l[88], 4);
+            out.lodViewDist = std::isfinite(v) ? v : 0;
+        }
+        out.occlusionExtents = carOcclusionExtents(best != 0 ? &R.lod(best) : nullptr, &out.occlusionBoxName);
+        // P77: 0x5ca7a0 merges the same Lod_Z's boxes (the corners of each 3x4 frame x half extents) into one box.
+        if (best != 0 && !R.lod(best).boxes.empty()) {
+            std::array<float, 3> lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+            for (const NamedBox& b : R.lod(best).boxes)
+                for (int r = 0; r < 3; ++r) {
+                    float e = 0;
+                    for (int k = 0; k < 3; ++k) e += std::fabs(b.rows[size_t(r * 4 + k)]) * b.half[size_t(k)];
+                    lo[size_t(r)] = std::min(lo[size_t(r)], b.rows[size_t(r * 4 + 3)] - e);
+                    hi[size_t(r)] = std::max(hi[size_t(r)], b.rows[size_t(r * 4 + 3)] + e);
+                }
+            for (int r = 0; r < 3; ++r)
+                out.boxHalf[size_t(r)] = (hi[size_t(r)] - lo[size_t(r)]) * 0.5f, out.boxCentre[size_t(r)] = (hi[size_t(r)] + lo[size_t(r)]) * 0.5f;
+        }
     }
 
     // Adds the meshes of one placed object: a Mesh_Z, or a Lod_Z's object for
@@ -714,6 +825,65 @@ AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int l
             }
         }
 
+        // P77: headlights (Skel_Z::BuildVehicleLinks 0x69e020). `V:HEADLIGHT:n "<group>" "<omni>"` instances the
+        // Omni_Z node named <omni> into the light list under the key "LIGHT:n" (the token after "V:HEAD"); a
+        // `V:LINK "<bone>" ... LIGHT:n` line then hangs that light node at its link: the bone named <bone> (else the
+        // commanding bone). The light keeps its own node's local matrix (identity in the data) under the bone.
+        {
+            std::vector<std::pair<std::string, uint32_t>> lightOmni;  // key -> Omni_Z
+            std::unordered_map<std::string, int> lightBone;           // key -> bone
+            for (const auto& [k, text] : out.otherCommands) {
+                const auto cmd = parseBoneCommand(text);
+                if (!cmd) continue;
+                if (startsWith(cmd->keyword, "V:HEADLIGHT:") && cmd->args.size() >= 2) {
+                    const auto it = byName.find(asoboCrc(cmd->args[1]));
+                    if (it != byName.end() && R.classOf(it->second.object) == cls::Omni)
+                        lightOmni.emplace_back(upper(cmd->keyword.substr(6)), it->second.object);
+                } else if (cmd->keyword == "V:LINK") {
+                    for (const std::string& t : cmd->tags) {
+                        if (!startsWith(upper(t), "LIGHT:")) continue;
+                        int at = k;
+                        if (!cmd->args.empty())
+                            for (size_t j = 0; j < bones.size(); ++j)
+                                if (bones[j].name == asoboCrc(cmd->args[0])) at = int(j);
+                        lightBone.emplace(upper(t), at);
+                    }
+                }
+            }
+            out.headlightRecords = !lightOmni.empty();  // PK22 (0x69df30: skeleton +0x150 count)
+            for (const auto& [key, omniId] : lightOmni) {
+                VehicleLight L;
+                L.key = key;
+                L.omniId = omniId;
+                const DpcFile::Entry* e = dpc_.find(omniId);
+                const auto body = e ? dpc_.body(*e) : std::nullopt;
+                if (!body || !omni::parseParams(*body, L.params)) continue;
+                omni::parseObjectInfo(dpc_.link(*e), *body, L.info);  // PK28
+                const auto b = lightBone.find(key);
+                if (b == lightBone.end()) continue;  // no link: the light node stays unplaced
+                L.bone = b->second;
+                for (int i = 0; i < 16; ++i) L.world[size_t(i)] = bones[size_t(L.bone)].world[size_t(i)];
+                out.lights.push_back(L);
+            }
+        }
+        // ---- PK22: the V:DYN records (0x69e020's bone-0 pass, every LOD: records are shared by the LOD records)
+        {
+            const Skel& sk = R.skel(*out.skeleton);
+            if (!bones.empty() && bones[0].userDefine != 0 && R.has(bones[0].userDefine, cls::UserDefine))
+                for (const std::string& line : R.userDefine(bones[0].userDefine)) {
+                    const std::vector<std::string> tok = vlinks::commandTokens(line);
+                    if (tok.empty() || tok[0].rfind("V:DYN:", 0) != 0) continue;
+                    if (auto rec = vlinks::parseDyn(tok, sk.points, sk.boxes)) out.dyn.push_back(std::move(*rec));
+                }
+        }
+        // ---- PK22 end
+        for (const auto& b : bones)  // P85: the damage smoke's bone (0x5d00c0: CRC "Engine", 0x692e50)
+            if (b.name == asoboCrc("Engine")) {
+                out.hasEngine = true;
+                out.engine = {float(b.world[12]), float(b.world[13]), float(b.world[14])};
+                break;
+            }
+
         // Place the records. A part at a point of part A waits until A is
         // placed (the engine sorts them topologically).
         std::unordered_map<uint32_t, Mat4> worldOf;  // placed object -> world matrix
@@ -768,6 +938,21 @@ AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int l
                     t.keptNodeMatrix = true;
                     w = toMat4(R.node(part.node).world);
                 }
+                // ---- PK22: the link record's DYN:n tag (0x69e020: the first V:DYN record whose key is the tag's CRC)
+                if (r->how == Placement::Link && !t.keptNodeMatrix)
+                    if (const auto c = parseBoneCommand(r->text))
+                        for (const std::string& tag : c->tags) {
+                            if (upper(tag).rfind("DYN:", 0) != 0) continue;
+                            const uint32_t key = asoboCrc(tag);
+                            for (size_t d = 0; d < out.dyn.size(); ++d)
+                                if (out.dyn[d].key == key) {
+                                    t.dyn = int(d);
+                                    break;
+                                }
+                            t.dynPivot = {float(K.world[12]), float(K.world[13]), float(K.world[14])};
+                            t.dynBoneQ = K.restQuat;
+                        }
+                // ---- PK22 end
                 worldOf[part.object] = w;
                 drawnObjects.insert(part.object);
                 addParts(part.node, *part.group, part.object, w, std::move(t));
@@ -775,6 +960,61 @@ AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int l
             }
         }
         for (const Record* r : pending) out.problems.push_back("part it hangs from is not placed (" + r->text + ")");
+        // ---- [suspanim] what each record aims at (0x6a0200, spec S18), resolved once every part is placed
+        {
+            out.bonePos.resize(bones.size());
+            for (size_t j = 0; j < bones.size(); ++j)
+                out.bonePos[j] = {float(bones[j].world[12]), float(bones[j].world[13]), float(bones[j].world[14])};
+            auto boneOf = [&](const std::string& name) {
+                const uint32_t c = asoboCrc(name);
+                for (size_t j = 0; j < bones.size(); ++j)
+                    if (bones[j].name == c) return int(j);
+                return -1;
+            };
+            auto pointOf = [&](const std::string& arg, uint32_t& object, std::array<float, 3>& at) {
+                const PointRef pr = splitPoint(arg);
+                const auto a = byName.find(pr.part);
+                if (a == byName.end() || worldOf.count(a->second.object) == 0) return false;
+                const NamedSphere* sp = R.findSphere(a->second.object, pr.point);
+                if (sp == nullptr) return false;
+                const Vec3 q = transformPoint(worldOf[a->second.object], sp->centre);
+                object = a->second.object;
+                at = {float(q[0]), float(q[1]), float(q[2])};
+                return true;
+            };
+            const uint32_t attachCrc = asoboCrc("LOCAL_ATTACH"), limitCrc = asoboCrc("LOCAL_LIMIT");
+            for (PlacedPart& t : out.parts) {
+                if (t.bone < 0 || t.keptNodeMatrix || t.shape == PartShape::Light) continue;
+                if (t.placement != Placement::Link && t.placement != Placement::LinkB && t.placement != Placement::LinkR &&
+                    t.placement != Placement::LinkM && t.placement != Placement::LinkMM)
+                    continue;
+                const auto c = parseBoneCommand(t.command);
+                if (!c) continue;
+                const std::vector<std::string>& a = c->args;
+                PlacedPart::LinkAim& L = t.aim;
+                for (const std::string& tag : c->tags)
+                    if (upper(tag) == "AXEZ") L.axis = 2;
+                if (const NamedSphere* sp = R.findSphere(t.objectId, lookAt)) L.hasLook = true, L.look = sp->centre;
+                if (t.placement == Placement::Link && !a.empty()) {
+                    L.bone = boneOf(a[0]);
+                } else if (t.placement == Placement::LinkR && !a.empty()) {
+                    L.bone = boneOf(a[0]);
+                    if (a.size() >= 3) L.bone2 = boneOf(a[2]);
+                    const NamedSphere* at = R.findSphere(t.objectId, attachCrc);
+                    const NamedSphere* li = R.findSphere(t.objectId, limitCrc);
+                    if (at && li) L.hasAttach = true, L.attach = at->centre, L.limit = li->centre, L.limitRadius = li->radius;
+                } else if (t.placement == Placement::LinkB && !a.empty()) {
+                    pointOf(a[0], L.object, L.point);
+                } else if (t.placement == Placement::LinkM && !a.empty()) {
+                    L.atObject = byName.count(splitPoint(a[0]).part) ? byName.find(splitPoint(a[0]).part)->second.object : 0;
+                    L.bone = int(t.bone);  // aimed at the commanding bone K (a wheel bone: its steer vector)
+                } else if (t.placement == Placement::LinkMM && a.size() >= 3) {
+                    L.atObject = byName.count(splitPoint(a[0]).part) ? byName.find(splitPoint(a[0]).part)->second.object : 0;
+                    pointOf(a[2], L.object, L.point);
+                }
+            }
+        }
+        // ---- [suspanim] end
 
         // Wheels: at the hub point of the bone's V:LINKWHEEL, else at the
         // bone; identity rotation.
@@ -834,6 +1074,9 @@ AssembledVehicle VehicleAssembler::assemble(const VehicleVariant& variant, int l
         }
         addParts(n, *group, obj, toMat4(R.node(n).world), PlacedPart{});
     }
+    // ---- PK23: the exhaust slots (0x5cf170 / 0x6a23b0 over this LOD's parts)
+    for (const vfx::ExhaustPoint& e : vfx::findExhausts(dpc_, out)) out.exhausts.push_back({e.pos, e.dir, e.index, e.dyn});
+    // ---- PK23 end
     return out;
 }
 

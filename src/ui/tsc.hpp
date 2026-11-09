@@ -25,7 +25,7 @@ class TscReader {
 public:
     explicit TscReader(std::string root) : root_(std::move(root)) {}
 
-    std::set<std::string> defines{"_PC", "CD_VERSION"};
+    std::set<std::string> defines{"_PC", "CD_VERSION", "_MASTER", "_BIGFILE"};  // _MASTER / _BIGFILE: Console_Z Init 0x68ed90
     std::vector<std::string> problems;
 
     // Runs `rel` (relative to the root) with %1.. = params, calling `fn` for every
@@ -36,6 +36,9 @@ private:
     void runFile(const std::string& path, const std::vector<std::string>& params, const std::function<void(const TscLine&)>& fn, int depth);
     std::string root_;
 };
+
+// 0x7c2890 script %N expansion; false = the line runs as it is.
+bool expandScriptParams(const std::string& line, const std::vector<std::string>& params, std::string* out);
 
 // Splits one line into arguments (quotes removed, comments dropped).
 std::vector<std::string> splitTscLine(const std::string& line, bool* inBlockComment);

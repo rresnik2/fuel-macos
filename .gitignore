@@ -24,3 +24,4 @@ shots/
 
 # Agent worktrees
 .claude/
+/-_[0-9]*

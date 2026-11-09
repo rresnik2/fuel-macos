@@ -33,6 +33,8 @@ struct TerrainVertex {
 };
 static_assert(sizeof(TerrainVertex) == 64, "TerrainVertex layout is shared with the Metal shader");
 
+// Generator settings G+0xa88 (written by 0x74d5b0 from the GenWorldCore ctor 0x74da50; float [0x9dbff0]).
+constexpr double kChunkSplit = 2.0625;
 constexpr int kChunkSide = 25;  // points per side (24 quads)
 
 struct TerrainChunk {
@@ -45,6 +47,18 @@ struct TerrainChunk {
 std::vector<TerrainVertex> buildTerrainChunk(const Heightfield& hf, double cx, double cz, double size);
 // Triangle list shared by every chunk (grid + skirts).
 const std::vector<uint32_t>& terrainChunkIndices();
+
+// PK32: the ground occlusion curvature term 0x7f90d0 of Paysage_FillPoints 0x7f92c0 (chunks C < 120 m,
+// notes p98/b012 sec. 7, pk32.md). h = the point's height, hA / hB its neighbours at +s / -s in x, hC / hD at
+// +s / -s in z, s = the point spacing C / 24: n = normalize(s (hB - hA), 2 s^2, s (hD - hC)),
+// d = n.y (h - mean of the 4) / s, f = 1.5 d ((4 - |d|) d^2 + 4 - 6 |d|) + 1 (hollows < 1, crests > 1).
+float groundCurvatureFactor(float h, float hA, float hB, float hC, float hD, float s);
+// The factors of the n x n vertex lattice (x0 + i s, z0 + j s) from TerrainDetail::height (the point heights
+// 0x7f72b0 of chunks under 240 m; the border neighbours come from 0x64dfe0, the same height).
+std::vector<float> groundCurvatureGrid(const TerrainDetail& d, double x0, double z0, double s, int n);
+// The point's occlusion byte +0x89 after the term (asm 0x7f9850..0x7f98b3): byte = floor(64 occ + 0.5) as the point
+// evaluation 0x7dc990 stores it, then floor(64 clamp01(byte / 64 x f) + 0.5) (fistp under RC_DOWN); returned / 64.
+float curvedOcclusion(float occ, float f);
 
 class TerrainLod {
 public:
@@ -60,6 +74,8 @@ public:
     std::vector<std::shared_ptr<const TerrainChunk>> update(double ex, double ez, double fx = 0, double fz = 0);
     // Blocks until nothing is queued or building.
     void settle();
+    // PK15: nothing queued or building (the teleport waits for it, 0x57f050).
+    bool idle();
 
 private:
     struct Job {
