@@ -10,7 +10,7 @@ namespace fuel {
 namespace {
 
 constexpr double kRoot = 12288.0;       // root chunk size (p15 D2)
-constexpr double kSplit = 2.0625;       // W+0xa88: split while the camera is within kSplit * C
+constexpr double kSplit = kChunkSplit;  // W+0xa88: split while the camera is within kSplit * C
 constexpr double kLeaf = 24.01;         // 0x9dc4f4: chunks this small never split
 constexpr double kFarChunk = 240.0;     // 0x7f92c0: chunks >= 240 m use the far height (0x64be70)
 constexpr double kMapNormalChunk = 120.0;  // chunks >= 120 m take the map normal (0x64be70)
@@ -132,6 +132,45 @@ std::vector<TerrainVertex> buildTerrainChunk(const Heightfield& hf, double cx, d
     return v;
 }
 
+float groundCurvatureFactor(float h, float hA, float hB, float hC, float hD, float s) {
+    // 0x7f90d0 (args p1 = h, p2 = hA, p3 = hB, p4 = hC, p5 = hD, p6 = s). x87 at PC_53: double arithmetic, float
+    // stores where the asm stores (the normal before and after the normalisation, the squared length's argument).
+    const float ns = -s;
+    const float nx = float(((double(hC) - h) * 0.0 - double(s) * (double(hA) - h)) + ((double(hD) - h) * 0.0 - double(ns) * (double(hB) - h)));
+    const float ny = float(double(s) * s + double(ns) * ns);
+    const float nz = float(((double(hA) - h) * 0.0 - (double(hC) - h) * s) + ((double(hB) - h) * 0.0 - (double(hD) - h) * ns));
+    double x = nx, y = ny, z = nz;
+    const float l2 = float(x * x + y * y + z * z);
+    if (l2 != 0.0f) {
+        const double inv = 1.0 / std::sqrt(double(l2));  // 0x40ed20 = fsqrt of the float argument
+        x = float(x * inv), y = float(y * inv), z = float(z * inv);
+    }
+    // The four neighbours as points (+-s, h_k, 0) / (0, h_k, +-s) dotted with n, against the point (0, h, 0).
+    const double mean = (y * hD + z * ns + x * 0.0) + (z * s + y * hC + x * 0.0) + (y * hB + x * ns + z * 0.0) + (x * s + y * hA + z * 0.0);
+    const double d = ((y * h + x * 0.0 + z * 0.0) - mean * 0.25) / s;
+    const double a = std::fabs(d);
+    return float(((4.0 - a) * d * d + (4.0 - 6.0 * a)) * d * 1.5 + 1.0);
+}
+
+std::vector<float> groundCurvatureGrid(const TerrainDetail& det, double x0, double z0, double s, int n) {
+    const int G = n + 2;
+    std::vector<float> h(size_t(G) * G), f(size_t(n) * n);
+    for (int j = 0; j < G; ++j)
+        for (int i = 0; i < G; ++i) h[size_t(j) * G + size_t(i)] = float(det.height(x0 + (i - 1) * s, z0 + (j - 1) * s));
+    auto H = [&](int i, int j) { return h[size_t(j + 1) * G + size_t(i + 1)]; };
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i)
+            f[size_t(j) * n + size_t(i)] = groundCurvatureFactor(H(i, j), H(i + 1, j), H(i - 1, j), H(i, j + 1), H(i, j - 1), float(s));
+    return f;
+}
+
+float curvedOcclusion(float occ, float f) {
+    const float b = std::floor(occ * 64.0f + 0.5f) * 0.015625f;
+    float v = b * f;
+    v = v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v);
+    return std::floor(v * 64.0f + 0.5f) * 0.015625f;
+}
+
 const std::vector<uint32_t>& terrainChunkIndices() {
     static const std::vector<uint32_t> idx = [] {
         constexpr uint32_t N = kChunkSide;
@@ -211,6 +250,10 @@ bool TerrainLod::cover(double cx, double cz, double size, int level, double ex, 
             all = cover(cx + kSx[k] * q, cz + kSz[k] * q, size * 0.5, level + 1, ex, ez, kids, want) && all;
         if (all) {
             out.insert(out.end(), kids.begin(), kids.end());
+            // Keep this chunk cached while its children stand in for it, so it is ready the moment
+            // the camera moves away and the area merges back (otherwise it was forgotten after 600
+            // frames and the area had no ground until a worker rebuilt it: a one-frame hole).
+            if (built_.count(key)) lastUsed_[key] = frame_;
             return true;
         }
     }
@@ -219,6 +262,27 @@ bool TerrainLod::cover(double cx, double cz, double size, int level, double ex, 
         lastUsed_[key] = frame_;
         out.push_back(it->second);
         return true;
+    }
+    if (size > kLeaf) {
+        // Not built yet: the four children, if they are still cached (they were drawn until now),
+        // keep covering the area while this chunk is built.
+        const double q = size * 0.25;
+        static constexpr int kSx[4] = {1, 1, -1, -1}, kSz[4] = {1, -1, -1, 1};
+        std::shared_ptr<const TerrainChunk> kid[4];
+        bool have = true;
+        for (int k = 0; k < 4 && have; ++k) {
+            const auto ki = built_.find(chunkKey(level + 1, cx + kSx[k] * q, cz + kSz[k] * q));
+            have = ki != built_.end();
+            if (have) kid[k] = ki->second;
+        }
+        if (have) {
+            for (int k = 0; k < 4; ++k) {
+                lastUsed_[kid[k]->key] = frame_;
+                out.push_back(kid[k]);
+            }
+            if (!pending_.count(key)) want.push_back({key, cx, cz, size, size});
+            return true;
+        }
     }
     if (!pending_.count(key)) {
         // FUEL's build key (0x7dfdc0, notes p31 D): the chunk size when the chunk is in the view
@@ -273,6 +337,11 @@ std::vector<std::shared_ptr<const TerrainChunk>> TerrainLod::update(double ex, d
     }
     cv_.notify_all();
     return out;
+}
+
+bool TerrainLod::idle() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return queue_.empty() && busy_ == 0;
 }
 
 void TerrainLod::settle() {

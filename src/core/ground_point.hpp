@@ -106,6 +106,10 @@ public:
 
     // Evaluates the point (x, z). With `full` false only what the tree filter needs.
     GroundPoint at(double x, double z, bool full = true) const;
+    // Noise_DecorDensity 0x6b7f10 (AutoMesh OnRockyArea, 0x78b6b0): a = 0.2 (1 - humidity) (float), u = clamp01(F_dd9c + a),
+    // s = 2u^2 - 1, A = 0.5 + 0.5 s (2 - |s|); t = 2 clamp01(clamp01(F_cdc8) - a) - 1 (0x4debf0), c = S-curve^8 of t;
+    // clamp01(A - 0.8 (0.5 + 0.5 c)). Humidity as GroundPoint::humidity (0x4dde20 approximated by map 2, p14).
+    float decorDensity(double x, double z, float* humidity = nullptr, float* clearing = nullptr) const;
     // The point's colours (needs `p` from at(x, z) with full = true). `t0` overrides the
     // palette-half noise T0 (>= 0: e.g. its mean over a map cell).
     GroundColours colours(double x, double z, const GroundPoint& p, float t0 = -1) const;
@@ -130,6 +134,10 @@ public:
     // and the forest density 0x6bd200, for AutoMesh's climate test 0x78b470 (p36).
     float map(int slot, double x, double z) const { return mapAt(slot, x, z); }
     float forest(double x, double z, float coarseNy) const { return forestDensity(x, z, coarseNy); }
+    // For the ambience (Game_SoundMgr 0x4e81e0, p45): the forest density 0x6bd200 with the coarse normal at
+    // (x, z), and 0x4e8a10 = clamp(|(F_fd8 + F_1fac) / 2|) (the grass-patch noise, p14).
+    float forestAt(double x, double z) const;
+    float grassPatch(double x, double z) const;
     // Bitmap_Z of the Grass material's 4x4 tuft atlas (0 if not found).
     uint32_t grassAtlas() const { return grassAtlas_; }
 
@@ -169,6 +177,7 @@ private:
     Fractal f3f54_;                                 // surface variant noise (0x6a81f0)
     Fractal f0004_, f9e4c_, fcdc8_;                 // colour noises (p16 C8, C11)
     Fractal f8e78_, fae20_, fbdf4_;                 // clay / chalk / volcano noises (p32)
+    Fractal fdd9c_;                                 // decor density noise (0x6b7f10)
     struct ClassCell {
         float frac[kGroundClasses];
         float height, water, soft;  // entry +0x18 ground height, +0x1c water level (-10000 dry), +0x20 ctx+0x208

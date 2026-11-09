@@ -1,6 +1,7 @@
 // FUEL's vehicle model, engine side and per-substep vehicle hooks. See fuel_vehicle.hpp and
 // ~/re-work/fuel/notes/p23-vehicle-physics.md (sections 2-8, Part E) for the decode.
 #include "fuel_vehicle.hpp"
+#include "nitro.hpp"  // [nitro]
 
 #include <algorithm>
 #include <cmath>
@@ -127,6 +128,8 @@ FuelVehicle::FuelVehicle(std::vector<float> params, const ProxyShapes& proxy, co
     com_ = comPrev_ = comBase_;
     body_.mass = P(2);
     body_.invMass = 1.0f / body_.mass;
+    body_.massP3 = P(3);
+    if (P_.size() > 593) body_.crashP = &P_[585];  // the crash meter 0x51ee90 (P585..P593)
     computeMassProperties();
     buildWheels();
     BodyState& S = body_.S;
@@ -185,6 +188,16 @@ void FuelVehicle::computeMassProperties() {
         I = Mat3::diag(i, i, i);
     }
     body_.boundR = boundR;
+    // +0x404 (0x712b60, called once from 0x70e210): starts at 0.01 [0x99614c] and takes the largest distance from
+    // the centre of mass of every sphere's far side (wheel spheres included: they are proxy spheres here) and of
+    // every box corner (0x7426b0: the 8 corners). The breadcrumbs' blocking sphere is this + 2 (0x527bf0).
+    extentR_ = 0.01f;
+    for (const auto& s : proxy_.spheres) extentR_ = std::max(extentR_, len(s.c - com_) + s.r);
+    for (const auto& b : proxy_.boxes)
+        for (int k = 0; k < 8; ++k) {
+            const Vec3 c{b.c.x + ((k & 1) ? b.half.x : -b.half.x), b.c.y + ((k & 2) ? b.half.y : -b.half.y), b.c.z + ((k & 4) ? b.half.z : -b.half.z)};
+            extentR_ = std::max(extentR_, len(c - com_));
+        }
     body_.I1 = I * Mat3::diag(P(4), P(5), P(6));
     body_.I2 = I * Mat3::diag(P(7), P(8), P(9));
     body_.I1inv = body_.I1.inverse();
@@ -193,7 +206,7 @@ void FuelVehicle::computeMassProperties() {
 }
 
 void FuelVehicle::buildWheels() {
-    // 0x52def0: hub = proxy sphere - CoM (offset helper 0x5d7a90: Unknown U4, 0 in the port); sphere radius =
+    // 0x52def0: hub = proxy sphere (+ hub offset 0x5d7a90, not applied: hubRest) - CoM; sphere radius =
     // proxy radius + P55 (front) | P56 (rear); the tyre material (front odd parameter, rear even).
     wheels_.assign(size_t(nWheels_), WheelRec{});
     for (int w = 0; w < nWheels_; ++w) {
@@ -201,7 +214,7 @@ void FuelVehicle::buildWheels() {
         const auto& s = proxy_.spheres[size_t(wheelSphere_[size_t(w)])];
         const bool f = front(w);
         auto pp = [&](int frontParam) { return P(f ? frontParam : frontParam + 1); };
-        r.hubL = s.c - com_;
+        r.hubL = hubRest(w) - com_;
         r.radius = s.r + pp(55);
         ContactMat& m = r.mat;
         m.c = pp(75);
@@ -223,6 +236,40 @@ void FuelVehicle::buildWheels() {
 
 // ---- helpers -------------------------------------------------------------------------------
 
+Vec3 FuelVehicle::hubOffset(int w) const {
+    // 0x5d7a90 switch (EDX = wheel): 0 (P57, P58, P59), 1 (P60, P61, P62), 2 (-P57, P58, P59), 3 / 4 / 5 (-P60, P61, P62);
+    // the decompiled axes are (0,1,0) [0xa06320], (-1,0,0) [0xa06344], (0,0,1) [0xa06350].
+    if (w < 0 || w > 5) return {};
+    const bool rear = w == 1 || w >= 3;
+    const float x = P(rear ? 60 : 57), y = P(rear ? 61 : 58), z = P(rear ? 62 : 59);
+    return {(w == 0 || w == 1) ? x : -x, y, z};
+}
+
+float FuelVehicle::visualCamber(int w, float c) const {
+    if (P(66) == 0) return 0;  // asm 0x5cb320: fucomp with 0
+    float h = c + P(67);
+    if (w > 1) h = -h;        // asm 0x5cb331: cmp wheel, 1; jle
+    return std::atan2(h, P(66));  // 0x40f550 = fpatan(h, P66)
+}
+
+// Port choice (P81, notes p81-physics-big.md open W2): the hub stays at the proxy sphere. 0x52def0 / 0x5c8620 add
+// hubOffset(w) (VehiclePP 58 = 0.1 .. 0.4 for 42 vehicles), but with this physics the body then rides that much
+// lower and the full-size proxy box drags (BUGGY_ALL_1: 4 chassis contacts per frame, top speed 164 -> 136 km/h),
+// and FUEL's own drawn-wheel height (0x5caf40, W1) disagrees with this contact geometry by about the same amount.
+Vec3 FuelVehicle::hubRest(int w) const {
+    const Vec3 c = proxy_.spheres[size_t(wheelSphere_[size_t(w)])].c;
+    if (!hubShifted_) return c;
+    // Port deviation (upgrade plan, suspension lift): the wheel centre lower by the lift (the body rides higher) and
+    // out by the axle's track widening, away from the model's centre line.
+    const float wide = front(w) ? widenF_ : widenR_;
+    return {c.x + (c.x >= 0 ? wide : -wide), c.y - lift_, c.z};
+}
+void FuelVehicle::setHubShift(float lift, float widenFront, float widenRear) {
+    lift_ = lift, widenF_ = widenFront, widenR_ = widenRear;
+    hubShifted_ = lift != 0 || widenFront != 0 || widenRear != 0;
+    for (int w = 0; w < nWheels_; ++w) wheels_[size_t(w)].hubL = hubRest(w) - com_;
+}
+
 float FuelVehicle::ratio(int g) const {  // 0x524d00
     if (g > 0) return P(350) * P(351 + g);
     if (g == -1) return P(350) * P(351);
@@ -234,11 +281,20 @@ float FuelVehicle::gearMul(int g) const {
     return 1;
 }
 float FuelVehicle::engineTorque(float rpm) const {  // 0x524c70 (cell index rounds down)
-    const float f = clampf(rpm / P(324), 0, 1) * 10.0f;
+    return governedTorque(rpm, powerScale * torqueScale_);
+}
+// 0x524c70's curve x P327, and the port's extra torque on top of it: scale s (1 = FUEL, returned bit for bit), the part
+// above FUEL's governed by gov_ (truck-power; notes truck-power.md).
+float FuelVehicle::governedTorque(float rpm, float s) const {
+    const float f = clampf(rpm / (P(324) * rpmStretch_), 0, 1) * 10.0f;  // [nitro] x 1 without a boost
     const int i = int(std::floor(f));
     const int j = std::min(i + 1, 10);
     const float t = f - float(i);
-    return ((1 - t) * P(338 + i) + P(338 + j) * t) * P(327);
+    const float T = ((1 - t) * P(338 + i) + P(338 + j) * t) * P(327);
+    if (s == 1.0f && !upgraded_) return T;
+    if (upgraded_ && governorOn)  // [upgrades U1] FUEL's own part x the traction hold (1 unless the driven wheels slide)
+        return T * (hold_ + (s - 1) * gov_);
+    return T * (1 + (s - 1) * (governorOn ? gov_ : 1.0f));
 }
 float FuelVehicle::meanDrivenRadius() const {  // 0x525680
     float sum = 0;
@@ -257,6 +313,24 @@ float FuelVehicle::meanDrivenWheelSpeed() const {  // 0x525710
         sum += x, ++n;
     }
     return n ? sum / float(n) : 0.0f;
+}
+float FuelVehicle::meanWheelSpeed() const {  // 0x5257b0: every wheel, rim speed with the dead zone, / the wheel count
+    float sum = 0;
+    for (int w = 0; w < nWheels_; ++w) {
+        float x = body_.S.auxVel[1 + w];
+        if (std::fabs(x) < body_.S.auxDead[1 + w]) x = 0;
+        sum += x;
+    }
+    return sum / float(nWheels_);
+}
+bool FuelVehicle::drivenWheelsSlidingEnough() const {  // 0x5244d0: sliding (loaded) driven wheels >= min(driven wheels, 2)
+    int driven_ = 0, sliding = 0;
+    for (int w = 0; w < nWheels_; ++w) {
+        if (!driven(w)) continue;
+        ++driven_;
+        if (wheelSliding(w)) ++sliding;
+    }
+    return sliding >= std::min(driven_, 2);
 }
 float FuelVehicle::engineSpeedAtWheel() const {  // 0x525980
     if (gear_ == 0) return 0;
@@ -388,6 +462,124 @@ namespace {
 // Contact_Add 0x70ce10 with the vehicle hooks: the contact frame 0x51f1e0 (static chassis contacts: the
 // wall normal bent towards the chassis at speed) and the filter 0x51f6c0 (restitution for chassis
 // contacts). Returns false when rejected.
+// 0x51ee90 crash meter (the last of 0x51f6c0's accept hooks): wheel contacts only when bottomed out (depth past
+// R[0x3e]); with an approach speed >= 0. The impact direction is (p - x) normalised, or -n when (p - x).y > -n.y;
+// a, b, c = |dir . fwd|, |dir . lat|, |dir . up|; e = (max(rel . dir, 0) - (P586 a + P588 b + P590 c)) x f (0x51ee20);
+// a hard hit (|n.y| < 0.707 or approach > 15 m/s) with e > 0 raises +0x138c to (P587 a + P589 b + P591 c) e 100/P585 x 20
+// and records the direction in the body frame (+0x1060); the scrape +0x1390 = max(, (tangential - 100/P585 x P592) P593 x 20).
+}  // namespace
+
+void crashMeter(const Contact& c, RigidBody& body, const Vec3& rel) {
+    const float* P = body.crashP;  // P[0] = P585 ... P[8] = P593
+    if (P == nullptr) return;
+    if (c.wheel != nullptr && !(c.m.maxDepth < c.depth)) return;
+    if (!(c.approach >= 0)) return;
+    float f = 1;
+    if (c.b) {
+        const float mo = c.b->massP3 > 0 ? c.b->massP3 : c.b->mass;
+        f = 1 - body.massP3 / (mo + body.massP3);
+    }
+    const bool hard = std::fabs(c.n.y) < 0.707f || std::fabs(c.approach) > 15.0f;
+    Vec3 dir = c.p - body.S.x;
+    const float dl = len(dir);
+    dir = dl > 0 ? dir / dl : dir;  // 0x410050(1.0)
+    if (-c.n.y < dir.y) dir = -c.n;
+    const Vec3 fw = rotate(body.S.q, {0, 0, 1}), lt = rotate(body.S.q, {1, 0, 0}), up = rotate(body.S.q, {0, 1, 0});
+    const float a = std::fabs(dot(dir, fw)), b = std::fabs(dot(dir, lt)), cc = std::fabs(dot(dir, up));
+    const float rv = std::max(dot(rel, dir), 0.0f);
+    const float s = 100.0f / P[0];
+    const float e = (rv - (P[1] * a + P[3] * b + P[5] * cc)) * f;
+    if (hard && e > 0) {
+        const float v = (P[6] * cc + P[4] * b + P[2] * a) * e * s * 20.0f;
+        if (body.impactMeter < v) {
+            body.impactMeter = v;
+            body.impactDirL = unrotate(body.S.q, dir);
+        }
+    }
+    const float t = c.tangential - s * P[7];
+    if (t > 0) body.scrapeMeter = std::max(body.scrapeMeter, t * P[8] * 20.0f);
+}
+
+// P87: the debris branch of Vehicle_ImpactFx 0x51e9e0 (asm 0x51e9e0..0x51ed70) for `self` (ESI) and contact R
+// (EDI). The FX stats (+0x1408..+0x1410, +0xf1c, +0xf2c) and the scrape sound 0x5d07f0 are elsewhere (soundImpact).
+static thread_local const char* tContactTag = "";  // P87 trace: which gather made the contact
+void impactDebris(const Contact& c, RigidBody& self, const Vec3& rel, const RigidBody* bodyA) {
+    if (self.crashP == nullptr) return;  // not a vehicle (no 0x234 hook)
+    const float r = len(rel);            // |R[0x10..0x12]| (0x70ce10: vA(p) + R[8..] surface velocity - vB(p))
+    const bool counts = 5.0f < r;        // (statistics only)
+    if (!self.fxDriver) {                // 0x51e9e3: +0x142b
+        if (counts) ++self.fxRefused[0];
+        return;
+    }
+    if (self.fxRaceState == 6 || self.fxRaceState == 7) {  // 0x51ea20: race won / lost
+        if (counts) ++self.fxRefused[1];
+        return;
+    }
+    if (c.wheel != nullptr) {  // R[0x39] = the wheel record (0 for sphere / box contacts)
+        if (c.depth < c.m.maxDepth) {  // 0x51ea79: R[0xd8] < R[0xf8], the tyre still springs
+            if (counts) ++self.fxRefused[2];
+            return;
+        }
+        // 0x51ea90: the hub (rec+0xf0) seen from the contact point in the body frame (conj(+0x7f0), 0x40f130 /
+        // 0x4db890): a bottomed wheel touching below (or above) its hub throws nothing unless rec+0xd4 (the y of
+        // the slip velocities 0x70f490 summed in the last substep) is below -P643 (PP+0xa08).
+        const Vec3 d = unrotate(self.S.q, c.wheel->hubW - c.p);
+        if (std::sqrt(d.x * d.x + d.z * d.z) < std::fabs(d.y) && -self.fxWheelDrop < c.wheel->slipGather.y) {
+            if (counts) ++self.fxRefused[2];
+            return;
+        }
+    }
+    if (self.fxClass == 1 || self.fxClass == 3) {
+        // 0x51ebba (BIKE / QUAD): the vehicle node's up (vt+0xb4(0) -> node +0x10 quaternion x 0xa06320) against
+        // the probe normal +0x1030 > 0.3 [0x9dbfa4] and the contact normal along it > 0.707 [0x9dc0c8]: skip.
+        const Vec3 up = rotate(self.S.q, {0, 1, 0});
+        if (0.3f < dot(self.fxProbeNormal, up) && 0.707f < dot(self.fxProbeNormal, c.n)) {
+            if (counts) ++self.fxRefused[3];
+            return;
+        }
+    }
+    // ---- PK23: the scrape sparks (asm 0x51ed72: 10 [0x996494] <= R[0x34], the tangential speed) run after the debris
+    // block whatever it did; R[0x14..0x16] = rel - n (n . rel) (0x70ce10).
+    struct SparkAfter {
+        const Contact& c;
+        RigidBody& self;
+        const Vec3& rel;
+        const RigidBody* a;
+        ~SparkAfter() {
+            if (!(10.0f <= c.tangential) || self.sparkCalls.size() >= RigidBody::kMaxSparkCalls) return;
+            RigidBody::SparkCall s;
+            s.a = uint64_t(reinterpret_cast<uintptr_t>(a)), s.b = uint64_t(reinterpret_cast<uintptr_t>(c.b));
+            s.point = c.p;
+            s.tangent = rel - c.n * dot(rel, c.n);
+            s.q = self.S.q;
+            self.sparkCalls.push_back(s);
+        }
+    } sparkAfter{c, self, rel, bodyA};
+    // ---- PK23 end
+    if (!(self.fxTimer < 0)) {  // 0x51ed0a: fldz; fcomp +0x1340
+        if (counts) ++self.fxRefused[4];
+        return;
+    }
+    if (!counts) return;  // 0x51ed19: 5 [0x9dbf8c] < |rel|
+    const int n = std::min(int(r * 0.5f), 20);  // 0x51ed28: x 0.5 [0x9960c0], _ftol 0x8e01d0, at most 0x14
+    static const bool trace = std::getenv("FUEL_P87_TRACE") != nullptr;
+    if (trace) {
+        const Vec3 dl = c.wheel ? unrotate(self.S.q, c.wheel->hubW - c.p) : Vec3{};
+        std::printf("p87 impact [%s]: %s%s depth %.3f (bottom %.3f) n (%.2f, %.2f, %.2f) |rel| %.1f approach %.1f tangential %.1f, hub-p local "
+                    "(%.2f, %.2f, %.2f) slip.y %.2f, at (%.1f, %.1f, %.1f) -> %d pieces\n",
+                    tContactTag, c.wheel ? "wheel" : "body", c.b ? " vs vehicle" : "", c.depth, c.m.maxDepth, c.n.x, c.n.y, c.n.z, r, c.approach, c.tangential,
+                    dl.x, dl.y, dl.z, c.wheel ? c.wheel->slipGather.y : 0.0f, c.p.x, c.p.y, c.p.z, n);
+    }
+    if (0 < n) {
+        self.debrisPieces = n;
+        self.debrisAt = c.p;  // R[0..2]: every piece starts at the contact point
+        ++self.debrisSerial;
+    }
+    self.fxTimer = 1.0f;  // 0x51ed66
+}
+
+namespace {
+
 bool addContact(Contact& c, RigidBody& body, const Quat& q, bool wrecked, float restitutionP284, float restitutionP285,
                 std::vector<Contact>& out) {
     if (c.depth < 1e-6f) return false;
@@ -416,9 +608,46 @@ bool addContact(Contact& c, RigidBody& body, const Quat& q, bool wrecked, float 
         c.m.dampC = (1 - std::fabs(dot(c.n, up))) * e;
         body.scrapeSpeed = std::max(body.scrapeSpeed, c.tangential);
     }
+    if (c.wheel == nullptr || c.depth > c.m.maxDepth) {  // 0x51e9e0: wheel contacts only when bottomed out
+        const float mf = c.b ? 1 - body.mass / std::max(body.mass + c.b->mass, 1e-6f) : 1.0f;  // 0x51ee20
+        if (c.tangential * mf > body.soundImpactKey) {
+            body.soundImpactKey = c.tangential * mf;
+            body.soundImpact = c.n * (mf * c.approach);
+        }
+    }
+    // P87: 0x51e9e0's debris request (0x52ee60). Contact_Add 0x70ce10 runs the filter hook 0x234 of A, then of B
+    // (+0xebf, both vehicles), so a vehicle-vehicle contact reaches 0x51e9e0 of both bodies with the same record.
+    impactDebris(c, body, rel, &body);
+    if (c.b != nullptr && c.b != &body) impactDebris(c, *c.b, rel, &body);
     body.impactSpeed = std::max(body.impactSpeed, c.approach);
+    crashMeter(c, body, rel);
     out.push_back(c);
     return true;
+}
+
+// 0x725db0: two bodies' contact materials combined for a body-body contact (R[0x3c..]): the larger compliance,
+// preload, friction peaks and load terms, the smaller bias, bottom-out depth, damping and exponent; the friction
+// set 1 coefficients 0, 2-4 and 7 by the larger, or by the smaller when both carry the min-friction flag (+0x21).
+ContactMat combineMaterials(const ContactMat& a, const ContactMat& b) {
+    ContactMat m = a;
+    m.c = std::max(a.c, b.c);
+    m.bias = std::min(a.bias, b.bias);
+    m.maxDepth = std::min(a.maxDepth, b.maxDepth);
+    m.preload = std::max(a.preload, b.preload);
+    m.dampC = std::min(a.dampC, b.dampC);
+    m.dampR = std::min(a.dampR, b.dampR);
+    m.quadC = std::min(a.quadC, b.quadC);
+    m.quadR = std::min(a.quadR, b.quadR);
+    m.set1[5] = std::max(a.set1[5], b.set1[5]);
+    m.set1[6] = std::max(a.set1[6], b.set1[6]);
+    m.maxN = std::max(a.maxN, b.maxN);
+    m.loadFloor = std::max(a.loadFloor, b.loadFloor);
+    m.loadBlend = std::max(a.loadBlend, b.loadBlend);
+    m.extraDepth = std::max(a.extraDepth, b.extraDepth);
+    m.loadExp = std::min(a.loadExp, b.loadExp);
+    const bool both = a.minFriction && b.minFriction;
+    for (int i : {0, 2, 3, 4, 7}) m.set1[i] = both ? std::min(a.set1[i], b.set1[i]) : std::max(a.set1[i], b.set1[i]);
+    return m;
 }
 
 ContactMat chassisMaterial(float P282, float P283, uint8_t wrecked, int wheels) {  // 0x52ff30 + 0x521ec0
@@ -440,6 +669,35 @@ ContactMat chassisMaterial(float P282, float P283, uint8_t wrecked, int wheels) 
 
 }  // namespace
 
+// The chassis spheres (proxy spheres that are not wheels, lowered by P10: 0x71c5f0 -> +0xdbc) and boxes in the world.
+void FuelVehicle::chassisSpheres(std::vector<std::pair<Vec3, float>>& out) const {
+    const BodyState& S = body_.S;
+    const Vec3 lower{0, -P(10), 0};
+    for (size_t i = 0; i < proxy_.spheres.size(); ++i) {
+        if (std::find(wheelSphere_.begin(), wheelSphere_.end(), int(i)) != wheelSphere_.end()) continue;
+        out.push_back({S.x + rotate(S.q, proxy_.spheres[i].c - com_ + lower), proxy_.spheres[i].r});
+    }
+}
+void FuelVehicle::modelShapes(std::vector<std::pair<Vec3, float>>& spheres, std::vector<ProxyShapes::Box>& boxes) const {
+    const Vec3 lower{0, -P(10), 0};
+    for (size_t i = 0; i < proxy_.spheres.size(); ++i) {
+        if (std::find(wheelSphere_.begin(), wheelSphere_.end(), int(i)) != wheelSphere_.end()) continue;
+        spheres.push_back({proxy_.spheres[i].c + lower, proxy_.spheres[i].r});
+    }
+    for (const auto& b : proxy_.boxes) boxes.push_back(b);
+}
+void FuelVehicle::chassisBoxes(std::vector<Obb>& out) const {
+    const BodyState& S = body_.S;
+    for (const auto& b : proxy_.boxes) {
+        Obb ob;
+        ob.ax[0] = rotate(S.q, {1, 0, 0}), ob.ax[1] = rotate(S.q, {0, 1, 0}), ob.ax[2] = rotate(S.q, {0, 0, 1});
+        ob.c = S.x + rotate(S.q, b.c - com_);
+        ob.h = b.half;
+        ob.r = b.r > 0 ? b.r : len(b.half);
+        out.push_back(ob);
+    }
+}
+
 void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehicle*>& others) {
     contacts_.clear();
     body_.updateWorldInertia();
@@ -448,10 +706,21 @@ void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehic
     const Vec3 upW = rotate(S.q, kUp);
     std::vector<const Tri*> tris;
     std::vector<StaticHit> hits;
+    // The island's static scene (0x71dd80): gathered once around the body's broadphase sphere (+0x410 = +0x408
+    // + 0.5).
+    if (P_.size() > 593) body_.crashP = &P_[585];  // (re-pointed: the vehicle may have been copied)
+    body_.fxDriver = player_;  // P87: 0x51e9e0's inputs
+    body_.fxProbeNormal = probeNormal_;
+    body_.fxWheelDrop = P(643);
+    StaticScene& scene = scene_;
+    scene.clear();
+    if (env.gatherStatics) env.gatherStatics(S.x, body_.boundR + 0.5f, scene);
     // Wheels (0x723400).
+    tContactTag = "wheel";
     for (int w = 0; w < nWheels_; ++w) {
         WheelRec& r = wheels_[size_t(w)];
         r.maxDepthSeen = r.load = r.compRatio = r.sumFn = r.sumDen = 0;
+        r.slipGather = r.slip;  // P87: FUEL clears +0xd0 after the gather (0x70f490), the port before it
         r.fric = r.slip = r.nDepth = {};
         r.surface = -1;
         if (!r.active) continue;
@@ -494,7 +763,39 @@ void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehic
                 if (addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_)) r.surface = t->surface;
             }
         }
-        if (env.sphereStatics) {
+        // Static boxes 0x71a9e0, sphere objects 0x71b1b0, mesh triangles 0x769560 (as the terrain's).
+        for (const Obb& ob : scene.boxes) {
+            Contact ct;
+            if (!sphereObb(ob, c, rad, ct.p, ct.n, ct.depth)) continue;
+            ct.a = &body_;
+            ct.surface = 0;
+            attachWheel(ct, r, upW);
+            addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+        }
+        for (const auto& [sc, sr] : scene.spheres) {
+            Contact ct;
+            if (!sphereSphere(sc, sr, c, rad, ct.p, ct.n, ct.depth)) continue;
+            ct.a = &body_;
+            ct.surface = 0;
+            attachWheel(ct, r, upW);
+            addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+        }
+        for (const Tri* t : scene.tris) {
+            float depth;
+            Vec3 n, p;
+            if (!sphereTriangle(*t, c, rad, depth, n, p)) continue;
+            if (depth > r.mat.maxDepth || dot(t->n, n) > 0.3f) n = t->n;
+            Contact ct;
+            ct.p = p, ct.n = n, ct.depth = depth;
+            ct.a = &body_;
+            ct.surface = t->surface;
+            ct.fromTriangle = true;
+            attachWheel(ct, r, upW);
+            if (addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_)) r.surface = t->surface;
+        }
+        // P50: no trunks for the wheels. 0x723400 calls 0x74ee80 with mode 4 (water floor only); trees 0x785200 and
+        // bushes 0x788ab0 need mode bit 2, which only the chassis spheres (0x723b80) and boxes (0x74ead0) pass.
+        if (env.sphereStatics && false) {  // tree and bush trunks
             hits.clear();
             env.sphereStatics(c, rad, hits);
             for (const StaticHit& h : hits) {
@@ -514,6 +815,7 @@ void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehic
         if (std::find(wheelSphere_.begin(), wheelSphere_.end(), int(i)) != wheelSphere_.end()) continue;
         const auto& s = proxy_.spheres[i];
         const Vec3 c = S.x + rotate(S.q, s.c - com_ + lower);
+        tContactTag = "chassis sphere";
         if (env.terrain) {
             tris.clear();
             env.terrain->query(c.x, c.z, s.r, tris);
@@ -526,7 +828,28 @@ void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehic
                 addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
             }
         }
-        if (env.sphereStatics) {
+        // 0x723b80: static boxes, sphere objects, mesh triangles (0x7260a0(0)).
+        for (const Obb& ob : scene.boxes) {
+            Contact ct;
+            if (!sphereObb(ob, c, s.r, ct.p, ct.n, ct.depth)) continue;
+            ct.a = &body_, ct.m = chassis;
+            addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+        }
+        for (const auto& [sc, sr] : scene.spheres) {
+            Contact ct;
+            if (!sphereSphere(sc, sr, c, s.r, ct.p, ct.n, ct.depth)) continue;
+            ct.a = &body_, ct.m = chassis;
+            addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+        }
+        for (const Tri* t : scene.tris) {
+            Contact ct;
+            if (!sphereTriangle(*t, c, s.r, ct.depth, ct.n, ct.p)) continue;
+            ct.a = &body_;
+            ct.m = chassis;
+            ct.surface = t->surface;
+            addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+        }
+        if (env.sphereStatics) {  // trunks
             hits.clear();
             env.sphereStatics(c, s.r, hits);
             for (const StaticHit& h : hits) {
@@ -536,90 +859,171 @@ void FuelVehicle::generateContacts(Environment& env, const std::vector<FuelVehic
             }
         }
     }
-    for (const auto& b : proxy_.boxes) {
-        const Vec3 c = S.x + rotate(S.q, b.c - com_);
-        // Box vs terrain (0x74ead0, not transcribed): the port tests the eight corners against the
-        // triangulated ground.
+    // Boxes (0x724120): the body's box records (axes = the body's, centre, half extents, radius +0xa0).
+    std::vector<Obb>& boxes = boxes_;
+    tContactTag = "chassis box";
+    boxes.clear();
+    chassisBoxes(boxes);
+    if (!boxes.empty()) {
+        const Vec3 bc = S.x;  // the body's bound sphere (+0xc10 = position, +0xc1c = +0x408)
+        const float br = body_.boundR;
+        // Trunks (0x74ead0; port: Jolt).
+        if (env.boxStatics)
+            for (size_t i = 0; i < boxes.size(); ++i) {
+                hits.clear();
+                env.boxStatics(boxes[i].c, S.q, boxes[i].h, hits);
+                for (const StaticHit& h : hits) {
+                    Contact ct;
+                    ct.p = h.p, ct.n = h.n, ct.depth = h.depth, ct.a = &body_, ct.m = chassis;
+                    addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+                }
+            }
+        // Static boxes: 0x7266a0 (the bound sphere), 0x726160 (the pair), 0x763890.
+        Vec3 n, pts[20];
+        float dep[20];
+        for (const Obb& sb : scene.boxes) {
+            if (!obbSphereCull(sb, bc, br)) continue;
+            for (const Obb& ob : boxes) {
+                if (!obbObbCull(ob, sb)) continue;
+                const int k = boxBox(sb, ob, n, pts, dep);
+                for (int j = 0; j < k; ++j) {
+                    Contact ct;
+                    ct.p = pts[j], ct.n = n, ct.depth = dep[j], ct.a = &body_, ct.m = chassis;
+                    addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+                }
+            }
+        }
+        // Triangles (terrain and meshes): 0x7260a0(1) against the bound sphere, then 0x765bc0 + 0x7667e0 per box;
+        // the contact normal is the triangle's.
+        auto boxTris = [&](const Tri& t) {
+            float d;
+            Vec3 nn, pp;
+            if (!sphereTriangle(t, bc, br, d, nn, pp)) return;
+            for (const Obb& ob : boxes) {
+                const int k = boxTriangle(ob, t, pts, dep);
+                for (int j = 0; j < k; ++j) {
+                    Contact ct;
+                    ct.p = pts[j], ct.n = t.n, ct.depth = dep[j], ct.a = &body_, ct.m = chassis;
+                    ct.surface = t.surface;
+                    ct.fromTriangle = true;
+                    addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
+                }
+            }
+        };
         if (env.terrain) {
-            for (int k = 0; k < 8; ++k) {
-                const Vec3 corner = c + rotate(S.q, {(k & 1) ? b.half.x : -b.half.x, (k & 2) ? b.half.y : -b.half.y,
-                                                     (k & 4) ? b.half.z : -b.half.z});
-                Vec3 n;
-                const float h = env.terrain->surfaceHeight(corner.x, corner.z, &n);
-                if (corner.y >= h) continue;
+            tris.clear();
+            env.terrain->query(bc.x, bc.z, br, tris);
+            for (const Tri* t : tris) boxTris(*t);
+        }
+        for (const Tri* t : scene.tris) boxTris(*t);
+        // Sphere objects vs boxes: 0x71a9e0 with the normal reversed (towards the body).
+        for (const auto& [sc, sr] : scene.spheres)
+            for (const Obb& ob : boxes) {
                 Contact ct;
-                ct.n = n;
-                ct.depth = (h - corner.y) * n.y;
-                ct.p = corner;
-                ct.a = &body_;
-                ct.m = chassis;
-                ct.surface = 2;
+                if (!sphereObb(ob, sc, sr, ct.p, ct.n, ct.depth)) continue;
+                ct.n = -ct.n;
+                ct.a = &body_, ct.m = chassis;
                 addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
             }
-        }
-        if (env.boxStatics) {
-            hits.clear();
-            env.boxStatics(c, S.q, b.half, hits);
-            for (const StaticHit& h : hits) {
-                Contact ct;
-                ct.p = h.p, ct.n = h.n, ct.depth = h.depth, ct.a = &body_, ct.m = chassis;
-                addContact(ct, body_, S.q, wrecked_, P(284), P(285), contacts_);
-            }
-        }
     }
-    // Vehicle vs vehicle (0x725490): the port pairs the chassis boxes and the wheel spheres as spheres of
-    // the box's inner radius; rigid, frictionless (0x51f1e0), restitution from P285.
+    // Vehicle vs vehicle (0x725490, each pair once from the body-pair list 0x71e1d0): A's chassis spheres 0x725130
+    // (vs B's spheres and wheels 0x71b1b0, B's boxes 0x71a9e0), A's boxes 0x724950 (vs B's spheres and wheels with
+    // the normal reversed, B's boxes 0x7266a0 / 0x726160 / 0x763890), A's wheels 0x724eb0 (vs B's spheres 0x71b1b0
+    // and boxes 0x71a9e0, tyre material). Non-wheel contacts take the two chassis materials combined (0x725db0).
     for (FuelVehicle* o : others) {
         if (o == this || o < this) continue;  // each pair once (the contact carries both bodies)
         if (len(o->body_.S.x - S.x) > body_.boundR + o->body_.boundR) continue;
-        auto spheres = [](const FuelVehicle& v, std::vector<std::pair<Vec3, float>>& out) {
-            const BodyState& s = v.body_.S;
-            for (const auto& b : v.proxy_.boxes) {
-                const float r = std::min({b.half.x, b.half.y, b.half.z});
-                // Spheres along the box's longest axis.
-                const Vec3 h = b.half;
-                const int axis = h.x >= h.y && h.x >= h.z ? 0 : (h.y >= h.z ? 1 : 2);
-                const float half = axis == 0 ? h.x : axis == 1 ? h.y : h.z;
-                const int n = std::max(1, int(std::ceil((half - r) / r)) + 1);
-                for (int i = 0; i < n; ++i) {
-                    const float t = n == 1 ? 0.0f : -half + r + (2 * (half - r)) * float(i) / float(n - 1);
-                    const Vec3 off = axis == 0 ? Vec3{t, 0, 0} : axis == 1 ? Vec3{0, t, 0} : Vec3{0, 0, t};
-                    out.push_back({s.x + rotate(s.q, b.c - v.com_ + off), r});
+        const ContactMat mat = combineMaterials(chassis, chassisMaterial(o->P(282), o->P(283), o->wrecked_, o->nWheels_));
+        std::vector<std::pair<Vec3, float>> mySph, oSph, oWheel;
+        chassisSpheres(mySph);
+        o->chassisSpheres(oSph);
+        for (int w = 0; w < o->nWheels_; ++w)
+            if (o->wheels_[size_t(w)].active) oWheel.push_back({o->wheels_[size_t(w)].hubW, o->wheels_[size_t(w)].radius});
+        std::vector<Obb> oBoxes;
+        o->chassisBoxes(oBoxes);
+        auto add = [&](Contact& ct, float e) {
+            ct.b = ct.a == &body_ ? &o->body_ : &body_;
+            addContact(ct, body_, S.q, wrecked_, P(284), e, contacts_);
+        };
+        // 0x725130: A's spheres.
+        for (const auto& [c, r] : mySph) {
+            for (const auto& [oc, orr] : oSph) {
+                Contact ct;
+                if (!sphereSphere(oc, orr, c, r, ct.p, ct.n, ct.depth)) continue;
+                ct.a = &body_, ct.m = mat;
+                add(ct, P(286));
+            }
+            for (const auto& [oc, orr] : oWheel) {
+                Contact ct;
+                if (!sphereSphere(oc, orr, c, r, ct.p, ct.n, ct.depth)) continue;
+                ct.a = &body_, ct.m = mat;
+                add(ct, P(286));
+            }
+            for (const Obb& ob : oBoxes) {
+                Contact ct;
+                if (!sphereObb(ob, c, r, ct.p, ct.n, ct.depth)) continue;
+                ct.a = &body_, ct.m = mat;
+                add(ct, P(286));
+            }
+        }
+        // 0x724950: A's boxes.
+        for (const Obb& mb : boxes) {
+            for (const auto& [oc, orr] : oSph) {
+                Contact ct;
+                if (!sphereObb(mb, oc, orr, ct.p, ct.n, ct.depth)) continue;
+                ct.n = -ct.n;
+                ct.a = &body_, ct.m = mat;
+                add(ct, P(286));
+            }
+            for (int w = 0; w < o->nWheels_; ++w) {  // B's wheel against A's box: a contact of B's wheel
+                WheelRec& wr = o->wheels_[size_t(w)];
+                if (!wr.active) continue;
+                Contact ct;
+                if (!sphereObb(mb, wr.hubW, wr.radius, ct.p, ct.n, ct.depth)) continue;
+                ct.a = &o->body_;
+                attachWheel(ct, wr, rotate(o->body_.S.q, kUp));
+                ct.b = &body_;
+                addContact(ct, o->body_, o->body_.S.q, o->wrecked_, o->P(284), o->P(286), contacts_);
+            }
+        }
+        {
+            Vec3 n, pts[20];
+            float dep[20];
+            for (const Obb& ob : oBoxes) {
+                if (!obbSphereCull(ob, S.x, body_.boundR)) continue;
+                for (const Obb& mb : boxes) {
+                    if (!obbObbCull(mb, ob)) continue;
+                    const int k = boxBox(ob, mb, n, pts, dep);
+                    for (int j = 0; j < k; ++j) {
+                        Contact ct;
+                        ct.p = pts[j], ct.n = n, ct.depth = dep[j], ct.a = &body_, ct.m = mat;
+                        add(ct, P(286));
+                    }
                 }
             }
-            for (int w = 0; w < v.nWheels_; ++w) out.push_back({v.wheels_[size_t(w)].hubW, v.wheels_[size_t(w)].radius * 0.8f});
-        };
-        std::vector<std::pair<Vec3, float>> A, B;
-        spheres(*this, A);
-        spheres(*o, B);
-        for (const auto& [ca, ra] : A)
-            for (const auto& [cb, rb] : B) {
-                const Vec3 d = ca - cb;
-                const float dist = len(d);
-                if (dist >= ra + rb || dist < 1e-6f) continue;
+        }
+        // 0x724eb0: A's wheels.
+        for (int w = 0; w < nWheels_; ++w) {
+            WheelRec& r = wheels_[size_t(w)];
+            if (!r.active) continue;
+            for (const auto& [oc, orr] : oSph) {
                 Contact ct;
-                ct.n = d / dist;
-                ct.depth = ra + rb - dist;
-                ct.p = cb + ct.n * rb;
+                if (!sphereSphere(oc, orr, r.hubW, r.radius, ct.p, ct.n, ct.depth)) continue;
                 ct.a = &body_;
-                ct.b = &o->body_;
-                ct.m = chassis;
-                addContact(ct, body_, S.q, wrecked_, P(284), P(286), contacts_);
+                attachWheel(ct, r, upW);
+                add(ct, P(286));
             }
-    }
-    // Reduction (0x71b7e0): with more than two contacts, for two penalty contacts of the same wheel with
-    // n1.n2 > 0 the later (shallower: the port sorts by depth) gets depth 0.
-    if (contacts_.size() > 2) {
-        std::stable_sort(contacts_.begin(), contacts_.end(), [](const Contact& a, const Contact& b) {
-            if (a.wheel != b.wheel) return a.wheel < b.wheel;
-            return a.depth > b.depth;
-        });
-        for (size_t i = 0; i < contacts_.size(); ++i) {
-            if (contacts_[i].wheel == nullptr || contacts_[i].m.c == 0 || contacts_[i].depth <= 0) continue;
-            for (size_t j = i + 1; j < contacts_.size() && contacts_[j].wheel == contacts_[i].wheel; ++j)
-                if (dot(contacts_[i].n, contacts_[j].n) > 0) contacts_[j].depth = 0;
+            for (const Obb& ob : oBoxes) {
+                Contact ct;
+                if (!sphereObb(ob, r.hubW, r.radius, ct.p, ct.n, ct.depth)) continue;
+                ct.a = &body_;
+                attachWheel(ct, r, upW);
+                add(ct, P(286));
+            }
         }
     }
+    // Reduction 0x71b7e0 (more than two contacts; vehicles have +0xedd = 0, so never 0x71bad0).
+    if (contacts_.size() > 2) reducePerWheel(contacts_);
     if (contacts_.size() > 256) contacts_.resize(256);
 }
 
@@ -633,9 +1037,25 @@ void FuelVehicle::forces() {
     for (auto& r : wheels_) r.util = r.sumDen != 0 ? r.sumFn / r.sumDen : 1.0f;  // 0x70f490
     if (len2(nsum) > 0) body_.meanNormal = normalize(nsum);
     bodyForces();
+    if (nitro_ > 0) nitroPush();  // [nitro]
     // 0x70dc20: F -> a, T -> alpha (no gyroscopic term for vehicles).
     body_.S.a = body_.F * body_.invMass;
     body_.S.alpha = body_.I1invW * body_.T;
+}
+
+void FuelVehicle::setNitro(float amount, float topSpeed) {  // [nitro]
+    nitro_ = amount, nitroTop_ = topSpeed;
+    rpmStretch_ = amount > 0 ? nitro::rpmStretch(amount, nitroParams()) : 1.0f;
+}
+
+// [DEVIATION nitro, physics/nitro.hpp] The boost's push: along the body's forward axis through the centre of mass (no
+// pitching torque: a bike does not wheelie), mass x thrustAccel (the amount, the strength, the fade below the lifted top
+// speed) while any wheel is on the ground (0x52e620: a bike on its back wheel pushes as hard); forward gears only, never
+// wrecked.
+void FuelVehicle::nitroPush() {
+    if (wrecked_ || gear_ < 1 || !anyWheelLoaded()) return;
+    const float a = nitro::thrustAccel(nitro_, vfwd_, nitroTop_, 1.0f, nitroParams());
+    if (a > 0) body_.addForceAt(fwd() * (a * body_.mass), body_.S.x);
 }
 
 // ---- body forces 0x522830 --------------------------------------------------------------------
@@ -644,6 +1064,7 @@ void FuelVehicle::aeroDrag() {  // 0x530d20
     BodyState& S = body_.S;
     const float k = 200.0f * body_.boundR * body_.boundR;
     float linF = allWheelsLoaded() ? P(93) : P(94);
+    if (nitro_ > 0) linF /= rpmStretch_ * rpmStretch_;  // [nitro] the boost's lifted top speed holds against the air too
     float angF = lerpf(P(100), P(98), clampf(speed_ / std::max(P(99), 1e-6f), 0, 1));
     if (wrecked_) linF *= 0.01f, angF *= 0.01f;
     // Coefficients applied per body axis (U2: Inferred frame).
@@ -677,7 +1098,7 @@ void FuelVehicle::antiRollLift() {  // 0x52c900
 void FuelVehicle::bodyForces() {
     BodyState& S = body_.S;
     const float m = body_.mass;
-    // 1. Drowned: strong lift (P288 < 0).
+    // 1. Caught by a tornado (+0x1420 == 2, P43/P61; p23's "drowned"): strong lift (P288 < 0).
     if (wrecked_ == 2) body_.addForceAt({0, P(288) * m * -4.0f, 0}, S.x);
     // 2. Aero drag.
     aeroDrag();
@@ -771,7 +1192,12 @@ void FuelVehicle::driveline() {
         float thr = engThrottle_;
         if (allWheelsLoaded()) thr *= 1 + std::max(0.0f, fwd().y) * P(328);
         if (!player_) thr *= 1.25f;
-        const float engAcc = thr * boostMul_ * engineTorque(rpm) * gearMul(gear_) / P(323) - (1 - engThrottle_) * rpm * P(329);
+        // [merge nitro + truck-power] the boost's torque gain (+0x13c0) is part of the governed extra torque: s =
+        // engine_power x torqueScale x boost (notes truck-power.md, "Merge into main"). Without a boost (+0x13c0 = 1)
+        // this is FUEL's thr x 1 x 0x524c70 bit for bit; nitroGoverned = false (bench) is main's ungoverned boost.
+        const float drive = nitroGoverned && boostMul_ != 1.0f ? thr * governedTorque(rpm, powerScale * torqueScale_ * boostMul_)
+                                                               : thr * boostMul_ * engineTorque(rpm);
+        const float engAcc = drive * gearMul(gear_) / P(323) - (1 - engThrottle_) * rpm * P(329);
         S.auxAcc[0] += engAcc;
         if (gear_ != 0 && P(377) >= 0.5f)
             for (int w = 0; w < nWheels_; ++w)
@@ -802,9 +1228,13 @@ void FuelVehicle::driveline() {
         const float om = S.auxVel[1 + w];
         const float sg = clampf(0.1f * om, -1, 1);
         const float load = std::min(100 * wheels_[size_t(w)].load, 1.0f);
-        const float boost = 0;  // boost is dead data (P633 = 0)
+        // boost is dead data (P633 = 0); [nitro] the port's boost blends FUEL's boost drag P92 in and scales the quadratic
+        // drag by 1 / stretch^2, so a vehicle this drag holds back (P92 = P91: the bikes) gains the same lifted top speed
+        // (both 0 / 1 without nitro: FUEL's drag).
+        const float boost = nitro_ > 0 ? nitro::wheelDragBlend(nitro_, nitroParams()) : 0.0f;
+        const float dragK = nitro_ > 0 ? 1.0f / (rpmStretch_ * rpmStretch_) : 1.0f;
         const float a = -((hbm ? hb : 0.0f) / I + B / I) * sg - (P(129) * C.hard + P(153) * C.soft) * C.rolling * load * om -
-                        ((1 - boost) * P(91) + boost * P(92)) * om * std::fabs(om) * load;
+                        ((1 - boost) * P(91) + boost * P(92)) * dragK * om * std::fabs(om) * load;
         S.auxAcc[1 + w] += a;
         dOmega_[w] += a;
     }
@@ -852,7 +1282,7 @@ void FuelVehicle::integrate(float h) {
 
 void FuelVehicle::postSubstep() {  // 0x5212d0 + 0x520790
     BodyState& S = body_.S;
-    S.auxVel[0] = clampf(std::max(S.auxVel[0], 500.0f), P(325), P(324));
+    S.auxVel[0] = clampf(std::max(S.auxVel[0], 500.0f), P(325), P(324) * rpmStretch_);  // [nitro] x 1 without a boost
     for (int w = 0; w < nWheels_; ++w) S.auxVel[1 + w] = clampf(S.auxVel[1 + w], -83.34f, 83.34f);
     const float clutch = std::min(clutchFraction(), notBraking());
     if (gear_ != 0 && P(377) >= 0.5f && clutch >= 0.99f) {
@@ -890,7 +1320,9 @@ void stepVehicles(const std::vector<FuelVehicle*>& vehicles, Environment& env, f
         for (FuelVehicle* v : vehicles) v->wheelUpdate();
         for (FuelVehicle* v : vehicles) v->generateContacts(env, vehicles);
         for (FuelVehicle* v : vehicles) v->forces();
+        if (FuelVehicle::substepHook) for (FuelVehicle* v : vehicles) FuelVehicle::substepHook(*v, 0);
         for (FuelVehicle* v : vehicles) v->driveline();
+        if (FuelVehicle::substepHook) for (FuelVehicle* v : vehicles) FuelVehicle::substepHook(*v, 1);
         for (FuelVehicle* v : vehicles) v->integrate(h);
         // Impulse pass 0x683ee0 (<= 5 iterations, tolerance 0.001).
         imp.clear();
@@ -917,6 +1349,7 @@ void stepVehicles(const std::vector<FuelVehicle*>& vehicles, Environment& env, f
             }
         }
         for (FuelVehicle* v : vehicles) v->postSubstep();
+        if (FuelVehicle::substepHook) for (FuelVehicle* v : vehicles) FuelVehicle::substepHook(*v, 2);
         remaining -= h;
     }
     for (FuelVehicle* v : vehicles) v->postStep(dt, env);

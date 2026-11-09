@@ -1,6 +1,7 @@
 // FUEL's AI racers: see race_ai.hpp and notes/p29-ai.md. Addresses are FUEL.exe (image base 0x400000).
 #include "race_ai.hpp"
 #include "core/road_graph.hpp"
+#include "core/spline_graph.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -378,6 +379,249 @@ void RaceLine::routeOnRoadGraph(const RoadGraph& graph, const std::function<floa
     for (size_t i = 1; i < path.size(); ++i) pathAlong[i] = pathAlong[i - 1] + std::hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]);
 }
 
+
+// ---- spline blocks (IAPathBlockSpline, world courses; P43) ------------------------------------
+
+namespace {
+// A crossing of a gate line with a lane edge (0x63df70 -> 0x63dda0): edge, segment, point, line parameter,
+// and the edge's direction against the gate (0x6253b0: segment direction . gate direction >= 0 = forward).
+struct LaneHit {
+    int edge = -1, seg = 0;
+    float x = 0, z = 0, t = 0;
+    bool fwd = true;
+};
+
+// 0x63df70: the nearest crossing (smallest t >= 0 along a -> b) with an edge carrying `flag` (0 = any edge).
+LaneHit nearestCrossing(const SplineGraph& g, const std::vector<uint32_t>& tags, float ax, float az, float bx, float bz, uint32_t flag) {
+    LaneHit best;
+    float bestT = 1e20f;
+    const float rx = bx - ax, rz = bz - az;
+    for (size_t e = 0; e < g.edges.size(); ++e) {
+        if (flag != 0 && (tags[e] & flag) == 0) continue;
+        for (int k = 0; k < 8; ++k) {
+            const auto& sg = g.edges[e].seg[size_t(k)];
+            const float sx = sg.p1[0] - sg.p0[0], sz = sg.p1[2] - sg.p0[2];
+            const float den = rx * sz - rz * sx;
+            if (std::fabs(den) < 1e-9f) continue;
+            const float qx = sg.p0[0] - ax, qz = sg.p0[2] - az;
+            const float t = (qx * sz - qz * sx) / den, u = (qx * rz - qz * rx) / den;
+            if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+            if (t <= bestT) bestT = t, best.edge = int(e), best.seg = k, best.t = t, best.x = ax + rx * t, best.z = az + rz * t;
+        }
+    }
+    return best;
+}
+
+// 0x625400: the three lane crossings of the gate line c +- n (W + 5), n = (-dz, dx), searched from the +n end:
+// the first (lane 0x10), then from 0.3 m past it the next (0x20), then the next (8). mode 0: any edge.
+bool gateCrossings(const SplineGraph& g, const std::vector<uint32_t>& tags, float cx, float cz, float dx, float dz, float W, bool mode,
+                   LaneHit out[3]) {
+    const float nx = -dz, nz = dx;
+    float ax = cx + nx * (W + 5), az = cz + nz * (W + 5);
+    const float bx = cx - nx * (W + 5), bz = cz - nz * (W + 5);
+    const uint32_t flags[3] = {0x10, 0x20, 8};
+    for (int i = 0; i < 3; ++i) {
+        out[i] = nearestCrossing(g, tags, ax, az, bx, bz, mode ? flags[i] : 0);
+        if (out[i].edge < 0) return false;
+        const auto& sg = g.edges[size_t(out[i].edge)].seg[size_t(out[i].seg)];
+        out[i].fwd = (sg.p1[2] - sg.p0[2]) * dz + dx * (sg.p1[0] - sg.p0[0]) >= 0;
+        ax = out[i].x - nx * 0.3f, az = out[i].z - nz * 0.3f;
+    }
+    return true;
+}
+
+bool near01(const std::array<float, 3>& a, const std::array<float, 3>& b) {
+    const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+    return x * x + y * y + z * z < 0.01f;
+}
+
+// 0x6256f0: from the start crossing's edge, at its far end the first edge (array order) with the lane flag
+// touching it, up to 32 edges or the end crossing's edge. Returns the lane polyline from the start crossing to
+// the end crossing, empty when the walk does not reach it (port: FUEL keeps the partial list).
+std::vector<std::array<float, 2>> walkLane(const SplineGraph& g, const std::vector<uint32_t>& tags, uint32_t flag, const LaneHit& a, const LaneHit& b,
+                                           std::vector<std::pair<int, bool>>* edges = nullptr) {
+    std::vector<std::array<float, 2>> P;
+    int cur = a.edge;
+    bool fwd = a.fwd;
+    std::vector<std::pair<int, bool>> list;
+    for (int n = 0; n < 32; ++n) {
+        list.push_back({cur, fwd});
+        if (cur == b.edge) break;
+        const std::array<float, 3> far = fwd ? g.edges[size_t(cur)].end() : g.edges[size_t(cur)].start();
+        int next = -1;
+        for (size_t e = 0; e < g.edges.size() && next < 0; ++e) {
+            if ((tags[e] & flag) == 0 || int(e) == cur) continue;
+            if (near01(g.edges[e].start(), far)) next = int(e), fwd = true;
+            else if (near01(g.edges[e].end(), far)) next = int(e), fwd = false;
+        }
+        if (next < 0) break;
+        cur = next;
+    }
+    if (list.back().first != b.edge) return P;
+    if (edges) *edges = list;  // PK19: the block's edge list (IAPathBlockSpline +0xc0, count +0x3e; 0x6256f0)
+    // The polyline: the start crossing, the segment points between, the end crossing.
+    P.push_back({a.x, a.z});
+    for (size_t i = 0; i < list.size(); ++i) {
+        const auto& E = g.edges[size_t(list[i].first)];
+        const bool f = list[i].second;
+        const bool last = i + 1 == list.size();
+        const int s0 = i == 0 ? a.seg : (f ? 0 : 7);
+        if (f) {
+            const int s1 = last ? b.seg - 1 : 7;
+            if (last && i == 0 && b.seg < a.seg) return {};
+            for (int k = s0; k <= s1; ++k) P.push_back({E.seg[size_t(k)].p1[0], E.seg[size_t(k)].p1[2]});
+        } else {
+            const int s1 = last ? b.seg + 1 : 0;
+            if (last && i == 0 && b.seg > a.seg) return {};
+            for (int k = s0; k >= s1; --k) P.push_back({E.seg[size_t(k)].p0[0], E.seg[size_t(k)].p0[2]});
+        }
+    }
+    P.push_back({b.x, b.z});
+    return P;
+}
+
+// Nearest crossing (from p along r) of the ray p -> p + r with a polyline; returns the parameter or -1.
+float rayPolyline(float px, float pz, float rx, float rz, const std::vector<std::array<float, 2>>& L) {
+    float best = -1;
+    for (size_t i = 0; i + 1 < L.size(); ++i) {
+        const float sx = L[i + 1][0] - L[i][0], sz = L[i + 1][1] - L[i][1];
+        const float den = rx * sz - rz * sx;
+        if (std::fabs(den) < 1e-9f) continue;
+        const float qx = L[i][0] - px, qz = L[i][1] - pz;
+        const float t = (qx * sz - qz * sx) / den, u = (qx * rz - qz * rx) / den;
+        if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+        if (best < 0 || t < best) best = t;
+    }
+    return best;
+}
+}  // namespace
+
+int RaceLine::routeOnSplineGraph(const SplineGraph& g, const std::vector<std::array<float, 2>>& gateDir, const std::vector<float>& gateHalf) {
+    splineEdges.clear();  // PK19
+    if (points.size() < 2 || gateDir.size() != points.size() || gateHalf.size() != points.size() || g.edges.empty()) return 0;
+    // Lane tags (0x627590 -> 0x625f80 clears 0x38, 0x625400 mode 0 on the first gate, 0x625fd0 flood fills).
+    std::vector<uint32_t> tags(g.edges.size(), 0);
+    {
+        LaneHit h[3];
+        if (!gateCrossings(g, tags, points[0][0], points[0][2], gateDir[0][0], gateDir[0][1], gateHalf[0], false, h)) return 0;
+        const uint32_t flags[3] = {0x10, 0x20, 8};
+        for (int i = 0; i < 3; ++i) {
+            std::vector<int> open{h[i].edge};
+            tags[size_t(h[i].edge)] |= flags[i];
+            while (!open.empty()) {
+                const int e = open.back();
+                open.pop_back();
+                const auto& E = g.edges[size_t(e)];
+                for (size_t f = 0; f < g.edges.size(); ++f) {
+                    if (tags[f] & flags[i]) continue;
+                    const auto& F = g.edges[f];
+                    if (near01(F.start(), E.start()) || near01(F.start(), E.end()) || near01(F.end(), E.start()) || near01(F.end(), E.end()))
+                        tags[f] |= flags[i], open.push_back(int(f));
+                }
+            }
+        }
+    }
+    std::vector<std::array<float, 2>> P;
+    std::vector<float> H, G;
+    P.push_back({points[0][0], points[0][2]});
+    H.push_back(pathHalf.empty() ? 30.0f : pathHalf[0]);
+    G.push_back(0);
+    int done = 0;
+    for (size_t k = 0; k + 1 < points.size(); ++k) {
+        // The spline block runs from gate k's exit (centre + dir) to gate k+1's entry (centre - dir, 0x623960(1));
+        // its half-width is the larger of the two checkpoint blocks' (0x627590).
+        const float W = std::max(gateHalf[k], gateHalf[k + 1]);
+        const auto& da = gateDir[k];
+        const auto& db = gateDir[k + 1];
+        LaneHit ha[3], hb[3];
+        std::vector<std::array<float, 2>> M, Lf, Rt;
+        std::vector<std::pair<int, bool>> mid;  // PK19: the middle lane's edge list
+        bool ok = gateCrossings(g, tags, points[k][0] + da[0], points[k][2] + da[1], da[0], da[1], W, true, ha) &&
+                  gateCrossings(g, tags, points[k + 1][0] - db[0], points[k + 1][2] - db[1], db[0], db[1], W, true, hb);
+        if (ok) {
+            M = walkLane(g, tags, 0x20, ha[1], hb[1], &mid);
+            Lf = walkLane(g, tags, 0x10, ha[0], hb[0]);
+            Rt = walkLane(g, tags, 8, ha[2], hb[2]);
+            ok = M.size() >= 2 && Lf.size() >= 2 && Rt.size() >= 2;
+            if (ok) {
+                // PK16 0x626400: the middle lane is cut at the sample spacing: the start crossing, then a point every
+                // 10 m along the lane polyline (the carry runs across the lane's vertices), none at the end crossing
+                // (the block's end gate is added below). (Before PK16 the lane's own vertices were the samples.)
+                std::vector<std::array<float, 2>> C{M[0]};
+                float want = 10.0f;
+                for (size_t i = 0; i + 1 < M.size(); ++i) {
+                    const float dx = M[i + 1][0] - M[i][0], dz = M[i + 1][1] - M[i][1], len = std::hypot(dx, dz);
+                    if (len < 1e-6f) continue;
+                    while (want < len) {
+                        C.push_back({M[i][0] + dx * (want / len), M[i][1] + dz * (want / len)});
+                        want += 10.0f;
+                    }
+                    want -= len;
+                }
+                if (C.size() < 2) C.push_back(M.back());
+                M = std::move(C);
+            }
+        }
+        if (std::getenv("FUEL_AI_PATHDUMP"))
+            std::printf("  spline stretch %zu: gate (%.1f, %.1f) dir (%.2f, %.2f) half %.1f -> (%.1f, %.1f) dir (%.2f, %.2f) half %.1f: %s\n", k, points[k][0],
+                        points[k][2], da[0], da[1], gateHalf[k], points[k + 1][0], points[k + 1][2], db[0], db[1], gateHalf[k + 1], ok ? "lanes" : "kept");
+        if (ok) {
+            // 0x626a30: per middle-lane point (normal from its neighbours, the last from its predecessor) a 200 m
+            // ray to each side; 0x625900 finds the outer lane's nearest crossing unless the ray crosses the previous
+            // cross-section (0x75a590: then the previous crossing is kept). The sample is the midpoint of
+            // P + n |hl - P| and P - n |hr - P|, half their distance its half-width.
+            std::array<float, 2> hl{ha[0].x, ha[0].z}, hr{ha[2].x, ha[2].z};   // the lanes' crossings of the gate line
+            std::array<float, 2> el = hl, er = hr;                               // previous cross-section ends
+            auto crosses = [](const std::array<float, 2>& a, const std::array<float, 2>& b, const std::array<float, 2>& c, const std::array<float, 2>& d) {
+                const float rx = b[0] - a[0], rz = b[1] - a[1], sx = d[0] - c[0], sz = d[1] - c[1];
+                const float den = rx * sz - rz * sx;
+                if (std::fabs(den) < 1e-9f) return false;
+                const float qx = c[0] - a[0], qz = c[1] - a[1];
+                const float t = (qx * sz - qz * sx) / den, u = (qx * rz - qz * rx) / den;
+                return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+            };
+            for (size_t i = 0; i < M.size(); ++i) {
+                const auto& a = M[i == 0 ? 0 : i - 1];
+                const auto& b = M[i + 1 < M.size() ? i + 1 : i];
+                float nx = -(b[1] - a[1]), nz = b[0] - a[0];
+                const float nl = std::hypot(nx, nz);
+                if (nl > 1e-6f) nx /= nl, nz /= nl;
+                const std::array<float, 2> p = M[i];
+                const std::array<float, 2> qL{p[0] + nx * 200, p[1] + nz * 200}, qR{p[0] - nx * 200, p[1] - nz * 200};
+                if (!crosses(p, qL, el, er)) {
+                    const float t = rayPolyline(p[0], p[1], nx * 200, nz * 200, Lf);
+                    if (t >= 0) hl = {p[0] + nx * 200 * t, p[1] + nz * 200 * t};
+                }
+                if (!crosses(p, qR, el, er)) {
+                    const float t = rayPolyline(p[0], p[1], -nx * 200, -nz * 200, Rt);
+                    if (t >= 0) hr = {p[0] - nx * 200 * t, p[1] - nz * 200 * t};
+                }
+                const float dl = std::hypot(hl[0] - p[0], hl[1] - p[1]), dr = std::hypot(hr[0] - p[0], hr[1] - p[1]);
+                el = {p[0] + nx * dl, p[1] + nz * dl}, er = {p[0] - nx * dr, p[1] - nz * dr};
+                P.push_back({(el[0] + er[0]) * 0.5f, (el[1] + er[1]) * 0.5f});
+                H.push_back(std::max((dl + dr) * 0.5f, 1.0f));
+            }
+            P.push_back({points[k + 1][0], points[k + 1][2]});
+            H.push_back(H.back());
+            ++done;
+            splineEdges.push_back(std::move(mid));  // PK19: a spline block (kind 5) in path order
+        } else {
+            // The stretch as already routed (road / plain blocks).
+            const float a = k < gateAlong.size() ? gateAlong[k] : 0, b = k + 1 < gateAlong.size() ? gateAlong[k + 1] : a;
+            for (size_t i = 0; i < path.size(); ++i)
+                if (pathAlong[i] > a + 1e-3f && pathAlong[i] <= b + 1e-3f) P.push_back(path[i]), H.push_back(pathHalf[i]);
+            if (P.back()[0] != points[k + 1][0] || P.back()[1] != points[k + 1][2]) P.push_back({points[k + 1][0], points[k + 1][2]}), H.push_back(30.0f);
+        }
+        float acc = 0;
+        for (size_t i = 1; i < P.size(); ++i) acc += std::hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+        G.push_back(acc);
+    }
+    path = P, pathHalf = H, gateAlong = G;
+    pathAlong.assign(path.size(), 0);
+    for (size_t i = 1; i < path.size(); ++i) pathAlong[i] = pathAlong[i - 1] + std::hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]);
+    return done;
+}
+
 float RaceLine::progress(size_t next, double x, double z) const {
     if (next + 1 >= points.size()) return length();
     const auto& b = points[next + 1];
@@ -400,6 +644,13 @@ std::array<float, 3> RaceLine::at(float s, float* dx, float* dz) const {
     if (path.empty()) return {0, 0, 0};
     if (path.size() == 1) return {path[0][0], 0, path[0][1]};
     s = std::clamp(s, 0.0f, pathLength() + finishRun);
+    if (s > pathLength()) {  // PK16: the finish block, along its own direction (0x627590: the last gate's dir * 100)
+        const auto fd = finishDirection();
+        if (dx) *dx = fd[0];
+        if (dz) *dz = fd[1];
+        const float t = s - pathLength();
+        return {path.back()[0] + fd[0] * t, 0.0f, path.back()[1] + fd[1] * t};
+    }
     size_t i = size_t(std::upper_bound(pathAlong.begin(), pathAlong.end(), s) - pathAlong.begin());
     i = i == 0 ? 0 : i - 1;
     i = std::min(i, path.size() - 2);
@@ -422,8 +673,7 @@ float RaceLine::project(double x, double z, float lo, float hi) const {
     float best = lo, bestD = std::numeric_limits<float>::max();
     for (size_t i = 0; i + 1 < path.size(); ++i) {
         const float a = pathAlong[i];
-        const bool last = i + 2 == path.size();
-        const float b = last ? pathAlong[i + 1] + finishRun : pathAlong[i + 1];
+        const float b = pathAlong[i + 1];
         if (b < lo || a > hi) continue;
         const float len = pathAlong[i + 1] - a;
         if (len < 1e-3f) continue;
@@ -434,7 +684,73 @@ float RaceLine::project(double x, double z, float lo, float hi) const {
         const float d = float(std::hypot(x - px, z - pz));
         if (d < bestD) bestD = d, best = a + t;
     }
+    if (finishRun > 0) {  // PK16: the finish block (the gate's direction)
+        const float a = pathLength(), b = a + finishRun;
+        if (!(b < lo || a > hi)) {
+            const auto fd = finishDirection();
+            const auto& e = path.back();
+            float t = float((x - e[0]) * fd[0] + (z - e[1]) * fd[1]);
+            t = std::clamp(t, std::max(0.0f, lo - a), std::min(b, hi) - a);
+            const float px = e[0] + fd[0] * t, pz = e[1] + fd[1] * t;
+            const float d = float(std::hypot(x - px, z - pz));
+            if (d < bestD) bestD = d, best = a + t;
+        }
+    }
     return best;
+}
+
+void RaceLine::setFinishDir(float dx, float dz) {
+    const float l = std::hypot(dx, dz);
+    if (l < 1e-3f) return;
+    finishDir = {dx / l, dz / l};
+    hasFinishDir = true;
+}
+
+std::array<float, 2> RaceLine::finishDirection() const {
+    if (hasFinishDir) return finishDir;
+    for (size_t i = path.size(); i >= 2; --i) {  // the last path segment's direction
+        const float dx = path[i - 1][0] - path[i - 2][0], dz = path[i - 1][1] - path[i - 2][1], l = std::hypot(dx, dz);
+        if (l > 1e-3f) return {dx / l, dz / l};
+    }
+    return {0, 1};
+}
+
+// 0x624310 / 0x624490: the finish block's parking line. A = the last gate's exit (centre + dir, 0x623960), the
+// block's end B = A + dir * 100 (0x627590); the target T = A + dist * dir + 6 m sideways: (-dz, dx) for an even rank,
+// (dz, -dx) for an odd one (rank & 0x80000001 == 0); none for rank -1.
+RaceLine RaceLine::parkingLine(int rank, float dist) const {
+    RaceLine L = *this;
+    if (path.size() < 2) return L;
+    const auto fd = finishDirection();
+    const std::array<float, 2> A{path.back()[0] + fd[0], path.back()[1] + fd[1]};
+    float ox = 0, oz = 0;
+    if (rank != -1) {
+        if ((rank & 1) == 0) ox = -fd[1] * 6.0f, oz = fd[0] * 6.0f;
+        else ox = fd[1] * 6.0f, oz = -fd[0] * 6.0f;
+    }
+    const std::array<float, 2> T{A[0] + fd[0] * dist + ox, A[1] + fd[1] * dist + oz};
+    L.path.push_back(A), L.path.push_back(T);
+    L.pathHalf.push_back(30.0f), L.pathHalf.push_back(30.0f);  // IAPathBlock default +0x18 = 30
+    L.pathAlong.push_back(pathAlong.back() + 1.0f);
+    L.pathAlong.push_back(L.pathAlong.back() + std::hypot(T[0] - A[0], T[1] - A[1]));
+    L.finishRun = 0;
+    return L;
+}
+
+float RaceLine::distanceLeft(double x, double z, float s, float straight) const {
+    if (path.size() < 2) return 0.0f;
+    const float total = pathLength();
+    const auto fd = finishDirection();
+    const auto foot = at(std::min(s, total));
+    const float S1 = std::max(0.0f, total - s) + fd[0] * (foot[0] - float(x)) + fd[1] * (foot[2] - float(z));
+    const float bx = path.back()[0] + fd[0] * (1.0f + 100.0f), bz = path.back()[1] + fd[1] * (1.0f + 100.0f);
+    const float S2 = float(std::hypot(bx - x, bz - z));
+    float v = std::max(S1, S2);
+    if (straight >= 0) {
+        v = std::max(v, straight);
+        if (v > 20.0f * straight) v = 20.0f * straight;
+    }
+    return v;
 }
 
 float RaceLine::halfWidth(float s) const {
@@ -448,29 +764,138 @@ float RaceLine::halfWidth(float s) const {
 
 // ---- 0x61a9d0 IA_PropagateCorridor -----------------------------------------------------------
 
-void aiPropagateCorridor(std::vector<AiSample>& S, int idx, const std::vector<AiObstacle>& obstacles) {
-    const int n = int(S.size()) - 1;
-    for (int i = idx + 1; i <= n; ++i) {
+void aiPropagateCorridor(std::vector<AiSample>& S, int idx, const std::vector<AiObstacle>& O, float ghostLat) {
+    const int n = int(S.size()) - 1;  // racer +0x218
+    size_t c = 0;                     // the list cursor (DAT_00a062cc chain)
+    // The ghost's own sample.
+    if (idx >= 0 && idx <= n) {
+        AiSample& a = S[size_t(idx)];
+        while (c < O.size()) {
+            const AiObstacle& o = O[c];
+            if (idx < o.sample) break;
+            ++c;
+            if (!(idx <= o.sample && o.lo <= a.latMax && a.latMin <= o.hi)) continue;
+            if (o.lo <= a.latMin && a.latMax < o.hi) {
+                a.latMin = o.lo, a.latMax = o.hi;
+                break;
+            }
+            if ((o.lo + o.hi) * 0.5f <= ghostLat) a.latMin = o.hi;
+            else a.latMax = o.lo;
+        }
+    }
+    for (int i = idx + 1; i < n; ++i) {
         if (i > 0) {  // widen by at most 0.1 per metre of the previous segment
             S[size_t(i)].latMin = std::max(S[size_t(i)].latMin, S[size_t(i - 1)].latMin - S[size_t(i - 1)].seg * 0.1f);
             S[size_t(i)].latMax = std::min(S[size_t(i)].latMax, S[size_t(i - 1)].latMax + S[size_t(i - 1)].seg * 0.1f);
         }
-        // Obstacles on this sample (type 4 records of 0x619210): keep the wider of the two gaps.
-        float lo = S[size_t(i)].latMin, hi = S[size_t(i)].latMax;
-        for (const AiObstacle& o : obstacles) {
-            if (o.sample != i || !(o.lo < hi && lo < o.hi)) continue;
-            if (lo <= o.lo) {
-                if (o.hi <= hi) {
-                    if (o.lo - lo <= hi - o.hi) lo = o.hi;
-                    else hi = o.lo;
+        if (c >= O.size()) continue;
+        float best = -1e6f, bLo = 0, bHi = 0;
+        float hi = S[size_t(i)].latMax, lo = S[size_t(i)].latMin, cur = lo;
+        while (c < O.size() && O[c].sample == i) {
+            const AiObstacle& o = O[c];
+            cur = lo;
+            if (lo < o.hi && o.lo < hi) {
+                if (o.type == 2) {  // drive into it: clamp and skip the rest of this sample's records
+                    if (lo <= o.lo) cur = o.lo;
+                    if (o.hi <= hi) hi = o.hi;
+                    while (c < O.size() && O[c].sample == i) ++c;
+                    lo = cur;
+                    break;
+                }
+                if (o.type == 3 && best < hi - lo) bLo = std::max(o.lo, lo), bHi = std::max(o.hi, hi), best = hi - lo;
+                if (lo <= o.lo) {
+                    if (o.hi <= hi) {
+                        const float left = o.lo - lo;
+                        if (left <= hi - o.hi) {
+                            if (best < left) bHi = o.lo, cur = o.hi, best = left, bLo = lo;
+                        } else {
+                            hi = o.lo;
+                        }
+                    } else {
+                        hi = o.lo;
+                    }
                 } else {
-                    hi = o.lo;
+                    cur = o.hi;
+                    if (hi < o.hi) hi = o.lo;
+                }
+            }
+            ++c;
+            lo = cur;
+        }
+        if (hi - lo < best) lo = bLo, hi = bHi;
+        if (0 < hi - lo) S[size_t(i)].latMin = lo, S[size_t(i)].latMax = hi;
+    }
+}
+
+void aiBoxObstacles(const std::vector<AiSample>& S, const float p[12], const float half[3], float r, int type, float margin, float halfWidth,
+                    std::vector<AiObstacle>& out) {
+    // Half-axis vectors (x, z) and the centre.
+    const float ax = p[0] * half[0], az = p[2] * half[0], bx = half[1] * p[4], bz = p[6] * half[1], cx = half[2] * p[8], cz = half[2] * p[10];
+    const float ox = p[3], oz = p[11];
+    const float w = halfWidth + margin;
+    float cum = 0, prevSeg = 0;
+    const int n = int(S.size()) - 1;
+    auto record = [&](int k, float lo, float hi, float s0, float s1) {
+        AiObstacle o;
+        o.lo = lo, o.hi = hi, o.s0 = s0 + cum, o.s1 = s1 + cum, o.sample = k, o.type = type;
+        if ((type == 2 || type == 3) && p[2] * S[size_t(k)].dz + S[size_t(k)].dx * p[0] < 0.7f) o.type = 0;
+        out.push_back(o);
+    };
+    for (int k = 0; k < n; ++k) {
+        cum += prevSeg;
+        const AiSample& a = S[size_t(k)];
+        const float seg = a.seg, dx = a.dx, dz = a.dz;
+        prevSeg = seg;
+        if (r < 15.0f) {
+            const float rx = ox - a.x, rz = oz - a.z;
+            const float al = rx * dx + rz * dz;
+            const float ext = std::fabs(ax * dx + az * dz) + std::fabs(bx * dx + bz * dz) + std::fabs(cx * dx + cz * dz);
+            float s0 = al - ext - 3.0f, s1 = al + ext;
+            if (!(s0 <= seg && 0.0f <= s1)) continue;
+            s0 = std::max(s0, 0.0f), s1 = std::min(s1, seg);
+            const float la = rz * dx - rx * dz;
+            const float extL = std::fabs(az * dx - ax * dz) + std::fabs(bz * dx - bx * dz) + std::fabs(cz * dx - cx * dz);
+            const float lo = la - extL - w, hi = w + la + extL;
+            if (lo <= a.latMax && a.latMin <= hi) record(k, lo, hi, s0, s1);
+            continue;
+        }
+        // Large boxes: the 12 edges (corner pairs of the table at 0xa021f0), clipped to the strip [0, seg].
+        float C[8][2];
+        for (int i = 0; i < 8; ++i) {
+            const float sa = (i & 4) ? -1.0f : 1.0f, sb = (i & 2) ? -1.0f : 1.0f, sc = (i & 1) ? -1.0f : 1.0f;
+            C[i][0] = ox - a.x + sa * ax + sb * bx + sc * cx;
+            C[i][1] = oz - a.z + sa * az + sb * bz + sc * cz;
+        }
+        static const int E[12][2] = {{0, 2}, {2, 3}, {3, 1}, {1, 0}, {4, 6}, {6, 7}, {7, 5}, {5, 4}, {0, 4}, {2, 6}, {3, 7}, {1, 5}};  // the cube's edges
+        float latLo = 1e6f, latHi = -1e6f, alHi = -1e6f, alLo = 1e6f;
+        for (const auto& e : E) {
+            float a1 = C[e[0]][1] * dz + C[e[0]][0] * dx, a2 = C[e[1]][1] * dz + C[e[1]][0] * dx;
+            if ((a1 > seg && a2 > seg) || (a1 <= 0 && a2 <= 0)) continue;
+            float l1 = C[e[0]][0] * -dz + C[e[0]][1] * dx, l2 = -dz * C[e[1]][0] + C[e[1]][1] * dx;
+            if ((l1 > a.latMax && l2 > a.latMax) || (l1 <= a.latMin && l2 <= a.latMin)) continue;
+            if (seg < a1) {
+                if (a1 - a2 < 0.001f) continue;
+                l1 = (l1 - l2) * ((seg - a2) / (a1 - a2)) + l2, a1 = seg;
+            } else if (a1 < 0) {
+                if (a2 - a1 < 0.001f) continue;
+                l1 = l2 - (a2 / (a2 - a1)) * (l2 - l1), a1 = 0;
+            }
+            if (a2 <= seg) {
+                if (a2 < 0) {
+                    if (a1 - a2 < 0.001f) continue;
+                    l2 = l1 - (a1 / (a1 - a2)) * (l1 - l2), a2 = 0;
                 }
             } else {
-                lo = o.hi;
+                if (a2 - a1 < 0.001f) continue;
+                l2 = (l2 - l1) * ((seg - a1) / (a2 - a1)) + l1, a2 = seg;
             }
+            latLo = std::min(latLo, std::min(l1, l2)), latHi = std::max(latHi, std::max(l1, l2));
+            alHi = std::max(alHi, std::max(a1, a2)), alLo = std::min(alLo, std::min(a1, a2));
         }
-        if (hi - lo > 0) S[size_t(i)].latMin = lo, S[size_t(i)].latMax = hi;
+        if (0.0001f <= latHi - latLo && 0.0001f <= alHi - alLo) {
+            const float lo = latLo - w, hi = w + latHi;
+            if (lo <= a.latMax && a.latMin <= hi) record(k, lo, hi, alLo, alHi);
+        }
     }
 }
 
@@ -649,6 +1074,13 @@ void RaceDriver::setTarget(float targetTime, int level) {
     level_ = float(level);
 }
 
+size_t aiPassCheckpointBlocks(const RaceLine& line, size_t cursor, float s, AiCheckpointFlag& flag) {
+    // IAPath_Progress walks the blocks while vf04 returns 1 (the cut point projects past a block's end); the checkpoint
+    // block's vf04 then sets +0x21 / +0x24 when its index +0x2c differs from +0x24 (asm 0x624297..0x6242aa).
+    while (cursor < line.gateAlong.size() && s > line.gateAlong[cursor] + 1.0f) flag.passed(int(cursor++));
+    return cursor;
+}
+
 void RaceDriver::restart() {
     started_ = physical_ = airborne_ = false;
     v_ = {}, f_ = {0, 0, 1}, n_ = {0, 1, 0}, hist_ = {};
@@ -658,7 +1090,10 @@ void RaceDriver::restart() {
     followT_ = followCap_ = 0;
     corners_.clear();
     samples_.clear();
+    cpCursor_ = 0, cpFlag_ = {};  // rain-ai
     resets_ = 0;
+    finishState_ = 0, park_.reset();  // PK16
+    histPos_ = histVel_ = acc_ = {}, histDt_ = 1000.0f, histInit_ = false, lean_.reset();  // PK31: 0x617aa0 / 0x61c150
     // 0x616d70: S+0x18 by class (row = grid row); S+0x14 = S+0x44 = S+0x18; S+0x3c = 0, S+0x48 = 1, S+0x4c = 0.
     const float K = target_, row = float(row_);
     switch (mode_) {
@@ -761,9 +1196,16 @@ float RaceDriver::budget(float r, const Sense& s, float dt) {
     return m;
 }
 
-RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float dt) {
+RaceDriver::Command RaceDriver::step(const RaceLine& raceLine, const Sense& s, float dt) {
     Command cmd;
-    const float total = line.pathLength();
+    const float total = raceLine.pathLength();
+    // PK16 0x61b630: the gate check's result 4 (finished) writes the finish rank and the parking distance into the
+    // path requests: the finish block becomes the line to the parking spot T (0x624310 / 0x624490).
+    if (s.finishRank >= 0 && finishState_ == 0) {
+        finishState_ = 4;
+        park_ = raceLine.parkingLine(s.finishRank, float(s.aiCount - s.finishRank + 1) * 6.0f + 5.0f);
+    }
+    const RaceLine& line = park_ ? *park_ : raceLine;
     if (!started_) {
         started_ = true;
         g_ = gPrev_ = s.pos;
@@ -775,7 +1217,7 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
     }
     // Physics switch (0x5cb6f0): on with rank < 4 within 150 m, off past rank 3 or 165 m.
     const bool wasPhysical = physical_;
-    physical_ = s.forcePhysical || (physical_ ? (s.rank <= 3 && s.playerDist <= 165.0f) : (s.rank < 4 && s.playerDist <= 150.0f));
+    physical_ = s.forcePhysical || (physical_ ? (s.rank <= 3 && s.switchDist <= 165.0f) : (s.rank < 4 && s.switchDist <= 150.0f));
     // Ghost tracking (0x619330): a simulated vehicle drags the ghost along the ghost's own direction.
     if (physical_) {
         if (!wasPhysical) v_ = s.vel;  // (0x5cb6f0 hands the velocity over; nothing to do the other way)
@@ -783,8 +1225,37 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
         g_[0] += f_[0] * d, g_[2] += f_[2] * d;
         g_[1] = s.pos[1];
     }
+    // PK31: 0x619330's acceleration estimate from the vehicle position (the second difference, each step divided by
+    // the PREVIOUS frame's dt +0x1100, 1000 at init: the first frames read ~0).
+    {
+        if (!histInit_) histInit_ = true, histPos_ = {float(s.pos[0]), float(s.pos[1]), float(s.pos[2])};
+        const double inv = 1.0 / double(histDt_);
+        std::array<float, 3> v;
+        for (int k = 0; k < 3; ++k) v[size_t(k)] = float(inv * (double(float(s.pos[size_t(k)])) - histPos_[size_t(k)]));
+        for (int k = 0; k < 3; ++k) acc_[size_t(k)] = float(inv * (double(v[size_t(k)]) - histVel_[size_t(k)]));
+        histPos_ = {float(s.pos[0]), float(s.pos[1]), float(s.pos[2])};
+        histVel_ = v;
+        histDt_ = dt;
+    }
     const float sLo = s_ - 30.0f, sHi = s_ + 60.0f;
     s_ = line.project(g_[0], g_[2], sLo, sHi);
+    // 0x624310 vf04: on the finish block the ghost's nearest point on A -> T reaching T, or within 5 m of it, parks
+    // the racer (path +0x38 = 1); 0x61de60 then stops the ghost (state 5).
+    bool parked = false;
+    if (finishState_ == 4 && park_ && line.path.size() >= 3) {
+        const auto& A = line.path[line.path.size() - 2];
+        const auto& T = line.path.back();
+        if (s_ >= line.pathAlong[line.path.size() - 2] - 1e-3f) {
+            const float ex = T[0] - A[0], ez = T[1] - A[1], l2 = ex * ex + ez * ez;
+            const float u = l2 > 0 ? float((g_[0] - A[0]) * ex + (g_[2] - A[1]) * ez) / l2 : 1.0f;
+            if (u >= 1.0f) {
+                parked = true;
+            } else {
+                const float t = std::max(u, 0.0f);
+                parked = std::hypot(T[0] - (A[0] + ex * t), T[1] - (A[1] + ez * t)) < 5.0f;
+            }
+        }
+    }
     if (s.frozen) {
         cmd.physical = true;
         cmd.input = {0, 0, 0, true};
@@ -798,7 +1269,10 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
     }
     bool resetNow = s.overturned;
     const float moved = float(std::hypot(g_[0] - gPrev_[0], g_[2] - gPrev_[2]) + std::fabs(g_[1] - gPrev_[1]));
-    if (moved <= dt * 1.0f) {
+    if (finishState_ >= 4) {
+        // 0x61c970: only a racer still in the race (state < 4) detects being stuck.
+        if (!reversing_) stuck_ = -1.0f, reverseT_ = 0;
+    } else if (moved <= dt * 1.0f) {
         stuck_ += dt;
         if (stuck_ > 1.0f && !reversing_) reversing_ = true;
         if (stuck_ > 4.0f) resetNow = true;
@@ -819,7 +1293,7 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
         float dx = 0, dz = 1;
         const auto p = line.at(sr, &dx, &dz);
         float nrm[3] = {0, 1, 0};
-        const float h = s.ground ? s.ground(p[0], p[2], nrm) : p[1];
+        const float h = s.ghostGround ? s.ghostGround(p[0], g_[1], p[2], nrm) : s.ground ? s.ground(p[0], p[2], nrm) : p[1];
         g_ = gPrev_ = {p[0], h, p[2]};
         f_ = {dx, 0, dz};
         v_ = {};
@@ -838,11 +1312,14 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
     // Path samples (0x6182b0 -> 0x6291f0(200 m, 10 m)): from the ghost's place on the line, re-cut
     // once the ghost is past the second sample; corridor = the block's half-width.
     auto sampleFrom = [&](float sStart) {
+        // rain-ai: the cut moves the path cursor (IAPath_Progress 0x628750 at the cut point, 0x6182b0); the checkpoint
+        // blocks it runs past raise the request's flag (IAPathBlockCheckpoint::vf04 0x624210).
+        cpCursor_ = aiPassCheckpointBlocks(line, cpCursor_, sStart, cpFlag_);
         samples_.clear();
         staticObs_.clear();
         for (int k = 0; k <= 20; ++k) {
             const float sk = sStart + 10.0f * float(k);
-            if (sk > total + line.finishRun) break;
+            if (sk > line.pathLength() + line.finishRun) break;  // (PK16: the parking line's own length)
             const auto p = line.at(sk);
             AiSample a;
             a.x = p[0], a.z = p[2];
@@ -869,7 +1346,8 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
         // Ground too steep to drive up (stand-in for the off-road blocks' ATV path finder, whose step cost
         // 0x61e710 refuses a rise of more than 0.5 per cell): lateral spans of a cross-section where the
         // ground climbs more than 0.5 along the line over 4 m.
-        if (s.ground && samples_.size() > 1) {
+        static const bool steepStandIn = !(std::getenv("FUEL_AI_STEEP") && std::atoi(std::getenv("FUEL_AI_STEEP")) == 0);
+        if (steepStandIn && s.ground && samples_.size() > 1) {
             float nrm[3];
             for (size_t k = 1; k < samples_.size(); ++k) {
                 const AiSample& a = samples_[k];
@@ -881,13 +1359,41 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
                     const bool steep = rise > 0.5f;
                     if (steep && !inRun) runLo = l, inRun = true;
                     if ((!steep || l + 3.0f > a.latMax + 0.01f) && inRun) {
-                        staticObs_.push_back({runLo - 1.5f - s.own.radius, (steep ? l : l - 3.0f) + 1.5f + s.own.radius, int(k)});
+                        staticObs_.push_back({runLo - 1.5f - s.own.radius, (steep ? l : l - 3.0f) + 1.5f + s.own.radius, int(k), 0, a.cum, a.cum + a.seg});
                         inRun = false;
                     }
                 }
             }
         }
-        if (s.statics && samples_.size() > 1) {
+        if (s.boxes && samples_.size() > 1) {
+            // FUEL (P58): the static objects' collision boxes (0x61a080 -> 0x6188e0 bounds, 0x639ba0 gather, 0x619d70
+            // per box, 0x6189b0 projection; margin 2.0 [0x99601c]). Boxes flagged 0x4000000 are ramps: type 2 (drive
+            // into it) on the AI trails (road types 0-3 under the box, 0x6176f0) or when the world's random byte there
+            // is >= 0.5, else 3.
+            double x0 = 1e30, z0 = 1e30, x1 = -1e30, z1 = -1e30;
+            for (const AiSample& a : samples_) {
+                const float r = std::max(-a.latMin, a.latMax);
+                x0 = std::min(x0, double(a.x - r)), x1 = std::max(x1, double(a.x + r));
+                z0 = std::min(z0, double(a.z - r)), z1 = std::max(z1, double(a.z + r));
+            }
+            std::vector<DriveWorld::WorldBox> boxes;
+            s.boxes(x0, z0, x1, z1, boxes);
+            for (const auto& b : boxes) {
+                int type = 0;
+                if ((b.type & 0x1c000000u) == 0x4000000u) {
+                    const float bx = b.frame[3], bz = b.frame[11];
+                    const int rt = s.roadType ? s.roadType(bx, bz) : -1;
+                    bool into = rt >= 0 && rt <= 3;
+                    if (!into) {  // 0x640700: world +0x5bc84 byte table (filled at run time, not found; a fixed hash here)
+                        uint32_t h = uint32_t(std::lrint(bz * 10.193578f + bx * 12.317513f) & 0xff) * 2654435761u;
+                        h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
+                        into = float(h & 0xff) / 255.0f >= 0.5f;
+                    }
+                    type = into ? 2 : 3;
+                }
+                aiBoxObstacles(samples_, b.frame.data(), b.half.data(), b.r, type, 2.0f, s.own.halfWidth, staticObs_);
+            }
+        } else if (s.statics && samples_.size() > 1) {
             double x0 = 1e30, z0 = 1e30, x1 = -1e30, z1 = -1e30;
             for (const AiSample& a : samples_) {
                 const float r = std::max(-a.latMin, a.latMax);
@@ -912,10 +1418,14 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
                     }
                     if (amax < -samples_[k - 1].seg * 0.5f || amin > a.seg * 0.5f) continue;
                     if (lmax < a.latMin || lmin > a.latMax) continue;
-                    staticObs_.push_back({lmin - s.own.radius, lmax + s.own.radius, int(k)});
+                    AiObstacle o;
+                    o.lo = lmin - s.own.radius, o.hi = lmax + s.own.radius, o.sample = int(k), o.s0 = a.cum;
+                    staticObs_.push_back(o);
                 }
             }
         }
+        // The list is kept sorted by the along start (0x6189b0 inserts in order).
+        std::stable_sort(staticObs_.begin(), staticObs_.end(), [](const AiObstacle& a, const AiObstacle& b) { return a.s0 < b.s0; });
     };
     if (samples_.size() < 3) sampleFrom(s_);
     // Where the ghost is on the samples (0x618780 / 0x6178a0).
@@ -937,6 +1447,8 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
             samples_[k].latMin = -hw, samples_[k].latMax = hw;
         }
     }
+    // rain-ai: 0x6182b0's checkpoint-block check after the cut, every frame (asm 0x618466..0x6184d0).
+    cmd.checkpointBlock = cpFlag_.frame();
     const float sRel = s_ - s0Abs;
     // The ghost's lateral offset on the samples.
     const AiSample& si = samples_[size_t(idx)];
@@ -958,7 +1470,7 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
             lo = std::max(ghostLat + 0.5f, ghostLat + lat - rSum - 1.0f), hi = 100.0f;
             if (!(lo < samples_[size_t(idx)].latMax)) continue;
         }
-        for (int k = idx; k < idx + 2 && k < int(samples_.size()); ++k) obstacles.push_back({lo, hi, k});
+        for (int k = idx; k < idx + 2 && k < int(samples_.size()); ++k) obstacles.push_back({lo, hi, k, 4, samples_[size_t(k)].cum, samples_[size_t(k)].cum});
         // About to hit it within 2 s (0x619f40, time to contact of the two discs on the current
         // velocities; argument order not confirmed, notes): hold its speed for a moment (+0xec0/+0xec4).
         if (along > 0) {
@@ -970,7 +1482,8 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
             if (ttc >= 0 && ttc < 2.0f) followT_ = 0.01f, followCap_ = hyp(o.vx, o.vz);
         }
     }
-    aiPropagateCorridor(samples_, idx, obstacles);
+    std::stable_sort(obstacles.begin(), obstacles.end(), [](const AiObstacle& a, const AiObstacle& b) { return a.s0 < b.s0; });
+    aiPropagateCorridor(samples_, idx, obstacles, ghostLat);
     // The line and the aim (0x61acb0); none: 20 m straight on.
     float aim[2];
     const float p0[2] = {float(g_[0]), float(g_[2])};
@@ -988,17 +1501,27 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
     cap_ = gain_ / m * remaining;
     if (remaining < 100.0f) cap_ = std::max(cap_, hyp(v_[0], v_[2]));
     updateAccel(s, dt, w, r);
+    if (nitro_ > 0) nitroApply(cap_, accel_);  // [nitro] physics/ai_nitro.cpp
     float target = cap_;
     if (!reversing_) {
         if (followT_ > 0 && followCap_ < target) target = followCap_;
         if (s.tables) {
-            const float c = aiCornerSpeed(corners_, *s.tables, g_[0], g_[2]);
+            float c = aiCornerSpeed(corners_, *s.tables, g_[0], g_[2]);
+            if (c > -1.0f) c *= cornerScale_;  // [upgrades U4] the racer's tyre stage (1 = FUEL)
             if (c > -1.0f && c < target) target = c;
         }
     }
     // 0x61de60: above the cap the speed decays by 0.9985 a millisecond; below it grows at S+4 less 0.1 v.
     float speed = hyp(v_[0], v_[2]);
-    if (target <= speed) {
+    if (finishState_ == 4) {
+        // Finished (state 4): parked -> stop (state 5); else slow by 0.5 v dt, at least 4 m/s, along the finish line.
+        if (parked) {
+            finishState_ = 5;
+            speed = 0;
+        } else {
+            speed = std::max(4.0f, speed - 0.5f * speed * dt);
+        }
+    } else if (target <= speed) {
         for (float t = 0; t < dt; t += 0.001f) speed *= 0.9985f;
         speed = std::max(speed, target);
     } else {
@@ -1020,7 +1543,12 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
     }
     if (!airborne_) {
         const float smax = std::sin(s.own.maxSlopeDeg * 0.017453292f);
-        const float vy = v_[1];
+        // 0x61e1ec..0x61e246: a copy of the velocity +0x11b4 normalised (Vec3_Normalize 0x410050, length 1;
+        // unchanged under 1e-6): its y is the sine of the climb, compared with sin(P626). (Before P82 the port
+        // used the raw vy in m/s: every descent pushed the ghost by 2 |vy| S+4 / sin(P626) a second and
+        // kinematic racers ran at up to 700 km/h at the start.)
+        float vy = v_[1];
+        if (const float l2 = v_[0] * v_[0] + v_[1] * v_[1] + v_[2] * v_[2]; l2 > 1e-6f) vy /= std::sqrt(l2);
         if (vy >= 0) {
             if (vy > smax * 0.3f) speed = std::max(speed, vy <= smax * 0.85f ? 10.0f : 20.0f);
         } else {
@@ -1037,15 +1565,24 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
         if (l > 1e-6f) vx /= l, vz /= l;
     }
     v_ = {vx * speed, vy - dt * 9.81f, vz * speed};
+    if (finishState_ == 5) v_ = {0, 0, 0};  // 0x619650 state 5: the ghost's velocity is zero (and it keeps its place)
     // Position (0x61be00): integrate, then the ground: above it by 1 m = airborne; below it = onto it,
     // the velocity along the ground (a bounce of 0.15 of a hard landing, at most 2 m/s, and a loss).
+    // 0x619650 runs it for every racer, simulated or not: a simulated racer's ghost starts the frame on the vehicle
+    // (0x619330: dragged along its forward axis, y = the vehicle's) and moves and lands like a kinematic one, so its
+    // vertical speed follows the ground. (Before P97 the port zeroed the simulated ghost's vy and skipped the ground:
+    // a racer switched to kinematic (0x5cb6f0, the ranks reshuffle at the start) left a downhill start with vy = 0
+    // and floated 2-11 m over the slope for 1-4 s at the launch speeds: "flying over" the player.)
     gPrev_ = g_;
     hist_ = {(v_[0]), (v_[2])};
-    if (!physical_) {
+    {
+        const double yWas = g_[1];
         g_[0] += v_[0] * dt, g_[1] += v_[1] * dt, g_[2] += v_[2] * dt;
         float nrm[3] = {0, 1, 0};
-        const float h = s.ground ? s.ground(g_[0], g_[2], nrm) : float(g_[1]);
-        n_ = {nrm[0], nrm[1], nrm[2]};
+        const bool haveGround = s.ghostGround || s.ground;
+        const float h = s.ghostGround ? s.ghostGround(g_[0], yWas, g_[2], nrm) : s.ground ? s.ground(g_[0], g_[2], nrm) : float(g_[1]);
+        if (haveGround) n_ = {nrm[0], nrm[1], nrm[2]};
+        else if (physical_) n_ = s.up;
         airborne_ = false;
         if (h + 1.0f < g_[1]) {
             airborne_ = true;
@@ -1074,11 +1611,6 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
             }
             v_ = {N[0] * up + tx * tang, N[1] * up + ty * tang, tz * tang + N[2] * up};
         }
-    } else {
-        // The vehicle carries the ghost: it moves on along its velocity and is dragged back next frame.
-        g_[0] += v_[0] * dt, g_[2] += v_[2] * dt;
-        v_[1] = 0;
-        n_ = s.up;
     }
     // Heading (0x61c4b0): turn the forward axis towards the aim by at most atan(0.2 |v| dt) a frame.
     {
@@ -1113,12 +1645,23 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
         rot = {qn[3] * qy[0] + qn[0] * qy[3] + qn[1] * qy[2] - qn[2] * qy[1], qn[3] * qy[1] - qn[0] * qy[2] + qn[1] * qy[3] + qn[2] * qy[0],
                qn[3] * qy[2] + qn[0] * qy[1] - qn[1] * qy[0] + qn[2] * qy[3], qn[3] * qy[3] - qn[0] * qy[0] - qn[1] * qy[1] - qn[2] * qy[2]};
     }
+    // PK31: IA_GhostOrient 0x61c4b0 tail: a simulated racer resets the lean (0x61c150); a kinematic one runs the
+    // springs (0x61c1b0) and is placed with Quat_Mul(orient, lean) = lean x orient (0x4f07d0).
+    if (physical_) {
+        lean_.reset();
+    } else {
+        lean_.step(dt, acc_, rot, s.own.vehicleClass == 1);
+        rot = AiLean::quatMul(rot, lean_.q);
+    }
     cmd.physical = physical_;
     cmd.pos = g_;
     cmd.vel = v_;
     cmd.rot = rot;
     if (physical_ && !s.forcePhysical && std::hypot(std::hypot(g_[0] - s.pos[0], g_[2] - s.pos[2]), g_[1] - s.pos[1]) > 20.0) {
         // Pilot_SetTarget 0x5c9c20: an AI vehicle more than 20 m from its ghost is put on it (0x5c9760).
+        if (std::getenv("FUEL_AI_TRACE"))
+            std::printf("ai 20 m rule: ghost (%.1f, %.1f, %.1f) vehicle (%.1f, %.1f, %.1f) ghost %.1f m/s airborne %d\n", g_[0], g_[1], g_[2], s.pos[0],
+                        s.pos[1], s.pos[2], hyp(v_[0], v_[2]), int(airborne_));
         cmd.place = cmd.reset = true;
         ++resets_;
         return cmd;
@@ -1127,14 +1670,49 @@ RaceDriver::Command RaceDriver::step(const RaceLine& line, const Sense& s, float
         // 0x5c97d0 (AI): no steering; throttle or brake towards the ghost's speed along the vehicle's axis.
         const float tgt = v_[0] * s.fwd[0] + v_[1] * s.fwd[1] + v_[2] * s.fwd[2];
         if (std::fabs(tgt) > 1.0f) {
-            const float d = tgt - s.fwdSpeed;
+            // 0x5c9844: the reference is the mean wheel rim speed (0x5257b0), not the forward speed.
+            const float d = tgt - s.cruiseSpeed;
             if (d > 0) cmd.input.throttle = std::min(d, 1.0f);
             else cmd.input.brake = std::min(-d, 1.0f);
         }
+        if (finishState_ == 5) cmd.input.brake = 1.0f;  // parked: held (port: FUEL's pilot holds the vehicle at the ghost)
     } else {
         cmd.place = true;
     }
     return cmd;
+}
+
+
+// ---- PK16: FUEL's global float generator and the AI names (0x620c20) ---------------------------------------------
+
+namespace {
+float gFuelRandState = 0.5f;  // 0xa065cc at start-up (.data)
+}
+
+// state' = frac mantissa of (state * 8.214545 + 2.0) * 1.4154547: the x87 expression (extended precision) is stored as
+// a float, its mantissa bits are put under the exponent of 1.0 and 1.0 is subtracted.
+float fuelRandom() {
+    const long double prod = ((long double)gFuelRandState * 8.214545249938965L + 2.0L) * 1.4154547452926636L;
+    const float f = float(prod);
+    uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    bits = (bits & 0x7fffff) | 0x3f800000;
+    float m;
+    std::memcpy(&m, &bits, 4);
+    gFuelRandState = m - 1.0f;
+    return gFuelRandState;
+}
+
+// 0x620c20: ids 1500 + i; then for i = 0..73: u = next random, j = trunc(u (74 - i)), swap slot i with slot i + j.
+std::array<int, 74> aiNameShuffle() {
+    std::array<int, 74> ids{};
+    for (int i = 0; i < 74; ++i) ids[size_t(i)] = i + 0x5dc;
+    for (int i = 0; i < 74; ++i) {
+        const float u = fuelRandom();
+        const int j = int(double(74 - i) * double(u));
+        std::swap(ids[size_t(i)], ids[size_t(std::min(i + j, 73))]);
+    }
+    return ids;
 }
 
 }  // namespace fuel

@@ -38,7 +38,21 @@ constexpr double kLambda[3] = {0.65, 0.57, 0.475};
 F3 sunDirection(double t, float* signedY) {
     // f = frac(t / 86400) (the game's FPU rounds down); 16 hours of day 06:00..22:00 -> phase 0.25..0.75.
     const double f = t / 86400.0 - std::floor(t / 86400.0);
-    const double p = f >= 0.25 ? 0.75 * f + 0.0625 : 0.75 * f + 0.8125;
+    // ---- P105: the night branch (asm 0x78098a..0x7809cc, emulated at 02:00 / 05:00 / 05:50): from 22:00
+    // ([0x9dcc30] = 11/12) the night fraction q = 3 (f - 11/12), before 06:00 q = 3 (f + 1/12) ([0x9dc288]),
+    // p = 0.75 + 0.5 q, minus 1 above 1: the sun goes on below the horizon (lowest at 02:00) and comes up in the
+    // east at 06:00 with no jump. (P28 had p = 0.75 f + 0.8125 before 06:00 and the day line after 22:00: the
+    // night "sun" / moon was at its highest, in the north, at 05:59 and jumped to the east horizon at 06:00.)
+    double p;
+    const double kDusk = double(0.9166666865348816f), kNight = double(0.0833333358168602f);  // the float constants
+    if (f >= 0.25 && f <= kDusk) {
+        p = 0.75 * f + 0.0625;
+    } else {
+        const double q = 3.0 * (f > kDusk ? f - kDusk : f + kNight);
+        p = 0.75 + 0.5 * q;
+        if (p > 1.0) p -= 1.0;
+    }
+    // ---- end P105
     // R1 = (0, -1, 0) turned 0.75 rad about +x ([0xa0632c], [0xa06338]); then about normalize(R1 x X) by 2 pi p.
     const F3 r1 = rotate({0, -1, 0}, {1, 0, 0}, 0.75);
     const F3 axis = normalize3({r1[1] * 0 - r1[2] * 0, r1[2] * 1 - r1[0] * 0, r1[0] * 0 - r1[1] * 1});
@@ -64,16 +78,27 @@ std::array<float, 13> scatterDefaults() {
     return {0.05f, 0.0005f, 45.0f, 1.0f, 0.9f, 10000.0f, 0.7f, 500.0f, 0.5f, 0.0f, 10000.0f, 20000.0f, 1.0f};
 }
 
-void applyWeather(std::array<float, 13>& P, const Weather& w) {
+void applyWeather(std::array<float, 13>& P, const Weather& w, float bc) {
     // World_SetWeatherAtmosphere 0x6409d0 (disassembly read: idx 10, 11, 9, 12, 6, 8 in that order).
-    P[10] = std::min(std::max(w.cloudBase, w.cloudTopArg + 100.0f), 1500.0f);  // cloud layer bottom
-    P[11] = w.cloudBase + 2000.0f;                                              // cloud layer top
+    // P105: args 3 and 4 get W+0xbc (the lowest ground, 0x6409d5 / 0x6409df) before the clamps.
+    P[10] = std::min(std::max(w.cloudBase + bc, w.cloudTopArg + 100.0f), 1500.0f);  // cloud layer bottom
+    P[11] = w.cloudBase + 2000.0f + bc;                                              // cloud layer top
     P[9] = w.cloud * 50.0f;                                                     // cloud layer density
     const float a = w.fog, c = w.cloud;
     const float a8 = std::fabs(a) * a * a * a * a * a * a * a;  // |a| a^7
     P[12] = 0.9f * c * (2.0f - std::fabs(c)) * (1.0f - a8);     // horizon thickness weight
     P[6] = std::sqrt(std::max(a8, 0.0f)) * 500.0f + 0.7f;        // layer-1 density
     P[8] = (w.wet + 1.0f) * 5.0f;                                // layer-2 density
+}
+
+float lowestGroundNear(double cx, double cz, float (*height)(double, double, const void*), const void* ctx) {
+    // GenWorld_LowestGround 0x77a240 (P105): W+0xbc starts at 1e7 ([0x9dc3bc]); x and z run from the camera
+    // -2000 ([0x996480]) to +2000 inclusive in 1000 m steps ([0x996374]); each sample (0x445570, the coarse map
+    // height) lowers the minimum. Without a valid heightfield (W+0x4b8 != 1) every sample is 0.
+    float m = 1e7f;
+    for (int i = -2; i <= 2; ++i)
+        for (int j = -2; j <= 2; ++j) m = std::min(m, height ? height(cx + 1000.0 * i, cz + 1000.0 * j, ctx) : 0.0f);
+    return m;
 }
 
 float scatterIntegral(const Atmosphere& a, float len, float y1, float y2) {
@@ -168,14 +193,31 @@ Atmosphere computeAtmosphere(const AtmosphereInput& in) {
     a.day = y > 0;
     if (!a.day) sun[1] = -sun[1];  // the moon: the sun mirrored below the horizon
     a.sunRaw = sun;
-    a.theta = float(kPi / 2 - std::atan2(double(sun[1]), std::sqrt(double(sun[0]) * sun[0] + double(sun[2]) * sun[2])));
-    a.lightDir = normalize3({sun[0], std::max(std::fabs(sun[1]), 0.05f) + 0.25f, sun[2]});
-    a.skyDir = normalize3({0.3f * a.lightDir[0], 1.0f, 0.3f * a.lightDir[2]});
+    // ---- DUSK: the sun direction S+0x4c (asm 0x780c53..0x780c7e): v = normalize(x, max(|y|, 0.05) ([0x996158]), z)
+    // goes to Atmo_SetSunDir 0x7808b0 (S+0x4c = v, theta S+0x40 = pi/2 - atan2(v.y, |v.xz|)); then A+0xbc =
+    // normalize(v + (0, 0.25, 0)) ([0x9dbfb0], 0x780c8f..0x780cb5) is DLIGHT_DIR only. GenWorld_UpdateLights
+    // 0x779d40 reads S+0x4c (EBX = S) for the sun position P[0..2] = camera + S+0x4c x 10000 (0x779f99..) -> SC3 and
+    // the sun term s (0x7816c0 / 0x7813d0), and for DSKY_DIR = normalize(0.3 S+0x4c.x, 1, 0.3 S+0x4c.z) (0x779f02..).
+    // (Pre-DUSK the port used the lifted DLIGHT_DIR for all three and theta of the un-clamped y.)
+    a.sunDir = normalize3({sun[0], std::max(std::fabs(sun[1]), 0.05f), sun[2]});
+    const bool oldDirs = in.legacyLiftedSun;
+    if (oldDirs) {
+        a.theta = float(kPi / 2 - std::atan2(double(sun[1]), std::sqrt(double(sun[0]) * sun[0] + double(sun[2]) * sun[2])));
+        a.lightDir = normalize3({sun[0], std::max(std::fabs(sun[1]), 0.05f) + 0.25f, sun[2]});
+        a.sunDir = a.lightDir;
+    } else {
+        const F3& v = a.sunDir;
+        a.theta = float(kPi / 2 - std::atan2(double(v[1]), std::sqrt(double(v[0]) * v[0] + double(v[2]) * v[2])));
+        a.lightDir = normalize3({v[0], v[1] + 0.25f, v[2]});
+    }
+    a.skyDir = normalize3({0.3f * a.sunDir[0], 1.0f, 0.3f * a.sunDir[2]});
+    // ---- end DUSK
 
     // ---- Intensity, exposure range, bloom scale, blue shift
     const float cloud = clamp01(in.weather.cloud);
+    const float sunCloud = in.sunCloud >= 0 ? clamp01(in.sunCloud) : cloud;  // PK17: 0x780920's argument
     const float u = clamp01(y), om = 1 - u, fu = 1 - om * om * om * om;
-    a.intensity = (0.1f * (1 - fu) + fu * (y > 0 ? 0.5f : 0.1f)) * (1 - (2 - fu) * cloud * fu * 0.25f);
+    a.intensity = (0.1f * (1 - fu) + fu * (y > 0 ? 0.5f : 0.1f)) * (1 - (2 - fu) * sunCloud * fu * 0.25f);
     a.bloomLumScale = 3.00077f * a.intensity;
     // GenWorld_FrameUpdate 0x77a3b0: the viewport values are these times the Brightness option A+0.
     a.screenLuminance = a.intensity * in.brightness;
@@ -188,7 +230,10 @@ Atmosphere computeAtmosphere(const AtmosphereInput& in) {
 
     // ---- Scatter parameters and constants (0x780ce0, 0x6409d0, 0x780e10, 0x7816c0)
     a.P = scatterDefaults();
-    if (in.weather.apply) applyWeather(a.P, in.weather);
+    // P105: the GenWorld frame (0x77a3b0 -> 0x77a240, 0x77a407) sets P7 = W+0xbc + 1000 every frame.
+    const bool haveGround = !std::isnan(in.lowestGround);
+    if (haveGround) a.P[7] = in.lowestGround + 1000.0f;
+    if (in.weather.apply) applyWeather(a.P, in.weather, haveGround ? in.lowestGround : 0.0f);
     const auto& P = a.P;
     F3 bR, bRd, bM, bMd;
     const double K[3] = {0.685, 0.679, 0.67};
@@ -210,10 +255,10 @@ Atmosphere computeAtmosphere(const AtmosphereInput& in) {
     a.c[kONEOVER] = {1 / a.c[kBETASUM][0], 1 / a.c[kBETASUM][1], 1 / a.c[kBETASUM][2], 100000};
     a.c[kHG] = {1 - g * g, 1 + g, 2 * g, P[9]};
     // Sun position = camera + DLIGHT_DIR * 10000 (0x779d40): SC3 = its direction from the camera.
-    a.c[kSC3] = {a.lightDir[0], a.lightDir[1], a.lightDir[2], P[12]};
+    a.c[kSC3] = {a.sunDir[0], a.sunDir[1], a.sunDir[2], P[12]};  // DUSK: S+0x4c (sun position - camera)
     a.c[kSC1] = {1, P[10], 4, 0};
     // Sun term s: the camera -> sun density integral (0x7813d0), T = 2^(-0.33 log2e sum(beta) d).
-    const float sunY = in.camera[1] + a.lightDir[1] * 10000.0f;
+    const float sunY = in.camera[1] + a.sunDir[1] * 10000.0f;  // DUSK: P[0..2] = camera + S+0x4c x 10000
     const float d = scatterIntegral(a, 10000.0f, in.camera[1], sunY);
     const float sb = a.c[kBETASUM][0] + a.c[kBETASUM][1] + a.c[kBETASUM][2];
     const float T = std::exp2(-0.33f * 1.442695f * sb * d);
@@ -317,5 +362,19 @@ F3 lighting(const Atmosphere& a, const F3& n, const F3& V, const F3& albedo, con
     }
     return out;
 }
+
+// ---- PK04: SetDayClock 0x46ab10 / 0x6ddfa0 and the clock read of 0x5b89e0.
+uint64_t setDayClockMs(double t) {
+    double v = double(float(t * 1000.0)) + 0.5;  // fld [ebp+8]; fmul 1000 (0x996374); fadd 0.5 (0x9960c0)
+    if (!(0.0 < v)) v -= 1.0;                     // fldz; fcomp; jnp: v <= 0 -> fsub 1 (0x9dc020)
+    const int64_t ms = int64_t(v);                // _ftol (0x8e01d0): toward zero
+    return uint64_t(ms) & 0xffffffffffull;        // added to the zeroed 40-bit clock, 5 bytes written back
+}
+
+double dayClockTimeOfDay(uint64_t clockMs, float pp371) {
+    // 0x5b89e0: (signed 64-bit ms) x 0.001 x PP371 + 28800 in float10, stored as a float (+0xac).
+    return double(float(double(int64_t(clockMs)) * 0.001 * double(pp371) + 28800.0));
+}
+// ---- end PK04
 
 }  // namespace fuel

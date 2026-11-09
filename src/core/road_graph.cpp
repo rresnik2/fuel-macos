@@ -507,4 +507,159 @@ std::vector<std::array<float, 2>> RoadGraph::polyline(const Route& rt, std::vect
     return out;
 }
 
+
+// ---- road loops (free-roam traffic, P58) -----------------------------------------------------------------
+
+std::vector<uint32_t> RoadGraph::recordsInBox(float x0, float z0, float x1, float z1) const {
+    // 0x4ae680: metres -> 2 m units, rounded to nearest, clamped to s16.
+    auto u2 = [](float v) { return int(std::clamp(std::floor(v * 0.5f + 0.5f), -32768.0f, 32767.0f)); };
+    const int bx0 = u2(x0), bz0 = u2(z0), bx1 = u2(x1), bz1 = u2(z1);
+    const int cx0 = std::clamp(ftol((x0 - gx0_) * invX_), 0, 127), cx1 = std::clamp(ftol((x1 - gx0_) * invX_), 0, 127);
+    const int cz0 = std::clamp(ftol((z0 - gz0_) * invZ_), 0, 127), cz1 = std::clamp(ftol((z1 - gz0_) * invZ_), 0, 127);
+    std::vector<uint32_t> out;
+    std::vector<uint8_t> seen(recs_.size(), 0);
+    for (int cz = cz0; cz <= cz1; ++cz)
+        for (int cx = cx0; cx <= cx1; ++cx) {
+            const size_t c = size_t(cz * 128 + cx);
+            for (uint32_t i = cellStart_[c]; i < cellStart_[c + 1] && out.size() < 20000; ++i) {
+                const uint32_t ri = items_[i];
+                const Rec& R = recs_[ri];
+                if (seen[ri] || (R.flags & kExcluded)) continue;
+                seen[ri] = 1;
+                if (R.maxX <= bx1 && R.maxZ <= bz1 && R.minX >= bx0 && R.minZ >= bz0) out.push_back(ri);
+            }
+        }
+    return out;
+}
+
+bool RoadGraph::loopEligible(uint32_t r) const {
+    const Rec& R = recs_[r];
+    if ((R.flags & kRigid) || R.type <= 5 || R.type == 13 || R.type == 14 || R.type == 15) return false;
+    const auto& a = pts_[R.first];
+    const auto& b = pts_[R.first + R.n - 1];
+    return !(a[0] == b[0] && a[1] == b[1]);  // Record_IsClosed 0x6d7680 (raw quarter-metre points)
+}
+
+uint64_t RoadGraph::endKey(uint32_t r, bool end1) const {
+    const auto& p = pts_[recs_[r].first + (end1 ? recs_[r].n - 1u : 0u)];
+    return (uint64_t(uint32_t(p[0])) << 32) | uint32_t(p[1]);
+}
+
+int RoadGraph::loopDfs(std::unordered_map<uint64_t, LoopNode>& nodes, uint64_t cur, uint64_t prev, uint64_t start, const float box[4], float acc,
+                       float& best) const {
+    LoopNode& c = nodes[cur];
+    c.state = 1;
+    const uint32_t parent = c.rec;
+    uint32_t r = parent;
+    int side = c.dir ? 1 : 0, ret = 0;
+    for (int guard = 0; guard < 4096; ++guard) {
+        const Rec& R = recs_[r];
+        const uint32_t next = side ? R.link1 : R.link0;
+        side = side ? R.side1 : R.side0;
+        r = next;
+        if (r == parent) break;
+        // RoadRouter_Node 0x6d7bb0: the node at r's far end (created even for records that are not followed).
+        const bool far1 = side == 0;
+        const uint64_t key = endKey(r, far1);
+        auto it = nodes.find(key);
+        if (it == nodes.end()) {
+            if (nodes.size() >= 9999) continue;  // the router's node capacity
+            it = nodes.emplace(key, LoopNode{r, far1, 0}).first;
+        }
+        if (!loopEligible(r)) continue;
+        const float len = lengthCost(r, 0, recs_[r].n);
+        if (it->second.state == 0) {
+            const float px = float(int32_t(key >> 32)) * 0.25f, pz = float(int32_t(uint32_t(key))) * 0.25f;
+            if (px < box[0] || px > box[2] || pz < box[1] || pz > box[3]) {
+                it->second.state = 1;
+            } else if (const int k = loopDfs(nodes, key, cur, start, box, acc + len, best); k != 0) {
+                ret = k + 1;
+                LoopNode& n = nodes[key];
+                n.rec = r, n.dir = far1;
+            }
+        } else if (key != prev && key == start && acc + len > best) {
+            best = acc + len;
+            LoopNode& s = nodes[start];
+            s.rec = r, s.dir = far1;
+            ret = 1;
+        }
+    }
+    return ret;
+}
+
+bool RoadGraph::findLoop(float x0, float z0, float x1, float z1, Loop& out) const {
+    out = Loop{};
+    const float box[4] = {x0, z0, x1, z1};
+    const std::vector<uint32_t> cand = recordsInBox(x0, z0, x1, z1);
+    std::unordered_map<uint64_t, LoopNode> nodes;
+    int bestC = 0;
+    int bestI = -1;
+    auto run = [&](uint32_t i) {
+        nodes.clear();
+        const uint64_t start = endKey(i, true);
+        nodes.emplace(start, LoopNode{i, true, 0});
+        float best = 0;
+        return loopDfs(nodes, start, ~0ull, start, box, 0, best);
+    };
+    for (uint32_t i : cand) {
+        if (!loopEligible(i)) continue;
+        const int c = run(i);
+        if (c > bestC) bestC = c, bestI = int(i);
+        if (c >= 10) break;
+    }
+    if (bestC < 3 || bestI < 0) return false;
+    run(uint32_t(bestI));
+    const uint64_t start = endKey(uint32_t(bestI), true);
+    uint64_t node = start;
+    do {
+        const LoopNode& n = nodes[node];
+        out.recs.push_back(n.rec);
+        out.length += lengthCost(n.rec, 0, recs_[n.rec].n);
+        node = endKey(n.rec, !n.dir);
+    } while (node != start && out.recs.size() < 256);
+    if (node != start) {
+        out = Loop{};
+        return false;
+    }
+    return true;
+}
+
+std::array<float, 2> RoadGraph::loopPoint(const Loop& loop, float s, float* dirX, float* dirZ, int* rec) const {
+    const size_t n = loop.recs.size();
+    if (n == 0) return {0, 0};
+    // The record holding s (records summed in list order), walked from its end that does not touch the next one.
+    size_t j = 0;
+    float start = 0;
+    for (; j + 1 < n; ++j) {
+        const uint32_t r = loop.recs[j];
+        const float len = lengthCost(r, 0, recs_[r].n);
+        if (s < start + len) break;
+        start += len;
+    }
+    const uint32_t r = loop.recs[j];
+    const uint32_t nb = loop.recs[(j + 1) % n];
+    const bool fwd = inEnd1Ring(r, nb);
+    const int cnt = int(recs_[r].n);
+    int k = fwd ? 0 : cnt - 1;
+    const int step = fwd ? 1 : -1;
+    float d = s - start, segStart = 0;
+    std::array<float, 2> a = point(r, uint32_t(k)), b = a;
+    float ux = 0, uz = 0;
+    while (true) {
+        const int kn = k + step;
+        if (kn < 0 || kn >= cnt) break;  // the record's end: extrapolate along the last segment
+        b = point(r, uint32_t(kn));
+        const float l = std::hypot(b[0] - a[0], b[1] - a[1]);
+        if (l > 1e-6f) ux = (b[0] - a[0]) / l, uz = (b[1] - a[1]) / l;
+        if (segStart + l >= d) break;
+        segStart += l;
+        k = kn;
+        a = b;
+    }
+    if (dirX) *dirX = ux;
+    if (dirZ) *dirZ = uz;
+    if (rec) *rec = int(r);
+    return {a[0] + ux * (d - segStart), a[1] + uz * (d - segStart)};
+}
+
 }  // namespace fuel

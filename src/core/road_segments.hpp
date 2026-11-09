@@ -83,6 +83,13 @@ public:
     };
     // Segments whose influence may reach (x, z) (built on demand), in a fixed order.
     void segmentsNear(double x, double z, std::vector<const Segment*>& out) const;
+    // 0x6fd3a0 RoadNearestCentreline (P70b, for the breadcrumbs 0x527f50 -> 0x5309e0): over the segments
+    // covering (x, z) (0x6fb6f0 = 0x6fb8c0 + Segment_Covers 0x6f0d10, at most 128), the nearest centreline point
+    // (strict <, first wins) and that segment's B - A (unnormalised); false (outputs untouched) when none covers.
+    bool coveringCentreline(double x, double z, double& px, double& pz, float& dirX, float& dirZ) const;
+    // Pieces of it (checked by fuelphysvec BCC*): Segment_Covers 0x6f0d10 and 0x6fd3a0's loop over a candidate list.
+    static bool covers(const Segment& s, float x, float z);
+    static bool nearestCentreline(const std::vector<const Segment*>& segs, float x, float z, double& px, double& pz, float& dirX, float& dirZ);
 
     // Nearest-road queries of the terrain code (decoded by P32, out/p32/chunkroads.md; used by
     // the procedural flat surfaces 0x799910). Candidates: built segments whose u16 cell box

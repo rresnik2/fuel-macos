@@ -9,6 +9,8 @@
 // FUEL_FLOAT_CLASSES=FILE lists them. --float-dump OUT.tsv: one row per placement for classifying.
 // --file-flats X Z: the authored flat surfaces holding a point; --emu-flat-cmd FILE: EmuRun commands
 // for the emulated flat-distance vectors; --resident: USA1.DPC's own placements.
+// --decal-check [X Z ...]: road decal uv continuity between owned neighbour vertices on FUEL's 1/2/4/8 m
+// lattices (p71); default spots yell_tarmac, yell_start, the tarmac at (-39743.5, -28195.5), a dirt road (-39465, -27606).
 
 #include "core/assembly.hpp"
 #include "core/dpc.hpp"
@@ -17,11 +19,15 @@
 #include "core/ground.hpp"
 #include "core/ground_point.hpp"
 #include "core/road_types.hpp"
+#include "core/static_collision.hpp"
 #include "core/roads.hpp"
 #include "core/terrain.hpp"
 #include "core/terrain_height.hpp"
+#include "core/automesh.hpp"
 #include "core/terrain_mesh.hpp"
 #include "core/vegetation.hpp"
+#include "core/road_graph.hpp"
+#include "core/races.hpp"
 #include "core/world.hpp"
 
 #include <algorithm>
@@ -557,6 +563,142 @@ int main(int argc, char** argv) {
                             X, Z, R, n, dune, sumDune / double(std::max<size_t>(n, 1)), sand, zone, wet);
                 std::printf("  points with SAND/SAND2 %zu/%zu, WETSAND/WETSAND2 %zu/%zu, ROUGHSAND/2 %zu/%zu\n", types[6], types[7], types[36], types[37],
                             types[38], types[39]);
+            } else if (a == "--wet" && i + 2 < argc) {  // --wet X Z: the ground point's water terms (P83: the spray depth)
+                const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr);
+                i += 2;
+                const fuel::Heightfield levelled = fuel::loadLevelledHeightfield(dpc);
+                fuel::GroundGenerator gen(dpc, levelled, nullptr);
+                if (levelled.roads) gen.setRoadSampler(levelled.roads.get());
+                fuel::Lakes lakes(dpc, [&](double x, double z) { return levelled.baseHeightAt(x, z); });
+                gen.setLakes(&lakes);
+                if (const char* line = std::getenv("FUEL_WET_LINE")) {  // "X2,Z2": 1 m steps from (X, Z), cells with depth > 0
+                    double X2 = X, Z2 = Z;
+                    std::sscanf(line, "%lf,%lf", &X2, &Z2);
+                    const double L = std::hypot(X2 - X, Z2 - Z);
+                    int wetCells = 0, n = 0;
+                    std::string row;
+                    for (double t = 0; t <= L; t += 1, ++n) {
+                        float fr[fuel::GroundGenerator::kGroundClasses] = {}, d = 0;
+                        const double x = X + (X2 - X) * t / std::max(L, 1e-9), z = Z + (Z2 - Z) * t / std::max(L, 1e-9);
+                        gen.classFractions(x, std::nan(""), z, fr, d);
+                        wetCells += d > 0;
+                        row += d > 0 ? '#' : '.';
+                    }
+                    std::printf("wet line (%.0f, %.0f) -> (%.0f, %.0f): %d of %d 1 m steps with depth > 0\n%s\n", X, Z, X2, Z2, wetCells, n, row.c_str());
+                }
+                const fuel::GroundPoint p = gen.at(X, Z);
+                float frac[fuel::GroundGenerator::kGroundClasses] = {}, depth = 0;
+                gen.classFractions(X, std::nan(""), Z, frac, depth);
+                std::printf("wet at (%.1f, %.1f): height %.2f water depth %.3f base %.2f puddle %.3f humidity %.3f surface humidity %.3f "
+                            "normal y %.4f road %.2f -> class depth %.3f\n",
+                            X, Z, p.height, p.waterDepth, p.waterBase, p.puddle, p.humidity, p.surfaceHumidity, p.normal[1], p.road, depth);
+            } else if (a == "--emu-map-cmd" && i + 1 < argc) {
+                // P80: EmuRun.java commands that run FUEL.exe's own map sampler set-up and samplers on this world's
+                // maps 8 (population), 9 (occlusion) and 14 (stormed): InitMapSamplers 0x77bb80 over a GenWorld whose
+                // slot table (G+0xb748c) holds only that map (Binary_Z body loaded from DIR/mapN.bin, header at +4:
+                // w, h, f32 span, i32, f32 max; data at +24), then the inlined per-map samplers 0x458e60 (map 8),
+                // 0x772110 (map 9) and 0x458780 (map 14), which all read the sampler array at P + 0x14c68 + 0x1814 k
+                // (P = G + 0x498c). Points sit 0.1..0.45 of a texel past a texel centre so the emulator's
+                // round-to-nearest fistp equals the game's round-down. Prints the port's mapAt for each point.
+                const std::string dir = argv[++i];
+                const std::vector<uint32_t> ids = fuel::genWorldMaps(dpc);
+                const fuel::Heightfield lv = fuel::loadLevelledHeightfield(dpc);
+                fuel::GroundGenerator gen(dpc, lv, nullptr);
+                std::ofstream f(dir + "/map.cmd");
+                f.precision(9);
+                const uint32_t G = 0x20000000, RES = 0x2f000000, BODY = 0x30000000, PT = 0x2f100000, OUT = 0x2f200000;
+                const double spots[][2] = {{-39570.0, -28068.0}, {45850.0, -6250.0}, {4900.0, 35538.0}, {-51400.0, -30100.0}, {12000.0, -51000.0}, {300.0, 700.0}};
+                const double fr[][2] = {{0.13, 0.31}, {0.42, 0.11}, {0.27, 0.27}, {0.36, 0.44}, {0.19, 0.4}, {0.1, 0.22}};
+                const std::pair<int, const char*> fns[] = {{8, "0x458e60"}, {9, "0x772110"}, {14, "0x458780"}, {2, "0x4dde20"}, {10, "0x7a2880"},
+                                                           {13, "0x458100"}, {15, "0x457a80"}, {16, "0x4573e0"}, {18, "0x646730"}};
+                // (Maps 3, 5, 6, 7 are read by composite functions 0x45d010 / 0x459530 / 0x45c270 / 0x6bd200 that also need
+                // fractal banks; maps 10 and 18 are 0 at these points.)
+                for (const auto& [slot, fn] : fns) {
+                    const fuel::DpcFile::Entry* e = size_t(slot) < ids.size() ? dpc.find(ids[size_t(slot)]) : nullptr;
+                    const auto body = e ? dpc.body(*e) : std::nullopt;
+                    if (!body) continue;
+                    const std::string bin = dir + "/map" + std::to_string(slot) + ".bin";
+                    std::ofstream(bin, std::ios::binary).write(reinterpret_cast<const char*>(body->data()), std::streamsize(body->size()));
+                    uint32_t w = 0;
+                    std::memcpy(&w, body->data() + 4, 4);
+                    const double sp = 140000.0 / w;
+                    f << "reset\nzero " << G << " 0xb7600\nload " << BODY << " " << bin << "\nw32 " << (G + 0xb748c + 4u * uint32_t(slot)) << " " << RES
+                      << "\nw32 " << (RES + 0xc) << " " << (BODY + 4) << "\npush32 " << G << "\ncall 0x77bb80 50000000\n";
+                    for (size_t k = 0; k < std::size(spots); ++k) {
+                        const double tx = std::floor(spots[k][0] / sp + w / 2.0) + fr[k][0], tz = std::floor(spots[k][1] / sp + w / 2.0) + fr[k][1];
+                        const float x = float((tx - w / 2.0) * sp), z = float((tz - w / 2.0) * sp);
+                        f << "wf " << PT << " " << x << "\nwf " << (PT + 4) << " 0\nwf " << (PT + 8) << " " << z << "\nwf " << (PT + 12) << " 0\n";
+                        f << "reg EAX " << PT << "\nreg ECX " << (G + 0x498c) << "\nreg EBX " << OUT << "\nreg ESI " << PT << "\nreg EDI " << PT << "\n";
+                        f << "zero " << OUT << " 0x60\n## slot " << slot << " point " << k << "\ncall " << fn << "\n";
+                        std::printf("slot %d point %zu (%.9g, %.9g): port mapAt %.9g\n", slot, k, double(x), double(z), double(gen.map(slot, x, z)));
+                    }
+                }
+                std::printf("map sampler commands written to %s/map.cmd\n", dir.c_str());
+            } else if (a == "--emu-trunk-cmd" && i + 1 < argc) {
+                // P52: an EmuRun.java command file that runs FUEL.exe's trunk radius code (0x785200 from 0x78531d to
+                // 0x78536e, trees; 0x788ab0 from 0x788bd3 to 0x788c33, bushes: species +0x78, the noise 0x784370 /
+                // 0x787c70 over this world's random table, the size lerp, x 6, min 2) for plants the port scatters
+                // near four spots; prints the port's radius for each. Plants are kept only when the noise argument
+                // sits 0.05..0.45 past an integer, so the emulator's round-to-nearest fstp / fistp give the game's
+                // round-down index.
+                const std::string out = argv[++i];
+                const fuel::Vegetation veg = fuel::loadVegetation(dpc);
+                const fuel::Heightfield lv = fuel::loadLevelledHeightfield(dpc);
+                std::ofstream f(out);
+                auto bits = [](float v) {
+                    uint32_t b;
+                    std::memcpy(&b, &v, 4);
+                    char t[16];
+                    std::snprintf(t, sizeof t, "0x%08x", b);
+                    return std::string(t);
+                };
+                const uint32_t RB = 0x20000000, OBJ = 0x21000000, TBL = 0x22000000, OUT = 0x23000000, FR = 0x0fd00000, SP = 0x0fe00000;
+                const double spots[][2] = {{46809.6, -1284.4}, {14778.0, 18650.8}, {43532.0, -49504.4}, {-39570.0, -28068.0}};
+                int count = 0;
+                for (const auto& q : spots) {
+                    std::vector<fuel::Plant> ps;
+                    fuel::scatterPlants(veg, lv, nullptr, nullptr, float(q[0]), float(q[1]), 80.0f, ps);
+                    int trees = 0, bushes = 0;
+                    // Each kept plant also stands in for species with other trunk values (TREES 4: 0.5, 5: 0.64,
+                    // 10: 0.1; BUSHES 18: 0.1): the radius maths at that point.
+                    std::vector<fuel::Plant> cases;
+                    for (fuel::Plant p : ps) {
+                        cases.push_back(p);
+                        const uint16_t alt = p.tree ? uint16_t(4 + (cases.size() % 3 == 0 ? 6 : cases.size() % 3 == 1 ? 0 : 1)) : uint16_t(18);
+                        if (alt <= (p.tree ? veg.trees : veg.bushes).size()) p.species = alt, cases.push_back(p);
+                    }
+                    for (const fuel::Plant& p : cases) {
+                        const std::vector<fuel::Species>& list = p.tree ? veg.trees : veg.bushes;
+                        const fuel::Species& sp = list[p.species - 1];
+                        if ((sp.flags & 2) || (p.tree ? trees >= 4 : bushes >= 2)) continue;
+                        const double h = (double(p.position[0]) + double(425.23886f)) * double(12.317513f) + double(p.position[2]) * double(10.193578f);
+                        const double fr = h - std::floor(h);
+                        if (fr < 0.05 || fr > 0.45) continue;
+                        (p.tree ? trees : bushes)++, ++count;
+                        f << "reset\n";
+                        for (int k = 0; k < 64; ++k) {
+                            const uint32_t v = uint32_t(veg.perm[size_t(4 * k)]) | uint32_t(veg.perm[size_t(4 * k + 1)]) << 8 |
+                                               uint32_t(veg.perm[size_t(4 * k + 2)]) << 16 | uint32_t(veg.perm[size_t(4 * k + 3)]) << 24;
+                            f << "w32 " << (TBL + 0x704 + 4 * k) << " " << v << "\n";
+                        }
+                        const uint32_t rec = RB + uint32_t(p.species - 1) * 0xf8;
+                        f << "w32 " << (OBJ + 0x148) << " " << TBL << "\nw32 0xa6ae68 " << RB << "\nw32 0xa6ae70 " << RB << "\n";
+                        f << "w32 " << (rec + 0x44) << " " << bits(sp.size.lo) << "\nw32 " << (rec + 0x48) << " " << bits(sp.size.hi) << "\nw32 "
+                          << (rec + 0x78) << " " << bits(sp.trunk) << "\n";
+                        f << "w32 " << (SP + 0x10) << " " << bits(p.position[0]) << "\nw32 " << (SP + 0x14) << " " << bits(p.position[1]) << "\nw32 "
+                          << (SP + 0x18) << " " << bits(p.position[2]) << "\nw32 " << (FR + 8) << " " << OBJ << "\nw32 " << OUT << " 0\n";
+                        f << "sp " << SP << "\nreg EAX " << RB << "\nreg EBX " << OUT << "\nreg EBP " << FR << "\n";
+                        if (p.tree)
+                            f << "reg ESI " << uint32_t(p.species) * 0xf8 << "\nreg ECX " << OBJ << "\nrun 0x78531d 0x78536e\n";
+                        else
+                            f << "reg ESI " << p.species << "\nreg ECX " << uint32_t(p.species) * 0xf8 << "\nrun 0x788bd3 0x788c33\n";
+                        f << "rf " << OUT << "\n";
+                        std::printf("{%d, %u, %.9gf, %.9gf, /* emulated */ 0}, // port r %.9g, k %.3f, size %.3f..%.3f, n %.6f\n", p.tree ? 1 : 0, p.species,
+                                    p.position[0], p.position[2], fuel::trunkRadius(veg, sp, p.position[0], p.position[2]), sp.trunk, sp.size.lo, sp.size.hi,
+                                    fuel::plantNoise(veg, p.position[0], p.position[2]));
+                    }
+                }
+                std::printf("%d trunk vectors written to %s\n", count, out.c_str());
             } else if (a == "--emu-fractal-cmd" && i + 1 < argc) {
                 // Writes an EmuRun.java command file (tools/ghidra, read-only emulation of FUEL.exe) that
                 // builds three Fractal objects with Fractal_Init 0x69b1b0 over this world's random table
@@ -629,6 +771,14 @@ int main(int argc, char** argv) {
                         std::printf("port 0x7a0c80 (%.4f, %.4f) = %.9g (stores rounded to nearest: %.9g)\n", q[0], q[1], down, near);
                     }
                 }
+            } else if (a == "--decor-density" && i + 2 < argc) {  // --decor-density X Z: 0x6b7f10 and its two stubbed inputs
+                const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr);
+                i += 2;
+                const fuel::Heightfield lv = fuel::loadLevelledHeightfield(dpc);
+                fuel::GroundGenerator gen(dpc, lv, nullptr);
+                float h = 0, c = 0;
+                const float d = gen.decorDensity(X, Z, &h, &c);
+                std::printf("decor density (%.4f, %.4f) = %.9g humidity %.9g clearing %.9g\n", X, Z, d, h, c);
             } else if (a == "--flats" && i + 3 < argc) {  // --flats X Z R: procedural flat surfaces (0x799910) near
                 const double X = std::strtod(argv[i + 1], nullptr), Z = std::strtod(argv[i + 2], nullptr), R = std::strtod(argv[i + 3], nullptr);
                 i += 3;
@@ -816,6 +966,399 @@ int main(int argc, char** argv) {
                         ++k;
                     }
                 }
+                // (6) Emulated trunk radii (P52, notes p52-trunks.md): FUEL.exe's 0x785200 (0x78531d..0x78536e, trees) and
+                // 0x788ab0 (0x788bd3..0x788c33, bushes) under EmuRun.java (command file from --emu-trunk-cmd): species
+                // +0x78 x the size lerp (+0x44 / +0x48) at the noise 0x784370 / 0x787c70 x 6, min 2, over this world's
+                // random table and species records. The emulator stores floats to nearest, the game (and the port)
+                // round down: one float ulp apart at most. Points: plants the port scatters near Boysen Canyon_VP_1,
+                // Sand Dunes_VP_4, Salt Lake_VP_2 and the CR2 start, some with another species' record.
+                {
+                    const fuel::Vegetation veg = fuel::loadVegetation(dpc);
+                    struct TV {
+                        int tree;
+                        unsigned species;  // 1-based record index
+                        float x, z, emu;
+                    };
+                    const TV tv[] = {
+                        {1, 59, 46790.7969f, -1305.6001f, 1.1796293f},
+                        {1, 10, 46790.7969f, -1305.6001f, 0.4718517f},
+                        {0, 5, 46789.5977f, -1318.80005f, 1.2062058f},
+                        {0, 18, 46789.5977f, -1318.80005f, 0.48248228f},
+                        {1, 55, 46804.7969f, -1308.0f, 1.3597587f},
+                        {1, 4, 46804.7969f, -1308.0f, 2.0f},
+                        {1, 68, 14738.0f, 18596.7988f, 1.1500999f},
+                        {1, 10, 14738.0f, 18596.7988f, 0.46003994f},
+                        {0, 18, 14776.7998f, 18592.0f, 0.44114113f},
+                        {1, 31, 14776.7998f, 18607.1992f, 1.0172175f},
+                        {1, 5, 14776.7998f, 18607.1992f, 2.0f},
+                        {0, 12, 14798.0f, 18607.1992f, 1.2150646f},
+                        {0, 1, 43518.0f, -49568.0f, 1.093994f},
+                        {0, 18, 43518.0f, -49568.0f, 0.43759757f},
+                        {1, 2, 43548.3984f, -49534.0f, 1.4660645f},
+                        {1, 5, 43548.3984f, -49534.0f, 2.0f},
+                        {1, 62, 43561.1992f, -49475.2031f, 1.2150646f},
+                        {1, 10, 43561.1992f, -49475.2031f, 0.4860258f},
+                        {0, 18, -39542.0f, -28142.0f, 0.5769764f},
+                        {1, 1, -39588.0f, -28138.8008f, 0.9168175f},
+                        {1, 10, -39588.0f, -28138.8008f, 0.366727f},
+                        {1, 51, -39560.0f, -28126.8008f, 1.4188175f},
+                        {1, 5, -39560.0f, -28126.8008f, 2.0f},
+                        {0, 16, -39550.4023f, -28132.8008f, 0.88728815f}};
+                    for (const TV& t : tv) {
+                        const std::vector<fuel::Species>& list = t.tree ? veg.trees : veg.bushes;
+                        const bool have = t.species >= 1 && t.species <= list.size();
+                        const float r = have ? fuel::trunkRadius(veg, list[t.species - 1], t.x, t.z) : -1.0f;
+                        const bool ok = have && std::fabs(r - t.emu) <= 2.5e-7f;
+                        ++checked, bad += !ok;
+                        std::printf("emulated %s trunk %s %2u (%.4f, %.4f) = %.9g, port %.9g %s\n", t.tree ? "0x785200" : "0x788ab0", t.tree ? "tree" : "bush", t.species,
+                                    t.x, t.z, t.emu, r, ok ? "match" : "MISMATCH");
+                    }
+                }
+                // (7) Emulated GenWorld_BuildPermutation 0x74e600 (P70b): RT[256] built at G+0x704 from this world's seed under
+                // EmuRun (run 0x74e600..0x74e6fb, EDI = G); compared by FNV-1a hash of the 256 bytes (no table in the repo).
+                {
+                    const fuel::Permutation perm = fuel::buildPermutation(dpc, fuel::genWorldSeed(dpc));
+                    uint32_t h = 2166136261u;
+                    for (uint8_t c : perm) h = (h ^ c) * 16777619u;
+                    const bool ok = h == 0x47f79187u;
+                    ++checked, bad += !ok;
+                    std::printf("emulated 0x74e600 permutation hash 0x%08x (emulated 0x47f79187) %s\n", h, ok ? "match" : "MISMATCH");
+                }
+                // (8) GenWorldCore ctor 0x74da50 -> settings 0x74d5b0 (P70b): the decor/ground quadtree split factor G+0xa88 is
+                // the float at [0x9dbff0] of the player's FUEL.exe (read at run time) = the port's kChunkSplit.
+                {
+                    const auto f = fuel::readEngineFloats(dpc, 0x9dbff0, 1);
+                    const bool ok = !f.empty() && double(f[0]) == fuel::kChunkSplit;
+                    ++checked, bad += !ok;
+                    std::printf("0x74d5b0 split G+0xa88 = %g (port %g) %s\n", f.empty() ? -1.0 : double(f[0]), fuel::kChunkSplit, ok ? "match" : "MISMATCH");
+                }
+                // (9) Shipped-data conditions that keep two FUEL functions from contributing (P70b):
+                // - 0x6b51d0 MapSampler_SampleSlot runs only from 0x79b870 when a flat surface's height-map index fs+0xa0
+                //   (file record +0x78, u16; loader 0x77d480) is not 0xffff: every USA1 file flat must have 0xffff.
+                // - 0x7006f0 (map slot 11 sampler) feeds the rock evaluator's lake term: slot 11 must be 0 at every texel
+                //   (the B-spline of an all-zero raster is 0 everywhere).
+                {
+                    size_t n = 0, other = 0;
+                    for (uint32_t k = 0; k < ground.detail->fileFlatCount(); ++k, ++n) {
+                        const auto info = ground.detail->fileFlat(k, 0, 0);
+                        if (info.raw.size() < 0x7a || (info.raw[0x78] | info.raw[0x79] << 8) != 0xffff) ++other;
+                    }
+                    const bool okF = n > 0 && other == 0;
+                    ++checked, bad += !okF;
+                    std::printf("0x6b51d0: file flats with a height map (+0x78 != 0xffff): %zu of %zu %s\n", other, n, okF ? "match (never runs)" : "MISMATCH");
+                    const auto& m11 = ground.detail->slot11();
+                    size_t nz = 0;
+                    for (uint16_t v : m11.raw) nz += v != 0;
+                    const size_t nt = m11.raw.size();
+                    const bool ok11 = nt > 0 && nz == 0;
+                    ++checked, bad += !ok11;
+                    std::printf("0x7006f0: map slot 11 non-zero texels %zu of %zu %s\n", nz, nt, ok11 ? "match (no effect)" : "MISMATCH");
+                }
+                // (10) Emulated Polyline_Offset 0x6f7360 (P70b; EmuRun, d = 3 on a 5-point polyline) vs fuel::offsetPolyline.
+                {
+                    const std::vector<std::array<double, 2>> poly = {{0, 0}, {10, 0}, {20, 5}, {25, 15}, {25, 30}};
+                    const double emu[10] = {0.0, 3.0, 9.272393, 2.9104276, 17.87868, 7.1213207, 22.058258, 15.588348, 22.0, 30.0};
+                    const auto o = fuel::offsetPolyline(poly, 3.0);
+                    double worst = 0;
+                    for (int k = 0; k < 5; ++k) worst = std::max({worst, std::fabs(o[size_t(k)][0] - emu[2 * k]), std::fabs(o[size_t(k)][1] - emu[2 * k + 1])});
+                    const bool ok = worst < 1e-4;
+                    ++checked, bad += !ok;
+                    std::printf("emulated 0x6f7360 Polyline_Offset d=3: worst %.6f %s\n", worst, ok ? "match" : "MISMATCH");
+                }
+                // (11) Emulated Noise_DecorDensity 0x6b7f10 (P70b): the whole function under EmuRun with the F_dd9c bank set up by
+                // Fractal_Init 0x69b1b0 (L5 S20000 seed 44.68557) over this world's random table; its two callees stubbed with
+                // the port's values at the point (0x4dde20 humidity, 0x4debf0 clamp01 F_cdc8). Points 62.5 m past a 20 km cell
+                // corner so the emulator's round-to-nearest fistp equals the game's round-down.
+                {
+                    fuel::GroundGenerator gen(dpc, ground, nullptr);
+                    const double dv[][3] = {{-39937.5, -19937.5, 0.229577796}, {-19937.5, -39937.5, 0.164893514}, {-59937.5, 20062.5, 0.208735088},
+                                            {20062.5, 40062.5, 0.646074593}};
+                    for (const auto& q : dv) {
+                        const float d = gen.decorDensity(q[0], q[1]);
+                        const bool ok = std::fabs(d - q[2]) < 1e-6;
+                        ++checked, bad += !ok;
+                        std::printf("emulated 0x6b7f10 decor density (%.1f, %.1f) = %.9g, port %.9g %s\n", q[0], q[1], q[2], d, ok ? "match" : "MISMATCH");
+                    }
+                }
+                // (12) Emulated GenWorld map samplers (P80): InitMapSamplers 0x77bb80 (GwMapSampler::Init 0x69b620: format 6,
+                // value scale 1 / max for all 20 slots, uniform cubic B-spline basis, scale trunc(span w) / 140000, origin w/2)
+                // on this world's map bodies, then the inlined samplers 0x458e60 (map 8), 0x772110 (map 9, Map9_Sample) and
+                // 0x458780 (map 14), 0x4dde20 (2), 0x458100 (13), 0x457a80 (15), 0x4573e0 (16) with SampleBicubic 0x69c560 and Fetch4x4_Mode6 0x69bfc0, under EmuRun (commands from
+                // --emu-map-cmd) vs GroundGenerator::mapAt. Proves the sampler every map consumer shares (away from the
+                // map border, where FUEL mirrors texels and the port clamps: never within the +-65.5 km world).
+                {
+                    fuel::GroundGenerator gen(dpc, ground, nullptr);
+                    const float px[6][2] = {{-39612.8906f, -28079.2969f}, {45778.9062f, -6258.98438f}, {4722.26562f, 35347.2656f},
+                                            {-51307.8125f, -30231.25f},   {11809.7656f, -51023.4375f}, {300.78125f, 607.03125f}};
+                    const int slots[7] = {8, 9, 14, 2, 13, 15, 16};
+                    const double emu[7][6] = {{1.00000012, 0.897882961, 0.176362305, 1.00000012, 1.00000012, 1.00000012},
+                                              {0.635746240, 0.467859003, 0.876620169, 0.582726506, 0.577462546, 0.643455258},
+                                              {0.0, 0.0, 0.291906952, 0.292316250, 0.391560220, 0.0},
+                                              {0.853376052, 0.662336707, 0.0, 1.0, 0.736202446, 1.0},
+                                              {0.0, 0.0853316857, 0.0, 0.0, 0.0, 0.0},
+                                              {0.0, 0.0, 0.0, 0.0, 0.0, 0.222440372},
+                                              {0.0, 0.0158704487, 0.0, 0.0, 0.742091173, 0.0}};
+                    const char* fn[7] = {"0x458e60", "0x772110", "0x458780", "0x4dde20", "0x458100", "0x457a80", "0x4573e0"};
+                    for (int s = 0; s < 7; ++s) {
+                        double worst = 0;
+                        for (int k = 0; k < 6; ++k) worst = std::max(worst, std::fabs(gen.map(slots[s], px[k][0], px[k][1]) - emu[s][k]));
+                        const bool ok = worst < 5e-6;
+                        ++checked, bad += !ok;
+                        std::printf("emulated %s map %d sampler, 6 points: worst %.2g %s\n", fn[s], slots[s], worst, ok ? "match" : "MISMATCH");
+                    }
+                }
+                {
+                    // (13) Vehicles and the AutoMesh / RoadMesh bushes (P84, notes p84-bushes.md). FUEL's Broussaille*
+                    // templates (clone.tsc: IT_DECORMESH_G, a thin decor agent: vf00 0x516c80 only sets agent flags
+                    // 0x44000 and sleeps it, vf24/25 0x516cb0/0x516db0 register a sound bank, none of them) carry no
+                    // collision: no Lod/Mesh boxes or spheres and no collision triangle tree (0x884dc0 / 0x885110 /
+                    // 0x884f50, P46), so 0x71dd80 gathers nothing for them and the contact hook 0x51edb0 (breakables,
+                    // IT_DECORDYNMESH_G +0x60 0x800000 only) never sees them: vehicles drive through, drawn intersecting.
+                    // The RoadMesh rules put Broussaille01Petite in the middle of forest tracks (MiddleDist 2 / 0 / -3).
+                    // Checked: every Broussaille template is IT_DECORMESH_G with empty FUEL collision (port: no solid);
+                    // control: the IT_DECORDYNMESH_G templates are not all empty (the loader finds collision at all).
+                    const std::filesystem::path common = std::filesystem::path(argv[1]).parent_path().parent_path();
+                    const fuel::AutoMesh am(common.string(), dpc, {&dpc});
+                    const auto classes = fuel::loadCloneClasses((common / "clone.tsc").string());
+                    auto classOf = [&](uint32_t crc) {
+                        const auto it = classes.find(crc);
+                        return it == classes.end() ? fuel::GameClass::None : it->second;
+                    };
+                    auto solid = [&](uint32_t crc) {
+                        for (const fuel::PlacedMesh& m : am.templateParts(crc))
+                            if (m.collisionFirst && !fuel::loadStaticCollision({&dpc}, m.objectId).empty()) return true;
+                        return false;
+                    };
+                    int bushes = 0, solidBushes = 0, wrongClass = 0, middle = 0, dyn = 0, dynSolid = 0;
+                    std::unordered_map<uint32_t, bool> seen;
+                    for (int l = 0; l < 4; ++l)
+                        for (const fuel::AutoMeshRule& r : am.rules(l)) {
+                            if (l == 3 && r.name.rfind("Broussaille", 0) == 0 && r.middleDist <= 1000.0f) ++middle;
+                            if (seen.count(r.crc) || am.templateParts(r.crc).empty()) continue;
+                            seen[r.crc] = true;
+                            const fuel::GameClass c = classOf(r.crc);
+                            if (r.name.rfind("Broussaille", 0) == 0) {
+                                ++bushes, wrongClass += c != fuel::GameClass::DecorMesh;
+                                const bool s = solid(r.crc);
+                                solidBushes += s;
+                                std::printf("  %-22s %s, FUEL collision %s", r.name.c_str(), fuel::gameClassName(c), s ? "solid:" : "none");
+                                for (const fuel::PlacedMesh& m : am.templateParts(r.crc)) {
+                                    if (!m.collisionFirst) continue;
+                                    const fuel::StaticCollision sc = fuel::loadStaticCollision({&dpc}, m.objectId);
+                                    if (sc.empty()) continue;
+                                    std::printf(" [%08x: %zu boxes, %zu spheres, %zu triangles, r %.2f m]", m.objectId, sc.boxes.size(), sc.spheres.size(),
+                                                sc.tris.size(), sc.radius);
+                                }
+                                std::printf("\n");
+                            } else if (c == fuel::GameClass::DecorDynMesh) {
+                                ++dyn, dynSolid += solid(r.crc);
+                            }
+                        }
+                    const bool ok = bushes >= 6 && solidBushes == 4 && wrongClass == 0 && middle == 3 && dynSolid > 0;
+                    ++checked, bad += !ok;
+                    std::printf("AutoMesh bushes: %d Broussaille templates, %d with collision, %d not IT_DECORMESH_G, %d road-middle rules; "
+                                "control: %d of %d IT_DECORDYNMESH_G templates solid %s\n",
+                                bushes, solidBushes, wrongClass, middle, dynSolid, dyn, ok ? "match" : "MISMATCH");
+                }
+                {
+                    // (PK05) Decor_FreeOfObjects 0x557650 = !0x6404a0 && 0x4f8a80 && 0x4ed9e0 (notes/pk05.md). (a) the logic at
+                    // hand-computed points; (b) trees / bushes standing inside start, checkpoint and finish boxes with and
+                    // without the clearance (CR2-Yell-CP and every mission of the level).
+                    const std::string data = std::filesystem::path(argv[1]).parent_path().parent_path().parent_path().string();
+                    fuel::PlantClearance C;
+                    C.gates.push_back({1000, 2000, 30, 20});  // a start box of half size 30 ((AI 4 + 1) / 2 + 1 = 3, x 10)
+                    C.gates.push_back({3000, 2000, 25, 20});  // a checkpoint on a 20 m road
+                    C.gates.push_back({5000, 2000, 25, 7.5f});  // a checkpoint on a 7.5 m road
+                    C.pois.push_back({-1000, 0});
+                    fuel::PlantClearance::Box bx;  // 4 x 2 x 6 box turned 90 degrees about y at (-2000, 10, -2000), grid radius 8
+                    bx.m = {0, 0, -1, -2000, 0, 1, 0, 10, 1, 0, 0, -2000};
+                    bx.ext = {2, 1, 3};
+                    bx.radius = 8;
+                    C.boxes.push_back(bx);
+                    C.index();
+                    const float r = fuel::kPlantSphereRadius;
+                    struct Case {
+                        const char* what;
+                        bool free;
+                        bool want;
+                    };
+                    const Case cases[] = {
+                        {"start box centre", C.free(1000, 0, 2000, r), false},
+                        {"start: 34 m out on an axis (grid box 30 + r 5 = 35, circle 55)", C.free(1034, 0, 2000, r), false},
+                        {"start: 36 m out (outside the grid box)", C.free(1036, 0, 2000, r), true},
+                        {"start: box corner (34, 34), distance 48 < 55", C.free(1034, 0, 2034, r), false},
+                        {"checkpoint, 20 m road: 29 m out", C.free(3029, 0, 2000, r), false},
+                        {"checkpoint, 20 m road: 31 m out (outside the box)", C.free(3031, 0, 2000, r), true},
+                        {"checkpoint, 7.5 m road: corner (29, 29), distance 41 > 37.5", C.free(5029, 0, 2029, r), true},
+                        {"checkpoint, 7.5 m road: 29 m out on an axis", C.free(5029, 0, 2000, r), false},
+                        {"POI: 29.9 m (< r + 25)", C.free(-1000 + 29.9f, 0, 0, r), false},
+                        {"POI: 30.1 m", C.free(-1000 + 30.1f, 0, 0, r), true},
+                        {"GenWorld box: centre", C.free(-2000, 10, -2000, r), false},
+                        {"GenWorld box: 4.9 m off the 3 m half-length face", C.free(-2000 + 3 + 4.9f, 10, -2000, r), false},
+                        {"GenWorld box: 5.1 m off the 3 m half-length face", C.free(-2000 + 3 + 5.1f, 10, -2000, r), true},
+                        {"GenWorld box: 4.9 m off the 2 m half-width face", C.free(-2000, 10, -2000 + 2 + 4.9f, r), false},
+                        {"GenWorld box: 4.9 m above the 1 m half-height", C.free(-2000, 10 + 1 + 4.9f, -2000, r), false},
+                        {"GenWorld box: 6 m above the 1 m half-height", C.free(-2000, 10 + 1 + 6.0f, -2000, r), true},
+                    };
+                    for (const Case& c : cases) {
+                        const bool ok = c.free == c.want;
+                        ++checked, bad += !ok;
+                        if (!ok) std::printf("Decor_FreeOfObjects %s: %s, expected %s: MISMATCH\n", c.what, c.free ? "free" : "blocked", c.want ? "free" : "blocked");
+                    }
+                    std::printf("Decor_FreeOfObjects: %zu logic cases checked\n", sizeof cases / sizeof cases[0]);
+                    try {
+                        fuel::Vegetation veg = fuel::loadVegetation(dpc);
+                        const fuel::Heightfield lv = fuel::loadLevelledHeightfield(dpc);
+                        const auto roads = std::make_unique<fuel::RoadNetwork>(fuel::loadRoads(dpc));
+                        std::unique_ptr<fuel::RoadGraph> graph;
+                        try { graph = std::make_unique<fuel::RoadGraph>(dpc); } catch (const std::exception&) {}
+                        const auto types = fuel::loadRoadTypes(dpc);
+                        const size_t gates = fuel::loadPlantClearance(veg, dpc, data, graph.get(), types ? types->data() : nullptr, types ? types->size() : 0);
+                        std::printf("Decor_FreeOfObjects: %zu GenWorld boxes, %zu mission gates, %zu POIs\n", veg.clearance.boxes.size(), gates, veg.clearance.pois.size());
+                        fuel::Vegetation base = veg;  // before: no gates, no POIs, no GenWorld boxes
+                        base.clearance.gates.clear(), base.clearance.pois.clear(), base.clearance.boxes.clear(), base.clearance.index();
+                        // Count plants inside each gate's own box (|dx|, |dz| <= half) and inside the circle road + half.
+                        auto count = [&](const fuel::Vegetation& V, float x, float z, float half, float road, bool circle) {
+                            std::vector<fuel::Plant> ps;
+                            fuel::scatterPlants(V, lv, roads.get(), nullptr, x, z, (half + std::min(road, 40.0f) + 6) * 1.5f, ps, false, 0, nullptr);
+                            size_t n = 0;
+                            for (const fuel::Plant& p : ps)
+                                n += (circle || (std::fabs(p.position[0] - x) <= half && std::fabs(p.position[2] - z) <= half)) &&
+                                     std::hypot(p.position[0] - x, p.position[2] - z) < half + road;  // the box corners beyond road + half stay open
+                            return n;
+                        };
+                        size_t startBefore = 0, startAfter = 0, allBefore = 0, allAfter = 0, startsChecked = 0;
+                        for (const fuel::PlantClearance::Gate& g : veg.clearance.gates) {
+                            if (g.x == 0 && g.z == 0) continue;
+                            const size_t b = count(base, g.x, g.z, g.box, g.road, false), a2 = count(veg, g.x, g.z, g.box, g.road, false);
+                            allBefore += b, allAfter += a2;
+                            if (g.box > 25) startBefore += b, startAfter += a2, ++startsChecked;
+                        }
+                        std::printf("Decor_FreeOfObjects: plants inside every gate box and its road + half circle (start / finish +-((AI + 1) / 2 + 1) x 10 m, checkpoints +-25 m): %zu before, %zu after (%zu "
+                                    "start / finish boxes: %zu before, %zu after)\n",
+                                    allBefore, allAfter, startsChecked, startBefore, startAfter);
+                        for (const fuel::Event& e : fuel::loadEvents(data)) {
+                            if (e.id != "CR2-Yell-CP") continue;
+                            const float box = float((e.race.aiCount + 1) / 2 + 1) * 10.0f;
+                            const auto& st = e.race.start;
+                            const size_t b = count(base, st[0], st[2], box, 1e9f, false), a2 = count(veg, st[0], st[2], box, 1e9f, false);
+                            std::printf("Decor_FreeOfObjects: CR2-Yell-CP start (%.1f, %.1f) AI %d box +-%.0f m: %zu plants before, %zu after\n", st[0], st[2], e.race.aiCount, box, b, a2);
+                            const bool ok = a2 == 0 && b > 0;
+                            ++checked, bad += !ok;
+                            if (!ok) std::printf("  CR2-Yell-CP start box: MISMATCH (expected plants before and none after)\n");
+                            size_t cb = 0, ca = 0;
+                            for (const auto& cp : e.race.checkpoints) cb += count(base, cp[0], cp[2], 25, 1e9f, false), ca += count(veg, cp[0], cp[2], 25, 1e9f, false);
+                            std::printf("Decor_FreeOfObjects: CR2-Yell-CP %zu checkpoints +-25 m: %zu plants before, %zu after\n", e.race.checkpoints.size(), cb, ca);
+                            const bool ok2 = ca == 0;
+                            ++checked, bad += !ok2;
+                        }
+                        const bool okAll = allAfter == 0 && allBefore > 0;
+                        ++checked, bad += !okAll;
+                        if (!okAll) std::printf("  gate boxes: MISMATCH (expected plants before and none after)\n");
+                    } catch (const std::exception& e) {
+                        std::printf("Decor_FreeOfObjects: %s\n", e.what());
+                    }
+                }
+                {
+                    // (PK32) Ground occlusion curvature term 0x7f90d0 (notes pk32.md): the whole function under EmuRun
+                    // (args h, h(x+s), h(x-s), h(z+s), h(z-s), s pushed as the asm does; result ST0) vs groundCurvatureFactor.
+                    struct Cv {
+                        float a[6];
+                        double emu;
+                    };
+                    const Cv cv[] = {
+                        {{100, 100, 100, 100, 100, 1}, 1.00000000},
+                        {{100, 100.05f, 100.05f, 100.05f, 100.05f, 1}, 0.721743676},
+                        {{100, 99.97f, 99.95f, 99.98f, 99.96f, 1}, 1.19921030},
+                        {{250.3f, 251.1f, 249.2f, 250.9f, 249.8f, 2}, 1.12724301},
+                        {{12.5f, 13.4f, 12.9f, 12.1f, 13.6f, 4}, 0.388846158},
+                        {{-3.25f, -2.0f, -2.5f, -1.75f, -3.0f, 1}, -0.496337805},
+                        {{840.125f, 840.5f, 840.0f, 841.25f, 839.0f, 1}, 0.768922947},
+                        {{500, 501, 499, 500.5f, 499.5f, 0.5f}, 1.00000000},
+                    };
+                    double worst = 0;
+                    for (const Cv& c : cv)
+                        worst = std::max(worst, std::fabs(double(fuel::groundCurvatureFactor(c.a[0], c.a[1], c.a[2], c.a[3], c.a[4], c.a[5])) - c.emu));
+                    const bool ok = worst < 2e-6;
+                    ++checked, bad += !ok;
+                    std::printf("emulated 0x7f90d0 ground curvature factor, %zu points: worst %.2g %s\n", sizeof cv / sizeof cv[0], worst, ok ? "match" : "MISMATCH");
+                    // The point byte +0x89 after the term (asm 0x7f9850..0x7f98b3, RC_DOWN fistp): hand-computed.
+                    const bool okB = fuel::curvedOcclusion(1.0f, 0.721743676f) == 46.0f / 64 && fuel::curvedOcclusion(0.8f, 1.2f) == 61.0f / 64 &&
+                                     fuel::curvedOcclusion(0.9f, 1.5f) == 1.0f && fuel::curvedOcclusion(0.5f, -0.4963f) == 0.0f;
+                    ++checked, bad += !okB;
+                    std::printf("0x7f92c0 occlusion byte x curvature (4 cases) %s\n", okB ? "match" : "MISMATCH");
+                    // On USA1: the factor over a 1 m lattice (tile level 0 spacing) at an arbitrary spot (information only).
+                    try {
+                        const fuel::Heightfield lv = fuel::loadLevelledHeightfield(dpc);
+                        if (lv.detail) {
+                            const auto f = fuel::groundCurvatureGrid(*lv.detail, -2000.5, 1000.5, 1.0, 64);
+                            double lo = 1e9, hi = -1e9, mean = 0;
+                            size_t dark = 0;
+                            for (float v : f) lo = std::min(lo, double(v)), hi = std::max(hi, double(v)), mean += v, dark += v < 0.95f;
+                            std::printf("0x7f90d0 on USA1, 64 x 64 points at 1 m from (-2000.5, 1000.5): f %.3f..%.3f, mean %.3f, %zu darkened by > 5%%\n", lo, hi,
+                                        mean / double(f.size()), dark);
+                        }
+                    } catch (const std::exception& e) {
+                        std::printf("0x7f90d0 on USA1: %s\n", e.what());
+                    }
+                }
+                {
+                    // (PK32) RoadMesh ShortCut search 0x78e030 under EmuRun (EDI = a 50-point hairpin: up x = 0 to z = 400, a
+                    // 60 m half circle, down x = 120; EAX = the sample, ECX = start, args out, count, step) vs roadShortCut.
+                    std::vector<std::array<double, 2>> P;
+                    for (int z = 0; z <= 400; z += 20) P.push_back({0.0, double(z)});
+                    for (int k = 1; k < 9; ++k) {
+                        const double a = 3.141592653589793 * (1 - k / 9.0);
+                        P.push_back({std::round((60 + 60 * std::cos(a)) * 1e4) / 1e4, std::round((400 + 60 * std::sin(a)) * 1e4) / 1e4});
+                    }
+                    for (int z = 400; z >= 0; z -= 20) P.push_back({120.0, double(z)});
+                    for (auto& q : P) q = {double(float(q[0])), double(float(q[1]))};
+                    struct Sc {
+                        double x, z;
+                        int start, step;
+                        bool found;
+                        double qx, qz;
+                    };
+                    const Sc sc[] = {
+                        {0, 205, 10, -1, false, 0, 0}, {0, 205, 11, 1, true, 120, 200},  {0, 345, 17, -1, false, 0, 0}, {0, 345, 18, 1, true, 120, 340},
+                        {120, 300, 34, -1, true, 0, 300}, {120, 300, 35, 1, false, 0, 0}, {500, 500, 5, -1, false, 0, 0}, {500, 500, 6, 1, false, 0, 0},
+                    };
+                    int okN = 0;
+                    for (const Sc& c : sc) {
+                        double qx = 0, qz = 0;
+                        const bool f = fuel::roadShortCut(P, c.start, int(P.size()), c.step, c.x, c.z, qx, qz);
+                        const bool ok = f == c.found && (!f || (qx == c.qx && qz == c.qz));
+                        okN += ok;
+                        if (!ok) std::printf("0x78e030 (%.0f, %.0f) start %d step %d: port %d (%.1f, %.1f), emulated %d (%.1f, %.1f) MISMATCH\n", c.x, c.z, c.start, c.step, f, qx, qz,
+                                             c.found, c.qx, c.qz);
+                    }
+                    const bool ok = okN == int(sizeof sc / sizeof sc[0]);
+                    ++checked, bad += !ok;
+                    std::printf("emulated 0x78e030 RoadMesh ShortCut search: %d of %zu calls %s\n", okN, sizeof sc / sizeof sc[0], ok ? "match" : "MISMATCH");
+                }
+                {
+                    // (PK32) ProGroundMgr_G (0x4fa5a0 Fill, 0x4fa680 Update, 0x4f9ec0 / 0x4f9e50 flat spots) is dead in the shipped
+                    // data: its prefabs PROCEDURAL_1..3 (CRC as 0x4fa5a0 computes it) are named by no DPC (name ids are stored raw).
+                    const std::string data = std::filesystem::path(argv[1]).parent_path().parent_path().parent_path().string();
+                    const uint32_t crc[3] = {fuel::asoboCrc("PROCEDURAL_1"), fuel::asoboCrc("PROCEDURAL_2"), fuel::asoboCrc("PROCEDURAL_3")};
+                    size_t files = 0, hits = 0;
+                    for (const auto& e : std::filesystem::recursive_directory_iterator(data)) {
+                        std::string ext = e.path().extension().string();
+                        for (char& ch : ext) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+                        if (!e.is_regular_file() || ext != ".DPC") continue;
+                        ++files;
+                        std::ifstream in(e.path(), std::ios::binary);
+                        const std::string b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                        for (uint32_t c : crc) {
+                            const char pat[4] = {char(c & 0xff), char(c >> 8 & 0xff), char(c >> 16 & 0xff), char(c >> 24)};
+                            for (size_t k = b.find(pat, 0, 4); k != std::string::npos; k = b.find(pat, k + 1, 4)) ++hits;
+                        }
+                    }
+                    const bool ok = crc[0] == 0x43d0f0d3u && crc[1] == 0x4e93d60au && crc[2] == 0x4a52cbbdu && files > 0 && hits == 0;
+                    ++checked, bad += !ok;
+                    std::printf("ProGround: PROCEDURAL_1..3 (%08x %08x %08x) named in %zu of %zu DPCs %s (pool always empty: dead)\n", crc[0], crc[1], crc[2], hits, files,
+                                ok ? "match" : "MISMATCH");
+                }
                 std::printf("terrain vectors: %d of %d match\n", checked - bad, checked);
                 if (bad) return 1;
             } else if (a == "--road-types") {  // the AGW_TerraRoad table replayed from FUEL.exe
@@ -827,9 +1370,9 @@ int main(int argc, char** argv) {
                 }
                 for (size_t k = 0; k < t->size(); ++k) {
                     const fuel::RoadTypeParams& q = (*t)[k];
-                    std::printf("type %2zu: T0 %g T24 %g T28 %g T34 %g T4c %g T50 %g T54 %g T5c %g T74 %g T78 %g T7c %g T80 %g Tbc %g Tc4 %g Tcc %g M %g Mmin %g Tb4 %g\n", k,
+                    std::printf("type %2zu: T0 %g T24 %g T28 %g T34 %g T4c %g T50 %g T54 %g T5c %g T74 %g T78 %g T7c %g T80 %g Tbc %g Tc4 %g Tc8 %g Tcc %g M %g Mmin %g Tb4 %g\n", k,
                                 q.reach, q.crown, q.verge, q.noise, q.fade, q.ditch, q.ditchDepth, q.stretch, q.bumpAmp, q.bumpLen, q.waveAmp,
-                                q.waveLen, q.band, q.core, q.flat, q.smooth, q.smoothMin, q.aiSpeedBlend);
+                                q.waveLen, q.band, q.core, q.cc8, q.flat, q.smooth, q.smoothMin, q.aiSpeedBlend);
                 }
             } else if (a == "--events") {
                 // Race starts and checkpoints (authored on FUEL's ground) against the ground.
@@ -958,6 +1501,70 @@ int main(int argc, char** argv) {
                     std::printf("  %s x %.2f z %.2f level %.2f R %.0f: %d x %d cells of %.2f m, %zu set, %.1f km2 under water\n",
                                 L.flood ? "basin" : "pond ", L.x, L.z, L.level, L.radius, L.w, L.h, L.cell, cells, double(wet) * 625e-6);
                 }
+            } else if (a == "--decal-check") {
+                // Road decal uv (0x6fbab0 ctx+0x1f8 / 0x1fc) between neighbouring ground vertices that both carry the
+                // decal (weight byte > 0.01, same material) on the chunk lattices 1, 2, 4, 8 m. Pairs differing by more
+                // than 0.5 in u or v lose the decal by the seam rule (0x7f9b50); the rest are interpolated across a
+                // triangle, so a step there shows as a squeezed band of texture. Rates are per metre.
+                std::vector<std::array<double, 2>> spots;
+                while (i + 2 < argc && argv[i + 1][0] != '-' ) {
+                    spots.push_back({std::strtod(argv[i + 1], nullptr), std::strtod(argv[i + 2], nullptr)});
+                    i += 2;
+                }
+                if (spots.empty()) spots = {{-39570, -28136}, {-39570, -28068}, {-39743.5, -28195.5}, {-39465, -27606}};
+                const fuel::Heightfield levelled = fuel::loadLevelledHeightfield(dpc);
+                if (!levelled.roads) {
+                    std::printf("decal check: FAIL no road sampler\n");
+                    return 1;
+                }
+                const fuel::RoadSampler& rs = *levelled.roads;
+                bool ok = true;
+                for (const auto& sp : spots) {
+                    for (const double L : {1.0, 2.0, 4.0, 8.0}) {
+                        const int R = 64, n = int(2 * R / L) + 1;
+                        const double x0 = std::round((sp[0] - R) / L) * L, z0 = std::round((sp[1] - R) / L) * L;
+                        std::vector<fuel::RoadFields> F(size_t(n) * size_t(n));
+                        for (int j = 0; j < n; ++j)
+                            for (int k = 0; k < n; ++k) F[size_t(j) * size_t(n) + size_t(k)] = rs.sample(x0 + k * L, z0 + j * L);
+                        size_t pairs = 0, seams = 0, steps = 0;
+                        double maxU = 0, maxV = 0;
+                        std::vector<double> rates;
+                        for (int j = 0; j < n; ++j)
+                            for (int k = 0; k < n; ++k) {
+                                const fuel::RoadFields& A = F[size_t(j) * size_t(n) + size_t(k)];
+                                if (!(std::floor(A.decal * 64 + 0.5) / 64 > 0.01) || A.material == 0xfff) continue;
+                                for (int d = 0; d < 2; ++d) {
+                                    const int kk = k + (d == 0), jj = j + (d == 1);
+                                    if (kk >= n || jj >= n) continue;
+                                    const fuel::RoadFields& B = F[size_t(jj) * size_t(n) + size_t(kk)];
+                                    if (!(std::floor(B.decal * 64 + 0.5) / 64 > 0.01) || B.material != A.material) continue;
+                                    const double du = std::fabs(A.across - B.across), dv = std::fabs(A.along - B.along);
+                                    if (du > 0.5 || dv > 0.5) {
+                                        ++seams;
+                                        continue;
+                                    }
+                                    ++pairs;
+                                    maxU = std::max(maxU, du / L), maxV = std::max(maxV, dv / L);
+                                    rates.push_back(std::max(du, dv) / L);
+                                }
+                            }
+                        double med = 0;
+                        if (!rates.empty()) {
+                            std::nth_element(rates.begin(), rates.begin() + long(rates.size() / 2), rates.end());
+                            med = rates[rates.size() / 2];
+                            for (double r : rates) steps += r > 2 * med + 0.02;
+                        }
+                        // The uv of one road changes by at most 0.5 / (T[cc] - 0.5) (~0.05-0.15) per metre; a pair
+                        // above 0.5 per metre would be a broken sample (the old blocks came from the renderer).
+                        const bool good = maxU <= 0.5 && maxV <= 0.5;
+                        ok = ok && good;
+                        std::printf("  (%.1f, %.1f) %g m lattice: %zu owned pairs, %zu seam-rule cuts, median %.3f /m, max |du| %.3f /m "
+                                    "|dv| %.3f /m, %zu joint steps (> 2x median)%s\n",
+                                    sp[0], sp[1], L, pairs, seams, med, maxU, maxV, steps, good ? "" : "  FAIL");
+                    }
+                }
+                std::printf("decal check: %s\n", ok ? "ok" : "FAIL");
+                if (!ok) return 1;
             } else if (a == "--roads" && i + 3 < argc) {
                 // --roads X Z R: FUEL's road segments, point sampler and height carve around (X, Z)
                 // (AGW_TerraRoad, notes p22). Writes roads.ppm (R weight, G decal, B carve depth).

@@ -1,7 +1,7 @@
 // Every event the player can start: the 72 career races and 190 hub challenges
 // (hubinfos.tsc AddHubCareerRaces / AddHubCHallengeRaces, the EMD blocks in
-// miss_official.tsc / missChallenge.tsc, and whatever the races without an EMD
-// block are decoded from). Shared contract between the event loader (P17) and
+// miss_official.tsc / missChallenge.tsc, and the MISSION_COURSE nodes of USA1.DPC
+// for the 15 career races without an EMD block, notes/p42-missions.md). Shared contract between the event loader (P17) and
 // the menus (P19); see ~/re-work/fuel/notes/p17-events.md.
 #pragma once
 
@@ -14,7 +14,7 @@
 namespace fuel {
 
 struct Event {
-    enum Kind { Career = 0, Challenge = 1 };
+    enum Kind { Career = 0, Challenge = 1, Edited = 2 /* PK21: an edited race of the career (race_editor.hpp) */ };
     std::string id;            // mission name, e.g. "CR2-Yell-CP" or a challenge's "(n)name:..:2km"
     Kind kind = Career;
     std::string hub;           // hub id as in hubs.hpp, e.g. "YELLOWSTONE"
@@ -32,8 +32,24 @@ struct Event {
     std::string vehicle;       // challenges: the forced variant, e.g. "BUGGY_OFF_3" ("" = the player's choice)
     float times[3] = {0, 0, 0};  // AddMissionTime 1st..3rd values (career: three target times; challenges: 1st only)
     std::string aiVehicles;    // AddMissionParam AI vehicle ids ("18_61_33_..."; "NONE" = none)
+    // Those ids as vehicle labels (e.g. "BIKE_OFF_1"): 0x575b00 atol's each '_' field (at most 32) into the
+    // mission's list +0xa8/+0xac; IA_RaceSetup 0x620e30 gives AI racer k the entry k mod n, an index into the
+    // game's vehicle table (DAT_00a7c094+0x3254) = the AddVehicleInfo lines of VehiclesDef.tsc in order (P43).
+    std::vector<std::string> aiVehicleLabels;
     int hubIndex = 0;          // position of `hub` in the hub list (SetHubTargetInfos order)
+    // AddMissionParam's weather strings (args 5 and 7, e.g. "C#0_TOR_W#100"; parser 0x5759c0). P61: "TOR" in the
+    // start string sets mission +0x18c, the tornado race (0x631bd0 places the tornado route).
+    std::string weatherStart, weatherEnd;
+    bool tornado = false;
 };
+
+// How many opponents an event puts on the grid: EMD_SetNbIA (no vehicle for the helicopter), or `requested`
+// (--opponents) when given (>= 0), at most 11. Shared by --race and --career-audit (P99).
+inline int eventOpponents(const Event& e, int requested = -1) {
+    if (e.race.gameMode() == Race::GmHelicopter) return 0;
+    const int n = requested >= 0 ? requested : e.race.aiCount;
+    return n < 0 ? 0 : n > 11 ? 11 : n;
+}
 
 // Short English name of a game mode (Race::gameMode()), e.g. "knock out".
 const char* gameModeName(int gameMode);

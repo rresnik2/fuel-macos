@@ -17,6 +17,15 @@ int main(int argc, char** argv) {
     }
     try {
         const std::string data = argv[1], variant = argv[2];
+        if (variant == "--liveries") {  // P66: texture livery counts per part type (0x5dc850)
+            fuel::DpcFile pilot(data + "/CommonComponent/DATAS/PILOT.DPC");
+            const auto names = fuel::riderLiveryNames(pilot);
+            for (const char* part : {"HEAD", "CHEST", "LEGS", "BODY"})
+                for (int n = 1; n <= 12; ++n)
+                    if (const int c = fuel::riderLiveryCount(names, part + std::to_string(n))) std::printf("%s%d: %d liveries\n", part, n, c);
+            std::printf("skins (LIVERY_01_BODY<k>): %d\n", fuel::riderLiveryCount(names, "BODY", true));
+            return 0;
+        }
         std::ifstream f(data + "/LocalizedComponent/GameTsc/Story/VehiclesDef.tsc");
         std::stringstream tsc;
         tsc << f.rdbuf();

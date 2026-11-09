@@ -20,7 +20,8 @@ struct Outcome {
     std::string line;
 };
 
-Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer, const fuel::Heightfield& terrain) {
+Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer, const fuel::Heightfield& terrain,
+                   const std::function<float(float, float)>& gateWidth) {
     streamer.setMission(e.id);  // its course sub-world, as the mission's teleport streams it in (p35)
     const fuel::Race& r = e.race;
     const int mode = r.gameMode();
@@ -29,7 +30,9 @@ Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& str
     const size_t others = mode == fuel::Race::GmHelicopter ? 0 : size_t(std::clamp(r.aiCount, 0, 11));
     fuel::RaceRules rules;
     rules.ground = [&terrain](float x, float z) { return terrain.smoothHeightAt(x, z); };
+    rules.gateWidth = gateWidth;
     rules.begin(r, 1 + others, e.times[0]);
+    rules.level = e.kind == fuel::Event::Career ? 0 : -1;  // medals: the result line's stars as a gold race (challenges give none)
     std::vector<Vec3> pos(rules.racers.size(), r.start);
     for (size_t i = 1; i < pos.size(); ++i) {
         if (mode == fuel::Race::GmCatchAI && !rules.aiTargets.empty()) {
@@ -53,6 +56,7 @@ Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& str
     };
     // Countdown (vehicle held), then hops every 6 steps.
     int steps = 0;
+    size_t gateStage = size_t(-1);  // the gate whose approach hop was made
     const int maxSteps = 60 * 60 * 25;  // 25 minutes of race time
     while (rules.state != fuel::RaceRules::Finished && steps < maxSteps) {
         if (rules.state == fuel::RaceRules::Running && steps % 6 == 0) {
@@ -68,13 +72,28 @@ Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& str
                 to = near ? goal : rules.heli;
                 hop = true;
             } else if (rules.racers[0].next < rules.route.size()) {
-                to = rules.route[rules.racers[0].next];
+                // FUEL's gates are lines that must be crossed (p38, 0x5c1ad0): hop to 6 m before the line on
+                // the car's side, then 6 m past it, so the move crosses it whatever the course's direction.
+                const fuel::RaceRules::Gate& g = rules.gates[rules.racers[0].next];
+                float nx = -(g.bz - g.az), nz = g.bx - g.ax;
+                const float nl = std::hypot(nx, nz);
+                if (nl > 1e-3f) nx /= nl, nz /= nl;
+                if ((pos[0][0] - g.centre[0]) * nx + (pos[0][2] - g.centre[2]) * nz > 0) nx = -nx, nz = -nz;  // n points away from the car
+                const bool before = gateStage != rules.racers[0].next;
+                const float off = before ? -6.0f : 6.0f;
+                to = {g.centre[0] + nx * off, g.centre[1], g.centre[2] + nz * off};
+                gateStage = rules.racers[0].next;
                 hop = true;
             }
             if (hop) drive.teleport(to[0], to[2], drive.heading());
         }
         drive.update(1.0f / 60, fuel::DriveInput{0, 0, 0, rules.state == fuel::RaceRules::Countdown});
         pos[0] = player();
+        if (std::getenv("FUEL_EVCHK_DEBUG") && steps % 600 == 0 && rules.racers[0].next < rules.gates.size()) {
+            const auto& g = rules.gates[rules.racers[0].next];
+            std::printf("dbg step %d next %zu pos (%.1f %.1f %.1f) gate c (%.1f %.1f) a (%.1f %.1f) b (%.1f %.1f) R %.1f\n", steps, rules.racers[0].next,
+                        pos[0][0], pos[0][1], pos[0][2], g.centre[0], g.centre[2], g.ax, g.az, g.bx, g.bz, rules.gateRadius);
+        }
         rules.update(1.0 / 60, pos);
         ++steps;
     }
@@ -91,7 +110,7 @@ Outcome checkEvent(const fuel::Event& e, DriveSession& drive, WorldStreamer& str
 }  // namespace
 
 int runEventCheck(const std::vector<fuel::Event>& events, DriveSession& drive, WorldStreamer& streamer, fuel::MeshRenderer& renderer,
-                  const fuel::Heightfield& terrain, const std::string& only) {
+                  const fuel::Heightfield& terrain, const std::string& only, const std::function<float(float, float)>& gateWidth) {
     int pass = 0, fail = 0, off = 0, warned = 0;
     std::map<std::string, std::array<int, 3>> byMode;  // game mode -> ok, failed, unplayable
     for (const fuel::Event& e : events) {
@@ -104,7 +123,7 @@ int runEventCheck(const std::vector<fuel::Event>& events, DriveSession& drive, W
                         e.note.c_str());
             continue;
         }
-        const Outcome o = checkEvent(e, drive, streamer, renderer, terrain);
+        const Outcome o = checkEvent(e, drive, streamer, renderer, terrain, gateWidth);
         (o.pass ? pass : fail)++;
         ++byMode[mode][o.pass ? 0 : 1];
         warned += o.line.find("spawn ok ") == std::string::npos;

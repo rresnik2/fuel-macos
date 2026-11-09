@@ -1,8 +1,12 @@
+#include "core/custom_vehicles.hpp"  // CUSTOM VEHICLES
+#include <sstream>
 #include "ui/menu_model.hpp"
+#include "ui/help_texts.hpp"  // PK26
 
 #include "ui/tsc.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -217,9 +221,15 @@ TextTable loadText(const std::string& dataDir, const std::string& language) {
     if (findPathNoCase(loc.string(), name).empty()) std::snprintf(name, sizeof name, "trtext\\tt01.pc");
     t.file = name;
     TscReader text(loc.string());
+    helpTexts().load(dataDir);  // PK26: input.PC's RemapTextAdd records come first (Story/init.tsc LoadINPUT)
     text.run(name, {}, [&](const TscLine& l) {
-        if (l.args.size() >= 3 && upper(l.args[0]) == "TT") t.strings[uint32_t(std::atoi(l.args[1].c_str()))] = l.args[2];
+        if (l.args.size() >= 3 && upper(l.args[0]) == "TT") {
+            std::string& v = t.strings[uint32_t(std::atoi(l.args[1].c_str()))] = l.args[2];
+            helpTexts().transText(v);  // PK26: TransText 0x677dd0 -> 0x4e2820 ("STR_X" -> "{STR_X}")
+        }
     });
+    for (const custom::Vehicle& cv : custom::vehicles())  // CUSTOM VEHICLES: the packs' PortText strings (every language)
+        for (const auto& [id, text] : cv.texts) t.strings.emplace(id, text);
     return t;
 }
 
@@ -227,7 +237,7 @@ std::vector<VehicleInfo> loadVehicleInfos(const std::string& dataDir) {
     std::vector<VehicleInfo> out;
     std::map<std::string, size_t> byMesh;
     TscReader reader((fs::path(dataDir) / "LocalizedComponent").string());
-    reader.run("GameTsc\\Story\\VehiclesDef.tsc", {}, [&](const TscLine& l) {
+    const auto line = [&](const TscLine& l) {
         const std::string cmd = upper(l.args[0]);
         // AddVehicleInfo MESH_ID_X CLASS SURFACE TIER VEH_X TT ? FAMILY
         if (cmd == "ADDVEHICLEINFO" && l.args.size() > 6) {
@@ -237,13 +247,29 @@ std::vector<VehicleInfo> loadVehicleInfos(const std::string& dataDir) {
             v.surface = upper(l.args[3]);
             v.tier = std::atoi(l.args[4].c_str());
             v.nameText = uint32_t(std::atoi(l.args[6].c_str()));
+            v.picture = l.args[5];
             byMesh[l.args[1]] = out.size();
             out.push_back(v);
+        } else if (cmd == "ADDVEHICLECOLOR" && l.args.size() > 2) {
+            int r = 0, g = 0, b = 0;
+            if (auto it = byMesh.find(l.args[1]); it != byMesh.end() && std::sscanf(l.args[2].c_str(), "R%dG%dB%d", &r, &g, &b) == 3)
+                out[it->second].colors.push_back({uint8_t(r), uint8_t(g), uint8_t(b)});
         } else if (cmd == "ADDVEHICLEINTERFACEPARAMS" && l.args.size() > 2) {
             if (auto it = byMesh.find(l.args[1]); it != byMesh.end())
                 for (size_t k = 2; k < l.args.size(); ++k) out[it->second].bars.push_back(float(std::atof(l.args[k].c_str())));
         }
-    });
+    };
+    reader.run("GameTsc\\Story\\VehiclesDef.tsc", {}, line);
+    {  // CUSTOM VEHICLES: the packs' lines after FUEL's (core/custom_vehicles.hpp)
+        std::istringstream extra(custom::extraScript("VehiclesDef.tsc"));
+        bool block = false;
+        for (std::string text; std::getline(extra, text);) {
+            TscLine l;
+            l.args = splitTscLine(text, &block);
+            l.file = "custom";
+            if (!l.args.empty()) line(l);
+        }
+    }
     return out;
 }
 

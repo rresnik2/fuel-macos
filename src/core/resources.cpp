@@ -121,6 +121,7 @@ BitmapInfo parseBitmapLink(const std::vector<uint8_t>& link) {
     bm.formatCode = link[0x1E];
     bm.format = formatForCode(bm.formatCode).format;
     bm.alphaKind = link[0x1F];
+    std::memcpy(&bm.lodBias, &link[22], 4);  // PK28: obj +0x24 (0x84ca80)
     return bm;
 }
 
@@ -147,6 +148,14 @@ Material parseMaterialBody(const std::vector<uint8_t>& b) {
     m.textureMask = rd<uint16_t>(&b[0x38]);
     m.flags = rd<uint32_t>(&b[0x3C]);
     for (size_t i = 0; i < 9; ++i) m.textures[i] = rd<uint32_t>(&b[0x88 + i * 4]);
+    m.uvMatrix = {rd<float>(&b[0x20]), rd<float>(&b[0x24]), rd<float>(&b[0x30]),
+                  rd<float>(&b[0x34]), rd<float>(&b[0x40]), rd<float>(&b[0x44])};
+    m.uvAngle = rd<float>(&b[0x4C]);
+    for (size_t i = 0; i < 4; ++i) m.params[i] = rd<float>(&b[0x60 + i * 4]);
+    m.uvOffset = {rd<float>(&b[0x70]), rd<float>(&b[0x74])};
+    m.uvScale = {rd<float>(&b[0x78]), rd<float>(&b[0x7C])};
+    m.field28 = rd<int32_t>(&b[0x28]);
+    m.field2c = rd<int32_t>(&b[0x2C]);
     return m;
 }
 
@@ -183,8 +192,16 @@ Mesh parseMeshBody(const std::vector<uint8_t>& body, uint32_t linkFlags) {
     const uint32_t nm = r.count();
     m.materials.resize(nm);
     for (uint32_t i = 0; i < nm; ++i) m.materials[i] = r.u32();
-    r.skipArray(0x20);
-    r.skipArray(8);
+    {
+        const uint32_t n = r.count();
+        const uint8_t* p = r.raw(size_t(n) * 0x20);
+        m.collisionNodes.assign(p, p + size_t(n) * 0x20);
+    }
+    {
+        const uint32_t n = r.count();
+        m.collisionTris.resize(size_t(n) * 4);
+        std::memcpy(m.collisionTris.data(), r.raw(size_t(n) * 8), size_t(n) * 8);
+    }
     r.skipArray(0x20);
 
     const uint32_t nvb = r.count();
@@ -229,21 +246,39 @@ Mesh parseMeshBody(const std::vector<uint8_t>& body, uint32_t linkFlags) {
         b.material = rd<uint16_t>(h + 0x2E);
         m.batches.push_back(b);
     }
-    r.skipArray(0x20);
-    r.skipArray(4);
-    r.skipArray(2);
+    {  // P85: the morph point tree, pairs and groups (Mesh_Z +0xfc / +0x104 / +0x10c)
+        uint32_t n = r.count();
+        const uint8_t* p = r.raw(size_t(n) * 0x20);
+        m.morphNodes.assign(p, p + size_t(n) * 0x20);
+        n = r.count();
+        m.morphPairs.resize(size_t(n) * 2);
+        std::memcpy(m.morphPairs.data(), r.raw(size_t(n) * 4), size_t(n) * 4);
+        n = r.count();
+        m.morphGroups.resize(n);
+        std::memcpy(m.morphGroups.data(), r.raw(size_t(n) * 2), size_t(n) * 2);
+    }
     // Morph targets: name, then per-target tables.
     const uint32_t nnamed = r.count();
     for (uint32_t i = 0; i < nnamed; ++i) {
         const uint32_t len = r.count(4096);
         const char* s = reinterpret_cast<const char*>(r.raw(len));
         m.morphTargets.emplace_back(s, strnlen(s, len));
-        r.u32();
-        r.u16();
-        r.skipArray(2);
-        r.skipArray(8);
+        Mesh::MorphTarget t;
+        t.flags = r.u32();
+        t.vb = r.u16();
+        uint32_t n = r.count();
+        t.vertexDelta.resize(n);
+        std::memcpy(t.vertexDelta.data(), r.raw(size_t(n) * 2), size_t(n) * 2);
+        n = r.count();
+        t.deltas.resize(size_t(n) * 4);
+        std::memcpy(t.deltas.data(), r.raw(size_t(n) * 8), size_t(n) * 8);
+        m.morphs.push_back(std::move(t));
     }
-    r.skipArray(6);
+    {
+        const uint32_t n = r.count();
+        m.collisionVerts.resize(size_t(n) * 3);
+        std::memcpy(m.collisionVerts.data(), r.raw(size_t(n) * 6), size_t(n) * 6);
+    }
     if (r.offset() != r.size())
         throw std::runtime_error("parse ended at " + std::to_string(r.offset()) + " of " + std::to_string(r.size()));
     return m;

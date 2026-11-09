@@ -23,6 +23,10 @@ int main(int argc, char** argv) {
                         e.surface.c_str(), e.vehicleFamily.c_str(), e.vehicle.c_str(), fuel::gameModeName(e.race.gameMode()), e.race.scenario,
                         e.race.aiCount, e.race.laps, e.race.checkpoints.size(), e.race.timeLimit, e.playable ? "" : "  UNPLAYABLE: ",
                         e.playable ? "" : e.note.c_str());
+            // PK10: start / finish heading (rotation vector y) and the AI vehicle list (AddMissionParam or EMD_SetFilterIA).
+            std::printf("   yaw %.4f %.4f ai [", e.race.startYaw, e.race.finishYaw);
+            for (size_t i = 0; i < e.aiVehicleLabels.size(); ++i) std::printf("%s%s", i ? " " : "", e.aiVehicleLabels[i].c_str());
+            std::printf("]\n");
             continue;
         }
         if (!e.playable) {

@@ -1,5 +1,6 @@
 #include "ui/menu_assets.hpp"
 
+#include "core/custom_vehicles.hpp"  // CUSTOM VEHICLES
 #include "core/resources.hpp"
 #include "ui/tsc.hpp"
 
@@ -38,12 +39,18 @@ std::vector<uint32_t> utf8Codes(const std::string& s) {
     return out;
 }
 
-MenuAssets::MenuAssets(const std::string& dataDir) {
+MenuAssets::MenuAssets(const std::string& dataDir, const std::vector<std::string>& first, bool menuFiles) {
     const std::string common = (fs::path(dataDir) / "CommonComponent").string();
-    for (const char* rel : {"DATAS\\SHARED.DPC", "DATAS\\FONTES.DPC", "DATAS\\LMENU.DPC", "WORLD\\MENU.DPC"}) {
-        const std::string path = findPathNoCase(common, rel);
+    std::vector<std::string> rels = first;
+    for (const char* rel : {"DATAS\\SHARED.DPC", "DATAS\\FONTES.DPC", "DATAS\\LMENU.DPC", "WORLD\\MENU.DPC"})
+        if (menuFiles || std::string(rel) == "DATAS\\FONTES.DPC") rels.push_back(rel);
+    // CUSTOM VEHICLES: the packs' archives carry their garage carousel picture (MaterialAnim_Z "VEH_<V>").
+    if (menuFiles)
+        for (const custom::Vehicle& cv : custom::vehicles()) rels.push_back(cv.dpc);
+    for (const std::string& rel : rels) {
+        const std::string path = !rel.empty() && rel[0] == '/' ? rel : findPathNoCase(common, rel);
         if (path.empty()) {
-            problems.push_back(std::string("missing ") + rel);
+            problems.push_back("missing " + rel);
             continue;
         }
         try {
@@ -98,6 +105,30 @@ MenuAssets::MenuAssets(const std::string& dataDir) {
             problems.push_back(fonts_[k].name + ": no reference glyph");
         }
     }
+    // ---- PK26: the pad-button icons of SMALL_FONT (codes 1..19: A, B, X, Y, sticks, LB/RB, RT, BACK, START) join the small
+    // font as codes 0x101..0x113 (pages appended). SMALL_FONT_PC has keyboard key caps at 1..18 (the glyphs 0x4e2580 picks
+    // for keys); the {STR_*} pad labels (one byte = the 0xa675c8 index) draw these instead while a pad is present
+    // (UiRenderer::padIcons) [I: FUEL's menu text resolves "SMALL_FONT" by name (0x608f20); the port's small font is _PC].
+    if (auto it = fontsByName.find(asoboCrc("SMALL_FONT")); it != fontsByName.end() && fonts_[0].name == "SMALL_FONT_PC") {
+        const DpcFile* df = it->second.first;
+        const auto body = df->body(*df->find(it->second.second));
+        if (body && body->size() >= 4) {
+            const uint8_t* p = body->data();
+            const uint32_t n = u32(p);
+            size_t o = 4;
+            std::vector<std::pair<uint32_t, Glyph>> icons;
+            for (uint32_t g = 0; g < n && o + 28 <= body->size(); ++g, o += 28)
+                if (const uint32_t code = u32(p + o); code >= 1 && code < 0x20)
+                    icons.emplace_back(code, Glyph{u32(p + o + 4), f32(p + o + 8), f32(p + o + 12), f32(p + o + 16), f32(p + o + 20), f32(p + o + 24)});
+            const uint32_t pages = o + 4 <= body->size() ? u32(p + o) : 0;
+            o += 4;
+            const uint32_t base = uint32_t(fonts_[0].pages.size());
+            for (uint32_t q = 0; q < pages && o + 4 <= body->size(); ++q, o += 4) fonts_[0].pages.push_back(materialBitmap(u32(p + o)));
+            for (auto& [code, g] : icons) g.page += base, fonts_[0].glyphs[0x100 + code] = g;
+            padIcons_ = icons.size();
+        }
+    }
+    // ---- end PK26
 }
 
 BitmapRef MenuAssets::materialBitmap(uint32_t materialId) const {

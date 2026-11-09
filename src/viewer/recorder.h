@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include <cstdio>
+#include <memory>
 #include <string>
 
 namespace fuel {
@@ -42,6 +43,11 @@ public:
     // when the command buffer completes. Also records the GPU time.
     void grab(id<MTLCommandBuffer> cb, id<MTLTexture> tex);
     void watchGpu(id<MTLCommandBuffer> cb);
+    // Every frame: a small copy of `tex` into a ring of the last ~1.5 s. K writes the whole ring
+    // (DIR/k<mark ms>/r_<ms>.jpg), so a one-frame glitch seen just before K is kept. A frame whose
+    // mean brightness jumps away from both neighbours is logged as FLICKER and the half second up
+    // to it written to DIR/flicker_<ms>/.
+    void capture(id<MTLCommandBuffer> cb, id<MTLTexture> tex);
 
 private:
     std::string dir_;
@@ -52,6 +58,9 @@ private:
     bool grabNext_ = false;
     std::string grabNote_;
     int written_ = 0;
+
+    struct Ring;  // the rolling small-frame buffer (recorder.mm)
+    std::shared_ptr<Ring> ring_;
 };
 
 }  // namespace fuel

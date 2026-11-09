@@ -208,6 +208,35 @@ void printAssembly(const fuel::VehicleAssembler& va, const fuel::AssembledVehicl
     for (const std::string& s : v.problems) std::printf("# problem: %s\n", s.c_str());
     const auto& bones = v.otherCommands;
     for (const auto& [bone, text] : bones) std::printf("# other command on bone %d: %s\n", bone, text.c_str());
+    // P74: the CAR_OCCLUSION omni box (0x5cc410)
+    std::printf("# car occlusion: Lod_Z %s box %s half extents %.3f %.3f %.3f\n", v.occlusionLod ? hex8(v.occlusionLod).c_str() : "-",
+                v.occlusionBoxName == fuel::asoboCrc("CAR_OCCLUSION") ? "CAR_OCCLUSION"
+                : v.occlusionBoxName == fuel::asoboCrc("DURL")        ? "DURL+0.75"
+                                                                       : "default",
+                v.occlusionExtents[0], v.occlusionExtents[1], v.occlusionExtents[2]);
+    // P77: the merged Lod_Z boxes (0x5ca7a0: the body blob's size without wheels)
+    for (const fuel::VehicleLight& l : v.lights)  // P77
+        std::printf("# light %s: Omni_Z %08x on bone %d at (%.3f %.3f %.3f) z (%.2f %.2f %.2f) colour %.2f %.2f %.2f r %.1f R %.1f cut %.4f %.4f\n",
+                    l.key.c_str(), l.omniId, l.bone, l.world[12], l.world[13], l.world[14], l.world[8], l.world[9], l.world[10], l.params.colour[0],
+                    l.params.colour[1], l.params.colour[2], l.params.inner, l.params.outer, l.params.cutZ, l.params.cutW);
+    std::printf("# merged boxes: half %.3f %.3f %.3f centre %.3f %.3f %.3f\n", v.boxHalf[0], v.boxHalf[1], v.boxHalf[2], v.boxCentre[0],
+                v.boxCentre[1], v.boxCentre[2]);
+    // ---- PK22: the V:DYN records (0x69e020) and the parts that follow them
+    for (size_t d = 0; d < v.dyn.size(); ++d) {
+        const fuel::vlinks::DynRecord& r = v.dyn[d];
+        std::printf("# dyn %zu: key %08x autostart %d adopt %d limb %d rpm %.5f axis %.2f %.2f %.2f tpm %.2f axe %.0f%.0f%.0f points %zu", d, r.key,
+                    r.autostart, r.adopt, r.limb, r.rpm, r.rpmAxis[0], r.rpmAxis[1], r.rpmAxis[2], r.tpm, r.axe[0], r.axe[1], r.axe[2], r.points.size());
+        for (const auto& p : r.points)
+            std::printf(" [rest %.3f %.3f %.3f g %.2f k %.1f d %.1f box half %.3f %.3f %.3f]", p.rest[0], p.rest[1], p.rest[2], p.gravity, p.spring,
+                        p.damping, p.box[12], p.box[13], p.box[14]);
+        std::printf("\n");
+        for (const fuel::PlacedPart& p : v.parts)
+            if (p.dyn == int(d))
+                std::printf("#   part mesh %08x pivot %.3f %.3f %.3f boneQ %.3f %.3f %.3f %.3f\n", p.meshId, p.dynPivot[0], p.dynPivot[1], p.dynPivot[2],
+                            p.dynBoneQ[0], p.dynBoneQ[1], p.dynBoneQ[2], p.dynBoneQ[3]);
+    }
+    std::printf("# headlight records %d\n", v.headlightRecords ? 1 : 0);
+    // ---- PK22 end
 }
 
 void printSummary(const fuel::VehicleAssembler& va, const fuel::VehicleVariant& variant, int lod) {

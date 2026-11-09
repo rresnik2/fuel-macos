@@ -170,6 +170,7 @@ GroundGenerator::GroundGenerator(const DpcFile& world, const Heightfield& terrai
     f3f54_ = Fractal(perm_, 1, 10.0f, 25.148701f, 0.3f, 0.3f, 5.0f);
     f9e4c_ = Fractal(perm_, 1, 100.0f, 65.145248f, 0.3f, 0.3f, 5.0f);
     fcdc8_ = Fractal(perm_, 3, 500.0f, 43.154682f, 0.025f, 0.15f, 0.5f);
+    fdd9c_ = Fractal(perm_, 5, 20000.0f, 44.68557f, 0.025f, 0.15f, 0.5f);  // bank+0xdd9c (p14 G8 table)
     f8e78_ = Fractal(perm_, 1, 100.0f, 67.349632f, 0.3f, 0.3f, 5.0f);  // clay noise (0x45d010)
     fae20_ = Fractal(perm_, 1, 100.0f, 42.407471f, 0.3f, 0.3f, 5.0f);  // chalk noise (0x45c270)
     fbdf4_ = Fractal(perm_, 1, 100.0f, 52.488899f, 0.3f, 0.3f, 5.0f);  // volcano noise (0x459530)
@@ -317,6 +318,14 @@ float GroundGenerator::forestDensity(double x, double z, float coarseNy) const {
     if (coarseNy < 0.707f) d *= std::max(0.0f, 1 - (0.707f - coarseNy) * 100.0f);
     return clamp01(d);
 }
+
+float GroundGenerator::forestAt(double x, double z) const {
+    float c[3];
+    coarseNormal(x, z, c);
+    return forestDensity(x, z, c[1]);
+}
+
+float GroundGenerator::grassPatch(double x, double z) const { return clamp01(std::fabs((ffd8_.at(x, z) + f1fac_.at(x, z)) * 0.5f)); }
 
 // Point_RockCover (0x6b8d80) over Terrain_RockEval (0x7a4c20).
 void GroundGenerator::rockCover(double x, double z, GroundPoint& p, float coarseNy) const {
@@ -662,7 +671,9 @@ GroundColours GroundGenerator::colours(double x, double z, const GroundPoint& p,
     const C M4 = lerp(mix({41, 42, 43, 44, 45}, {91, 93, 95, 97, 99}), mix({36, 37, 38, 39, 40}, {90, 92, 94, 96, 98}), pr);
 
     // Bit 7 (0x6b9f40): grass colour X.
-    const float occ = clamp01(mapAt(9, x, z));  // ctx+0x230 (tree/bush shade near the camera not ported)
+    // ctx+0x230 = Point_Occlusion 0x772800: map 9 times a 5 m tree/bush shade lattice within 250 m of the camera (0x7727a0),
+    // but every species shade radius (record +0x28) is 0 in FUEL, so the lattice is 1 (P80, notes p80-terrain-big.md B2).
+    const float occ = clamp01(mapAt(9, x, z));
     const float s = clamp01(1.25f * H);
     C X;
     if (p.field == 2) {
@@ -911,4 +922,22 @@ void GroundGenerator::grass(int32_t x0, int32_t z0, int32_t x1, int32_t z1, std:
         }
 }
 
+}  // namespace fuel
+
+namespace fuel {
+float GroundGenerator::decorDensity(double x, double z, float* humidity, float* clearing) const {  // 0x6b7f10
+    const float hum = clamp01(mapAt(2, x, z)), cl = clamp01(fcdc8_.at(x, z));
+    if (humidity) *humidity = hum;
+    if (clearing) *clearing = cl;
+    const float a = float((1.0 - double(hum)) * 0.2);
+    const double u = std::clamp(double(fdd9c_.at(x, z)) + a, 0.0, 1.0);
+    const double s = u * u * 2.0 - 1.0;
+    double t = std::clamp(double(cl) - a, 0.0, 1.0);
+    t = t + t - 1.0;
+    double c;
+    if (t <= 0) c = std::pow(t + 1, 8) - 1;
+    else c = 1 - std::pow(1 - t, 8);
+    const double v = (2.0 - std::fabs(s)) * s * 0.5 + 0.5 - (0.5 + c * 0.5) * 0.8;
+    return float(std::clamp(v, 0.0, 1.0));
+}
 }  // namespace fuel

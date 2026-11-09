@@ -1,5 +1,6 @@
 #include "settings.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -39,6 +40,8 @@ bool toBool(const std::string& v) { return v == "1" || v == "true" || v == "yes"
 }  // namespace
 
 std::string settingsPath() {
+    // P101: tests and checks point the game at a scratch copy (never the player's own file).
+    if (const char* p = std::getenv("FUEL_SETTINGS"); p && *p) return p;
     const char* home = std::getenv("HOME");
     return (fs::path(home ? home : ".") / "Library/Application Support/FUEL Port/settings.txt").string();
 }
@@ -46,6 +49,7 @@ std::string settingsPath() {
 Settings loadSettings(const std::string& path) {
     Settings s;
     for (const auto& [k, v] : readLines(path)) {
+        if (!k.empty()) s.all[k] = v;
         try {
             if (k == "data") s.dataDir = v;
             else if (k == "width") s.width = std::stoi(v);
@@ -86,5 +90,21 @@ bool saveSettings(const Settings& s, const std::string& path) {
     for (const auto& [k, v] : lines) f << (k.empty() ? v : k + " = " + v) << "\n";
     return bool(f);
 }
+
+// ---- PK26 (see settings.hpp)
+int languageIndex(const std::string& language) {
+    std::string l;
+    for (char c : language) l += char(std::tolower(static_cast<unsigned char>(c)));
+    if (l == "en-uk" || l == "english_uk") return 10;  // 0x809
+    if (l == "fr" || l == "french") return 2;          // 0x40c
+    if (l == "es" || l == "spanish") return 3;         // 0x40a
+    if (l == "de" || l == "german") return 4;          // 0x407
+    if (l == "it" || l == "italian") return 5;         // 0x410
+    if (l == "fr-ca") return 0x13;                     // 0xc0c
+    return 1;                                          // 0x81e060's default (English US)
+}
+
+bool languageMiles(int index) { return index == 1 || index == 10 || index == 0x13 || index == 0x14; }
+// ---- end PK26
 
 }  // namespace fuel

@@ -292,7 +292,7 @@ std::array<float, 4> hsvToRgb(const std::array<float, 4>& h) {  // 0x5f4a90
 }
 
 // ---- emitter setters (0x4c4b50 & co.: set the range, redraw the current value) ----
-namespace {
+// PK23: the setters are shared with core/vehicle_fx (declared in sfx.hpp).
 void setRange(Well512& r, Emitter::R& x, float lo, float hi) {
     x.lo = lo, x.hi = hi;
     x.cur = r.uniform() * (hi - lo) + lo;
@@ -325,7 +325,6 @@ Emitter makeEmitter(Well512& r) {  // 0x4c4730
     redraw3(r, e.offset);
     return e;
 }
-}  // namespace
 
 // ---- System ----
 System::System(const Tables& t) : t_(t), rng_(t.wellSeed) {}
@@ -455,10 +454,10 @@ void System::update(float dt, const std::vector<WheelFeed>& feeds, const V3& eye
     for (const WheelFeed& f : feeds) {
         Wheel* w = nullptr;
         for (Wheel& c : wheels_)
-            if (c.key == f.key) w = &c;
+            if (c.key == f.key && !c.w->dead()) w = &c;  // PK23: a killed emitter is never fed again
         if (!w) {
             if (!f.active) continue;
-            wheels_.push_back({f.key, std::make_unique<WheelEmitter>(*this, f.player), 0});
+            wheels_.push_back({f.key, std::make_unique<WheelEmitter>(*this, f.player, f.water), 0});
             w = &wheels_.back();
         }
         w->idle = 0;
@@ -466,14 +465,20 @@ void System::update(float dt, const std::vector<WheelFeed>& feeds, const V3& eye
         else w->w->stopAll();
     }
     for (Wheel& w : wheels_) {
-        if (w.idle > 0) w.w->stopAll();
-        for (Emitter* e : {&w.w->dust, &w.w->stones, &w.w->projection, &w.w->chunks}) runEmitter(*e, dt, eye);
+        if (w.idle > 0 && !w.w->dead()) w.w->kill();  // PK23: the vehicle's FX teardown 0x5d1060 -> 0x5f0a20 (was stopAll)
+        if (w.w->water()) {
+            runEmitter(w.w->mist, dt, eye), runEmitter(w.w->spray, dt, eye);
+        } else {
+            for (Emitter* e : {&w.w->dust, &w.w->stones, &w.w->projection, &w.w->chunks}) runEmitter(*e, dt, eye);
+            runTrack(w.w->track, dt, eye);
+        }
     }
     // A wheel that is gone for good and has nothing left to draw is dropped.
     wheels_.erase(std::remove_if(wheels_.begin(), wheels_.end(),
                                  [](const Wheel& w) {
                                      return w.idle > 600 && w.w->dust.live.empty() && w.w->stones.live.empty() &&
-                                            w.w->projection.live.empty() && w.w->chunks.live.empty();
+                                            w.w->projection.live.empty() && w.w->chunks.live.empty() &&
+                                            w.w->mist.live.empty() && w.w->spray.live.empty() && w.w->track.ribbons.empty();
                                  }),
                   wheels_.end());
     // GPU particles die at spawn + life (0x5ff610 retires ring slots by their death time).
@@ -481,17 +486,224 @@ void System::update(float dt, const std::vector<WheelFeed>& feeds, const V3& eye
     if (gpu_.size() > 32 * 256) gpu_.erase(gpu_.begin(), gpu_.begin() + long(gpu_.size() - 32 * 256));  // 256 buckets of 32
 }
 
+// ---- Tyre tracks (ribbon trail) ----
+namespace {
+V3 cross3(const V3& a, const V3& b) { return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]}; }
+// 0x5df2c0's u bookkeeping (run by the particle step): u of every point from +0x8c on, +0x60 advanced to the u at
+// point n - 3, +0x8c = max(n - 3, 0). The last point adds the previous segment's length (fStack_5c is not
+// recomputed for it), which is never stored.
+void ribbonAdvance(Ribbon& r, std::vector<float>& u) {
+    const int n = int(r.pts.size());
+    u.assign(size_t(n), 0.0f);
+    if (n <= 1) return;
+    // Points before +0x8c keep the u the earlier builds gave them: replay them from 0 with the same arithmetic.
+    float run = r.uBase;
+    float seg = 0;
+    for (int i = r.base; i < n; ++i) {
+        u[size_t(i)] = run;
+        if (i != n - 1) seg = len3(sub3(r.pts[size_t(i + 1)].pos, r.pts[size_t(i)].pos));
+        run = r.uPerMetre * seg + run;
+        if (i < n - 3) r.uBase = run;
+    }
+    r.prevBase = r.base;
+    r.base = std::max(n - 3, 0);
+}
+}  // namespace
+
+void ribbonRebuild(Ribbon& r) {
+    std::vector<float> u;
+    ribbonAdvance(r, u);
+    for (size_t k = 0; k < u.size(); ++k)
+        if (int(k) >= r.prevBase) r.pts[k].u = u[k];
+}
+
+float ribbonEndU(const Ribbon& r) {  // 0x5df240
+    float sum = 0;
+    for (size_t i = 0; i + 1 < r.pts.size(); ++i) sum = len3(sub3(r.pts[i].pos, r.pts[i + 1].pos)) + sum;
+    return sum * r.uPerMetre + r.uBase;
+}
+
+void ribbonVertices(const Ribbon& r, std::vector<DecalVertex>& out) {  // 0x5df2c0 (the vertex strip)
+    const int n = int(r.pts.size());
+    if (n < 2) return;
+    const size_t first = out.size();
+    out.resize(first + size_t(2 * n));
+    DecalVertex* v = out.data() + first;
+    V3 side{1, 0, 0};  // DAT_00a06338 for degenerate first segments
+    for (int i = 0; i < n; ++i) {
+        const RibbonPoint& p = r.pts[size_t(i)];
+        if (i != n - 1) {
+            const V3 d = sub3(r.pts[size_t(i + 1)].pos, p.pos);
+            const float l = len3(d);
+            if (l > 0.0001f) {
+                V3 s = cross3(p.normal, mul3(d, 1.0f / l));
+                const float sl = len3(s);
+                if (sl > 0) side = mul3(s, 1.0f / sl);  // 0x410050(1.0)
+            } else if (i < 2) {
+                side = {1, 0, 0};
+            }
+        }
+        DecalVertex& a = v[2 * i];
+        DecalVertex& b = v[2 * i + 1];
+        a.pos = add3(p.pos, mul3(side, r.halfWidth));
+        b.pos = sub3(p.pos, mul3(side, r.halfWidth));
+        a.u = b.u = p.u;
+        a.v = 0, b.v = 1;  // 0x3c00
+        a.rgba = b.rgba = {p.colour[0], p.colour[1], p.colour[2], 0};
+        a.normal = b.normal = p.normal;
+        a.lift = b.lift = 0.0625f;
+        a.deep = b.deep = p.deep, a.tarmac = b.tarmac = p.tarmac;
+    }
+    const int m = 2 * n;
+    for (int j = 0; j < m; ++j) {  // vertex(j) - vertex(j + 2); the last two pairs vertex(j - 2) - vertex(j)
+        if (j + 2 < m && j < m - 4) v[j].tangent = sub3(v[j].pos, v[j + 2].pos);
+        else if (j >= 2) v[j].tangent = sub3(v[j - 2].pos, v[j].pos);
+    }
+    for (int j = 0; j < 2 && j + 2 < m; ++j) v[j].tangent = v[j + 2].tangent;  // FUEL: copied once +0x8c > 0
+    const float fadeA = r.fade ? std::max(0.0f, 1.0f - r.age / std::max(r.life, 1e-6f)) * r.colourAlpha : 1.0f;
+    for (int j = 2; j < m - 2; ++j) v[j].rgba[3] = fadeA;
+    if (!r.fade && r.prevBase == 0)  // a build that started at point 0 leaves the second pair at 0 too
+        for (int j = 2; j < 4 && j < m - 2; ++j) v[j].rgba[3] = 0;
+}
+
+Ribbon* System::emitRibbon(TrackEmitter& e) {  // 0x5f41f0
+    // Kill flag 8: at most 30 ribbons; the oldest recyclable one is killed (0x5eeba0: flag 0x10 -> a 5 s fade).
+    if (e.ribbons.size() > 0x1d)
+        for (size_t i = 0; i < e.ribbons.size(); ++i)
+            if (e.ribbons[i].flags & 8) {
+                Ribbon& k = e.ribbons[i];
+                if (k.flags & 0x10) k.flags = 1, k.age = 0, k.fade = true, k.life = 5.0f;
+                else e.ribbons.erase(e.ribbons.begin() + long(i));
+                break;
+            }
+    Ribbon r;  // 0x5df0d0 then the init 0x5f4570
+    r.flags = 0x1e, r.motion = 1;
+    r.at = e.pos;  // + offset (0)
+    r.halfWidth = e.halfWidth;
+    r.life = rng_.range(e.lifeLo, e.lifeHi);
+    r.colourAlpha = e.colour[3];
+    e.ribbons.push_back(r);
+    e.lastEmit = e.pos;
+    e.burstDone = true;
+    // The redraws of 0x5f41f0 (interval, accel, size, angle, rot speed, colour, velocity, offset, +0x15c, life):
+    // only the size is used by the tracks; the draws keep the shared generator's sequence.
+    for (int k = 0; k < 13; ++k) rng_.uniform();
+    return &e.ribbons.back();
+}
+
+void System::stepRibbon(TrackEmitter& e, size_t i, float dt) {  // 0x5eec30
+    Ribbon* r = &e.ribbons[i];
+    r->age += dt;  // 0x5df2c0
+    ribbonRebuild(*r);
+    if (r->motion != 1) return;
+    r->at = add3(r->start, e.pos);
+    auto point = [&]() {
+        RibbonPoint p;
+        p.pos = e.pos, p.colour = e.colour, p.deep = e.deep, p.tarmac = e.tarmac, p.normal = e.normal;
+        return p;
+    };
+    const size_t n = r->pts.size();
+    if (n == 0) {  // the first step lays two points at the emitter
+        r->pts.push_back(point());
+        r->pts.push_back(point());
+        return;
+    }
+    bool freeze = n >= 0x20;
+    if (!freeze) {
+        V3 prev = r->pts[n - 2].pos;
+        V3 d = sub3(e.pos, prev);
+        float len = len3(d);
+        if (int(len / r->spacing) == 0) {  // ftol 0x8e01d0: the head just follows
+            r->pts[n - 1].pos = e.pos;
+            return;
+        }
+        if (len < 4.0f) {
+            if (r->spacing < len) {
+                size_t head = n - 1;
+                float norm = len;
+                do {
+                    // The head is fixed one spacing along, a new head follows the emitter. FUEL normalises the
+                    // next step by (distance - spacing), so a second point in one frame lands a little farther.
+                    r->pts[head].pos = add3(prev, mul3(d, r->spacing / norm));
+                    prev = r->pts[head].pos;
+                    d = sub3(e.pos, prev);
+                    r->pts.push_back(point());
+                    head = r->pts.size() - 1;
+                    norm = len3(d) - r->spacing;
+                } while (r->spacing < norm);
+            }
+            if (n != 0x1f) return;
+        }
+        freeze = true;  // 4 m or more in one step, or the 32nd point
+    }
+    r->motion = 2;  // 0x5de2d0 hands the ribbon to the static decal list
+    const float endU = ribbonEndU(*r);
+    Ribbon* nr = emitRibbon(e);
+    if (nr) nr->uBase = endU;
+}
+
+void System::runTrack(TrackEmitter& e, float dt, const V3& eye) {  // 0x5f3ef0
+    // Particle loop 0x5f4480: step, then the kill tests (flag 1 life, flag 2 > 200 m from the camera).
+    const size_t count = e.ribbons.size();
+    for (size_t i = 0; i < count && i < e.ribbons.size(); ++i) {
+        stepRibbon(e, i, dt);
+        Ribbon& r = e.ribbons[i];
+        if ((r.flags & 1) && r.life < r.age) r.dead = true;
+        if (r.flags & 2) {
+            const V3 d = sub3(r.at, eye);
+            if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 40000.0f) r.dead = true;
+        }
+        if (r.dead) {  // 0x5eeba0
+            if (r.flags & 0x10) {
+                r.flags = 1, r.age = 0, r.fade = true, r.life = 5.0f;
+            } else {
+                e.ribbons.erase(e.ribbons.begin() + long(i));
+                --i;
+            }
+        }
+    }
+    if (e.stopped) return;
+    if (!e.burstDone) emitRibbon(e);  // spawn mode 3: one ribbon per start
+}
+
+void System::collectTracks(std::vector<DecalVertex>& out, std::vector<uint32_t>& counts) const {
+    out.clear(), counts.clear();
+    for (const Wheel& w : wheels_)
+        for (const Ribbon& r : w.w->track.ribbons) {
+            const size_t before = out.size();
+            ribbonVertices(r, out);
+            if (out.size() > before) counts.push_back(uint32_t(out.size() - before));
+        }
+}
+
 void System::collect(std::vector<const Particle*>& out) const {
     out.clear();
     for (const Particle& p : gpu_) out.push_back(&p);
     for (const Wheel& w : wheels_)
-        for (const Emitter* e : {&w.w->dust, &w.w->stones, &w.w->projection, &w.w->chunks})
+        for (const Emitter* e : {&w.w->dust, &w.w->stones, &w.w->projection, &w.w->chunks, &w.w->mist, &w.w->spray})
             for (const Particle& p : e->live)
                 if (p.age > 0) out.push_back(&p);
 }
 
 // ---- Wheel emitter ----
-WheelEmitter::WheelEmitter(System& sys, bool player) : sys_(sys), player_(player) { setup(); }
+WheelEmitter::WheelEmitter(System& sys, bool player, bool water) : sys_(sys), player_(player), water_(water) {
+    if (water) waterSetup();
+    else setup();
+}
+
+void WheelEmitter::waterSetup() {  // 0x5efc00 with +0x3c set: the mist +0x48 and spray +0x50 (atlas 46)
+    Well512& r = sys_.rng();
+    mist = makeEmitter(r);
+    setRange(r, mist.angle, -kPi, kPi);
+    mist.spawnMode = 2, mist.motion = 3, mist.killFlags = 1;
+    mist.alphaFn = Fade::OneMinusTSq, mist.sizeFn = Fade::Quarter;  // 0x5f4810 / 0x301, 0x5d2fd0 / 0x003
+    mist.atlas = 0x2e, mist.kind = 0xe, mist.gpuStatic = true;
+    spray = makeEmitter(r);
+    setRange(r, spray.angle, -kPi, kPi);
+    spray.spawnMode = 2, spray.motion = 3, spray.killFlags = 1;
+    spray.alphaFn = Fade::OneMinusT, spray.sizeFn = Fade::SqrtT;  // 0x4beab0 / 0x101, 0x5f4840 / 0x401
+    spray.atlas = 0x2e, spray.kind = 0xe, spray.gpuStatic = true;
+}
 
 void WheelEmitter::setup() {  // 0x5efc00 (the dry-land form, +0x3c == 0)
     Well512& r = sys_.rng();
@@ -525,6 +737,12 @@ void WheelEmitter::setup() {  // 0x5efc00 (the dry-land form, +0x3c == 0)
     redraw3(r, stones.offset);
     stones.atlas = 42, stones.kind = 0xe, stones.gpuStatic = true;
 
+    // +0x40 tyre track (0x5f3050): size 0.2 (0x5f33f0), life P5110..P5111 (0x5f3440), spawn mode 3 (one ribbon
+    // per start), motion 1, uv flag 1, kill flags 0x1e, alpha 0x4beae0, atlas 0xf (FX_PNEU), offset 0, kind 0x1b.
+    for (int k = 0; k < 10; ++k) r.uniform();  // the ctor's and the setters' redraws
+    track.halfWidth = 0.2f;
+    track.lifeLo = P(5110), track.lifeHi = P(5111);
+
     projection = makeEmitter(r);  // +0x4c
     setRange(r, projection.size, 0, 0);
     setRange(r, projection.life, 0, 0);
@@ -552,12 +770,49 @@ void WheelEmitter::setup() {  // 0x5efc00 (the dry-land form, +0x3c == 0)
     chunks.kind = 0xe, chunks.gpuStatic = true;
 }
 
+void trackHeadSnap(TrackEmitter& t, const V3& wheelPos, const V3& contact) {  // PK23: 0x5f0b70
+    if (t.stopped || t.ribbons.empty()) return;
+    Ribbon& r = t.ribbons.back();
+    if (r.motion == 2 || r.pts.size() < 2) return;
+    const V3 d = sub3(wheelPos, r.pts.back().pos);
+    if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 4.0f) r.pts.back().pos = contact;
+}
+
+// ---- PK23: the kills (vf02). 0x4c56b0: stop if running, dying; flags +0x58 & 4 drops the particles now. 0x5eeb20 (the
+// track): the same, flags 0x1e & 4 frees every ribbon at once. 0x5f0a20: the wheel emitter's, each sub-emitter's vf02.
+void Emitter::kill() {
+    if (!stopped) stop();
+    dying = true;
+    if (killFlags & 4) live.clear();
+}
+void TrackEmitter::kill() {
+    if (!stopped) stop();
+    dying = true;
+    if (flags & 4) ribbons.clear();
+}
+void WheelEmitter::kill() {
+    stopped_ = true;
+    dead_ = true;
+    if (water_) {
+        mist.kill(), spray.kill();
+        return;
+    }
+    dust.kill(), track.kill(), projection.kill(), stones.kill(), chunks.kill();
+}
+// ---- PK23 end
+
 void WheelEmitter::stopAll() {  // 0x5f0af0
     stopped_ = true;
-    dust.stop(), stones.stop(), projection.stop(), chunks.stop();
+    if (water_) {
+        mist.stop(), spray.stop();
+        return;
+    }
+    dust.stop(), projection.stop(), track.stop(), stones.stop(), chunks.stop();
 }
 
 void WheelEmitter::surfaceRules(const WheelInput& in, bool rainFlag) {  // 0x5f29d0
+    // Each action function tests +0x3c: the water form drives the mist (+0x48, in the dust's place) and the spray
+    // (+0x50, in the projection's place) and leaves the stones, chunks and track alone.
     const auto& c = in.classes;
     const bool tarmac = c[0] > 0.5f;
     const bool rough = !tarmac && c[2] + c[5] + c[6] + c[7] > 0.5f;           // classes 2, 5, 6, 7
@@ -565,32 +820,58 @@ void WheelEmitter::surfaceRules(const WheelInput& in, bool rainFlag) {  // 0x5f2
     const bool snowy = !tarmac && !rough && !soft && c[15] + c[16] + c[17] > 0.5f;  // 15, 16, 17
     const float wetSum = c[11] + c[12];                                          // 11, 12
     const bool other = !tarmac && !rough && !soft && !snowy && !(wetSum > 0.5f);
-    const bool moving = mode != 3, slipMode = mode == 1 || mode == 2;
+    const bool w = water_;
+    auto inWater = [&]() {  // 0x5f2de0
+        if (w) mist.stop(), spray.start();
+        else dust.stop(), track.stop(), stones.stop(), chunks.stop(), projection.start();
+    };
     if (in.depth <= 0) {
         if (in.rain <= 0.1f) {
             if (wetSum > 0.5f) {  // 0x5f2bc0
-                dust.stop(), projection.stop(), stones.stop(), chunks.start();
-            } else if (tarmac) {  // 0x5f2d30: smoke while sliding
-                projection.stop(), stones.stop(), chunks.stop();
-                if (mode == 0 || mode == 3) dust.stop();
-                else dust.start();
+                if (w) mist.stop(), spray.stop();
+                else dust.stop(), track.stop(), projection.stop(), stones.stop(), chunks.start();
+            } else if (tarmac) {  // 0x5f2d30: smoke while sliding, a track in mode 1
+                if (w) spray.stop();
+                else projection.stop(), stones.stop(), chunks.stop();
+                Emitter& d = w ? mist : dust;
+                if (mode == 0 || mode == 3) d.stop();
+                else d.start();
+                if (!w) {
+                    if (mode == 1) track.start();
+                    else track.stop();
+                }
             } else if (rough) {  // 0x5f2e30
-                dust.stop(), projection.stop(), chunks.stop(), stones.start();
+                if (w) spray.stop(), mist.start();
+                else dust.stop(), projection.stop(), chunks.stop(), stones.start();
             } else if (other || soft || snowy) {  // 0x5f2e80 / 0x5f2c10 / 0x5f2ca0
-                projection.stop(), stones.stop(), chunks.stop();
-                if (moving) dust.start();
-                else dust.stop();
+                if (w) spray.stop();
+                else projection.stop(), stones.stop(), chunks.stop();
+                if (mode == 3) {  // not moving
+                    if (w) mist.stop();
+                    else if (other) dust.stop(), track.start();  // 0x5f2e80 keeps laying the track
+                    else track.stop(), dust.stop();
+                } else {
+                    if (w) mist.start();
+                    else dust.start(), track.start();
+                }
             }
         } else {  // 0x5f2f10: wet weather
-            dust.stop(), chunks.stop();
-            if (tarmac) projection.start(), stones.stop();
-            else if (!(0.5f <= wetSum)) projection.start();
-            if (rainFlag) dust.stop(), stones.stop(), chunks.stop(), projection.start();  // 0x5f2de0
+            if (w) mist.stop();
+            else dust.stop(), chunks.stop();
+            if (tarmac) {
+                if (w) spray.start();
+                else track.stop(), projection.start(), stones.stop();
+            } else if (0.5f <= wetSum) {
+                if (!w) track.stop();
+            } else {
+                if (w) spray.start();
+                else track.start(), projection.start();
+            }
+            if (rainFlag) inWater();
         }
-    } else {  // 0x5f2de0: in water / soft ground
-        dust.stop(), stones.stop(), chunks.stop(), projection.start();
+    } else {
+        inWater();
     }
-    (void)slipMode;
 }
 
 void WheelEmitter::baseUpdate(float dt, const WheelInput& in) {  // 0x5f0ef0
@@ -612,6 +893,56 @@ void WheelEmitter::baseUpdate(float dt, const WheelInput& in) {  // 0x5f0ef0
     const C4 hsv = rgbToHsv(in.groundColour);
     const bool onTarmac = in.classes[0] > 0.5f;
     C4 dustB{1, 1, 1, 1};
+    // Distance level of detail (only the water form reads it): x = clamp01(+0x18 x 0.0004), +0x18 = the squared
+    // camera distance (0x5f7af0), x = 1 for the player (+0x20); A scales the lives, B the spacings.
+    const float lodX = player_ ? 1.0f : std::clamp(in.cameraDistSq * 0.0004f, 0.0f, 1.0f);
+    const float lodA = (lodX + 1.0f) * 0.5f, lodB = (1.0f - lodX) * 0.8f + 1.0f;
+    if (water_) {
+        if (!mist.stopped) {  // +0x48, rows 5360-5375 (asm 0x5f124f..0x5f14b9)
+            C4 rgb = hsvToRgb({hsv[0], hsv[1], P(5368), hsv[3]});
+            C4 A = rgb, B = rgb;
+            A[3] = P(5364), B[3] = P(5365);
+            const V3 v{in.velocity[0] * P(5372), in.velocity[1] * P(5372) + P(5370), in.velocity[2] * P(5372)};
+            const float k = kK * (1.0f - P(5373)) / P(5360);
+            const V3 acc{v[0] * k, v[1] * k + P(5371), v[2] * k};
+            mist.vel.lo = mist.vel.hi = v;     // 0x5d1350 (no redraw)
+            mist.offset.lo = mist.offset.hi = {0, 0, 0};  // 0x5f2ff0
+            mist.life.lo = P(5360) * lodA, mist.life.hi = lodA * P(5361);
+            mist.size.lo = P(5362), mist.size.hi = P(5363);
+            mist.spacing.lo = P(5366) * lodB, mist.spacing.hi = lodB * P(5367);
+            mist.accel.lo = mist.accel.hi = acc;  // 0x5d1390
+            mist.colourA = A, mist.colourB = B;   // 0x5d1410
+            mist.angle.lo = -P(5374), mist.angle.hi = P(5374);
+            mist.rotSpeed.lo = -P(5375), mist.rotSpeed.hi = P(5375);
+            if (mode == 2) {
+                mist.spawnMode = 1;
+                setRange(r, mist.interval, 0.03f, 0.08f);  // 0x4c4ad0
+                const V3 bv = mul3(back, 1.5f * 1.5f);      // [0x995ee4] 1.5 applied twice (asm 0x5f146a..)
+                setRange3One(r, mist.vel, bv, bv);
+            } else {
+                mist.spawnMode = 2;
+            }
+        }
+        if (!spray.stopped) {  // +0x50, rows 5340-5356
+            const C4 base = onTarmac ? C4{1, 1, 1, 1} : in.groundColour;  // .data 0xa064b8 white on tarmac
+            const C4 col{base[0] * P(5348), base[1] * P(5348), base[2] * P(5348), P(5344)};
+            const V3 v = mul3(in.velocity, P(5355));
+            spray.vel.lo = spray.vel.hi = v;
+            const float life = (lerpf(P(5340), P(5341), s)) * lodA;
+            spray.life.lo = spray.life.hi = life;
+            spray.offset.lo = spray.offset.hi = offset;
+            spray.angle.lo = -P(5353), spray.angle.hi = P(5353);
+            spray.rotSpeed.lo = -P(5354), spray.rotSpeed.hi = P(5354);
+            spray.size.lo = std::max(P(5342) * s, 0.5f), spray.size.hi = std::max(P(5343) * s, 0.5f);
+            const float sp = lerpf(P(5346), P(5347), s) * lodB;
+            spray.spacing.lo = spray.spacing.hi = sp;
+            const float k = kK * (1.0f - P(5356)) / P(5340);
+            const V3 acc{v[0] * k, v[1] * k + lerpf(P(5351), P(5352), s), v[2] * k};
+            spray.accel.lo = spray.accel.hi = acc;
+            spray.colourA = spray.colourB = col;
+        }
+        return;
+    }
 
     if (!dust.stopped) {
         C4 A, B;
@@ -665,6 +996,13 @@ void WheelEmitter::baseUpdate(float dt, const WheelInput& in) {  // 0x5f0ef0
         } else {
             stones.spawnMode = 2;
         }
+    }
+    if (!track.stopped) {  // +0x40 (asm after the stones): width, colour, deep / tarmac, normal
+        track.halfWidth = in.width * 0.8f;  // 0x5f33f0(w, w) (+0xfc redrawn in [w, w])
+        r.uniform();
+        track.colour = in.groundColour;
+        track.deep = in.load, track.tarmac = in.classes[0];
+        track.normal = in.up;
     }
     if (!projection.stopped) {
         const bool notTarmacShallow = !(onTarmac || 0.1f < in.depth);
@@ -791,14 +1129,24 @@ void WheelEmitter::update(float dt, const WheelInput& in) {
     // 0x5ceb60: (re)start a stopped wheel emitter, then place it (0x5f0c20).
     if (stopped_) {  // 0x5f0a90
         stopped_ = false;
-        dust.start(), stones.start(), projection.start(), chunks.start();
+        if (water_) mist.start(), spray.start();
+        else dust.start(), projection.start(), track.start(), stones.start(), chunks.start();
     }
     prev_ = havePos_ ? pos_ : in.contact;
     pos_ = in.contact;
     havePos_ = true;
     phase_ += 4.0f * dt;  // 0x5f0b50
-    auto place = [&](Emitter& e, float k) { e.setPosition({pos_[0], pos_[1] + e.size.cur * k, pos_[2]}); };
-    place(dust, 0.5f), place(projection, 0.4f), place(stones, 0.4f), place(chunks, 0.4f);
+    if (water_) {  // 0x5f0c20: the water form's emitters sit at the position itself
+        mist.setPosition(pos_), spray.setPosition(pos_);
+    } else {
+        auto place = [&](Emitter& e, float k) { e.setPosition({pos_[0], pos_[1] + e.size.cur * k, pos_[2]}); };
+        place(dust, 0.5f), place(projection, 0.4f), place(stones, 0.4f), place(chunks, 0.4f);
+        track.setPosition(in.trackPos);  // the feed: vf+0x14 of +0x40 with +0xac
+        // ---- PK23: 0x5f0b70 (the end of vf05 0x5f0c20): while the track runs, its last ribbon is not frozen (motion 2) and
+        // has two points or more, a last point within 2 m (d^2 < 4) of the emitter position +8 snaps to the contact +0xac.
+        trackHeadSnap(track, pos_, in.trackPos);
+        // ---- PK23 end
+    }
     baseUpdate(dt, in);
     if (player_) playerUpdate(in);
 }

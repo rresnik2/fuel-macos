@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 namespace fuel {
@@ -74,6 +75,23 @@ public:
 
     bool inEnd1Ring(uint32_t a, uint32_t b) const;  // 0x6d77c0
 
+    // Road loops for the free-roam traffic (P58, notes/p58-traffic.md).
+    // 0x6d3190: records whose bbox lies inside the box (2 m units, 0x4ae680 rounding), flags 0x2400000 skipped,
+    // in grid order (cell rows z, then x, index order in a cell), each once.
+    std::vector<uint32_t> recordsInBox(float x0, float z0, float x1, float z1) const;
+    struct Loop {
+        std::vector<uint32_t> recs;  // loop record +2 (list order = the reverse of the search's travel)
+        float length = 0;            // +0x404
+    };
+    // RoadLoop_FindInBox 0x6daff0 (+ RoadLoop_DFS 0x6dad40): from each eligible record of the box (types 6-12 and
+    // >= 16, not rigid, not closed), a depth-first search over the road ends inside the box for the longest walk
+    // back to the record's end 1; the record with the most records in its loop wins (search stops at >= 10);
+    // false when the best has fewer than 3.
+    bool findLoop(float x0, float z0, float x1, float z1, Loop& out) const;
+    // LoopCursor_Seek 0x6db320: the point at distance s (0 <= s < length) along the loop, list order, each record
+    // walked towards the end that touches the next record; dir = the segment's unit direction, rec = the record.
+    std::array<float, 2> loopPoint(const Loop& loop, float s, float* dirX = nullptr, float* dirZ = nullptr, int* rec = nullptr) const;
+
 private:
     std::vector<Rec> recs_;
     std::vector<std::array<int32_t, 2>> pts_;
@@ -84,6 +102,15 @@ private:
 
     float segDist2(uint32_t r, float px, float pz, float rad, int& k, float& qx, float& qz) const;  // 0x6d1520
     bool search(Route& route, const CostFn& cost) const;  // 0x6d7f90
+    struct LoopNode {
+        uint32_t rec = 0;
+        bool dir = false;    // 1: reached travelling end 0 -> end 1
+        uint8_t state = 0;   // 1: visited or outside the box
+    };
+    bool loopEligible(uint32_t r) const;
+    uint64_t endKey(uint32_t r, bool end1) const;
+    int loopDfs(std::unordered_map<uint64_t, LoopNode>& nodes, uint64_t cur, uint64_t prev, uint64_t start, const float box[4], float acc,
+                float& best) const;  // 0x6dad40
     bool sameRecordDir(uint32_t r, int ks, int ke, float sx, float sz, float ex, float ez) const;  // 0x6d7820
 };
 

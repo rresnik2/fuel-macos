@@ -1,9 +1,17 @@
 // The event catalogue: hubinfos.tsc (hub order, career and challenge lists, needed vehicles,
-// times) joined with the EMD blocks of miss_official.tsc and missChallenge.tsc.
+// times) joined with the missions: the EMD blocks of miss_official.tsc and missChallenge.tsc, then
+// the MISSION_COURSE nodes of USA1.DPC (0x4f4db0, notes/p42-missions.md).
 // FUEL.exe joins them the same way: AddHubCareerRaces (0x575370) and AddHubCHallengeRaces
 // (0x5755e0) look the mission up by name with _stricmp and silently skip names that match no
 // mission. See ~/re-work/fuel/notes/p17-events.md (E1-E9).
+#include "custom_vehicles.hpp"  // CUSTOM VEHICLES
 #include "events.hpp"
+#include "storms.hpp"
+
+#include "console.hpp"
+#include "dpc.hpp"
+
+#include <strings.h>
 
 #include <algorithm>
 #include <cctype>
@@ -11,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <cstdlib>
 #include <sstream>
 
 namespace fuel {
@@ -82,10 +91,18 @@ const char* gameModeName(int m) {
 std::vector<Event> loadEvents(const std::string& dataDir) {
     const std::filesystem::path story = std::filesystem::path(dataDir) / "LocalizedComponent/GameTsc/Story";
 
-    // Missions by upper-case name (FUEL matches with _stricmp).
+    // Missions by upper-case name (FUEL matches with _stricmp). The level's mission list (0x4f40f0)
+    // holds the EMD blocks first, then the world's MISSION_COURSE nodes (0x4f4db0); the name lookup
+    // 0x4f8f90 returns the first match, so emplace keeps the earlier one.
     std::map<std::string, Race> missions;
     for (const char* file : {"miss_official.tsc", "missChallenge.tsc"})
         for (Race& r : parseMissions(readFile(story / file))) missions.emplace(upper(r.name), std::move(r));
+    try {
+        const DpcFile usa1((std::filesystem::path(dataDir) / "CommonComponent/WORLD/USA1.DPC").string());
+        for (Race& r : loadWorldMissions(usa1)) missions.emplace(upper(r.name), std::move(r));
+    } catch (const std::exception&) {
+        // No world file: only the script missions exist.
+    }
 
     struct Hub {
         std::string id;
@@ -101,6 +118,19 @@ std::vector<Event> loadEvents(const std::string& dataDir) {
         return nullptr;
     };
 
+    // The game's vehicle table (AddVehicleInfo, VehiclesDef.tsc order): the ids of AddMissionParam's AI list.
+    std::vector<std::string> vehicleTable;
+    try {
+        std::istringstream vin(custom::readScript((story / "VehiclesDef.tsc").string()));  // CUSTOM VEHICLES: packs appended
+        std::string vl;
+        while (std::getline(vin, vl)) {
+            const std::vector<std::string> t = tokens(vl);
+            if (t.size() > 1 && consoleCommandIs(t[0], "AddVehicleInfo"))
+                vehicleTable.push_back(t[1].compare(0, 8, "MESH_ID_") == 0 ? t[1].substr(8) : t[1]);
+        }
+    } catch (const std::exception&) {
+    }
+
     std::istringstream in(readFile(story / "hubinfos.tsc"));
     std::string line;
     std::vector<std::vector<std::string>> lines;
@@ -110,17 +140,17 @@ std::vector<Event> loadEvents(const std::string& dataDir) {
     }
     // Pass 1: hubs and their event lists (pointers into the lists are taken after they are complete).
     for (const auto& t : lines) {
-        if (t[0] == "SetHubTargetInfos" && t.size() > 3) {
+        if (consoleCommandIs(t[0], "SetHubTargetInfos") && t.size() > 3) {
             Hub h;
             h.id = upper(t[1]);
             h.tier = int(number(t[2]));
             hubs.push_back(h);
-        } else if ((t[0] == "AddHubCareerRaces" || t[0] == "AddHubCHallengeRaces") && t.size() > 3) {
+        } else if ((consoleCommandIs(t[0], "AddHubCareerRaces") || consoleCommandIs(t[0], "AddHubCHallengeRaces")) && t.size() > 3) {
             Hub* h = hubOf(t[1]);
             if (!h) continue;  // the game prints "Career Hub +%s+ non connue" and skips it
             Event e;
             e.id = t[2];
-            e.kind = t[0] == "AddHubCareerRaces" ? Event::Career : Event::Challenge;
+            e.kind = consoleCommandIs(t[0], "AddHubCareerRaces") ? Event::Career : Event::Challenge;
             e.hub = h->id;
             e.tier = h->tier;
             e.nameText = textId(t[3]);
@@ -134,12 +164,12 @@ std::vector<Event> loadEvents(const std::string& dataDir) {
     }
     // Pass 2: per-mission lines.
     for (const auto& t : lines) {
-        if (t.size() < 2 || t[0].compare(0, 10, "AddMission") != 0) continue;
+        if (t.size() < 2 || strncasecmp(t[0].c_str(), "AddMission", 10) != 0) continue;
         const auto it = byName.find(upper(t[1]));
         if (it == byName.end()) continue;
         Event& e = *it->second;
         auto arg = [&](size_t i) { return i < t.size() ? t[i] : std::string(); };
-        if (t[0] == "AddMissionNeededVehicle") {
+        if (consoleCommandIs(t[0], "AddMissionNeededVehicle")) {
             // "<forced MESH_ID_... | NONE> <surface | NONE> <family | NONE> NONE"
             const std::string forced = arg(2), surface = arg(3), family = arg(4);
             if (forced != "NONE" && forced.compare(0, 8, "MESH_ID_") == 0) {
@@ -150,15 +180,26 @@ std::vector<Event> loadEvents(const std::string& dataDir) {
             }
             if (surface != "NONE" && !surface.empty()) e.surface = surface;
             if (family != "NONE" && !family.empty()) e.vehicleFamily = family;
-        } else if (t[0] == "AddMissionSurfaceType") {
+        } else if (consoleCommandIs(t[0], "AddMissionSurfaceType")) {
             e.surfaceText = textId(arg(2));
             e.vehicleText = textId(arg(3));
-        } else if (t[0] == "AddMissionTime") {
+        } else if (consoleCommandIs(t[0], "AddMissionTime")) {
             for (int i = 0; i < 3; ++i) e.times[i] = number(arg(size_t(2 + i)));
             // 0x5761e0: a 4th value other than NONE replaces the mission's timer (+0x48).
             if (arg(5) != "NONE" && !arg(5).empty()) e.race.timeLimit = number(arg(5));
-        } else if (t[0] == "AddMissionParam") {
+        } else if (consoleCommandIs(t[0], "AddMissionParam")) {
             e.aiVehicles = arg(2);
+            e.weatherStart = arg(5), e.weatherEnd = arg(7);
+            e.tornado = strcasecmp(e.weatherStart.c_str(), "NONE") != 0 && storm::weatherHasTornado(e.weatherStart);
+            e.aiVehicleLabels.clear();
+            if (strcasecmp(e.aiVehicles.c_str(), "NONE") != 0) {
+                std::istringstream ids(e.aiVehicles);
+                std::string f;
+                while (std::getline(ids, f, '_') && e.aiVehicleLabels.size() < 32) {
+                    const long id = std::atol(f.c_str());
+                    e.aiVehicleLabels.push_back(id >= 0 && size_t(id) < vehicleTable.size() ? vehicleTable[size_t(id)] : std::string());
+                }
+            }
         }
     }
 
@@ -171,28 +212,53 @@ std::vector<Event> loadEvents(const std::string& dataDir) {
                 const float timerOverride = e.race.timeLimit;
                 auto m = missions.find(upper(e.id));
                 std::string note;
-                if (m == missions.end() && e.kind == Event::Career) {
-                    // CR42: the hub lists "CR42-Chec-CT" but the career script names its block "CR42-Chec-BJ".
-                    // FUEL drops the event (no mission of that name); the port runs the block anyway.
-                    const size_t dash = e.id.rfind('-');
-                    for (const char* suffix : {"-BJ", "-CP", "-AB", "-RD", "-SR"}) {
-                        const auto alt = missions.find(upper(e.id.substr(0, dash) + suffix));
-                        if (dash != std::string::npos && alt != missions.end()) {
-                            m = alt;
-                            note = "port choice: FUEL's hub list names " + e.id + ", which matches no mission, so the game drops it; "
-                                   "the port runs the " + alt->second.name + " block of miss_official.tsc";
-                            break;
-                        }
-                    }
-                }
                 if (m == missions.end()) {
-                    e.race.name = e.id;
-                    e.playable = false;
-                    e.note = "no EMD block in the mission scripts and no route anywhere in the game data; FUEL.exe drops it too "
-                             "(AddHubCareerRaces 0x575370 skips names with no mission), so it is not in the shipped game";
+                    // AddHubCareerRaces 0x575370 / AddHubCHallengeRaces 0x5755e0: the mission index by name
+                    // (0x4f8f90) is < 0, so the handler returns without adding the race to the hub (p38). With
+                    // the world's MISSION_COURSE missions (p42) every listed name in the shipped data matches.
+                    continue;
                 } else {
                     e.race = m->second;
+                    // PK02: a vehicle name in EMD_SetPlayerForbiddenVehiculeFilter (0x5d6180: the table index of the name;
+                    // no shipped script uses one). A name the table does not know ends the command in FUEL (returns 0).
+                    for (const std::string& nm : e.race.forbiddenNames) {
+                        const std::string bare = nm.compare(0, 8, "MESH_ID_") == 0 ? nm.substr(8) : nm;
+                        for (size_t vi = 0; vi < vehicleTable.size(); ++vi)
+                            if (strcasecmp(vehicleTable[vi].c_str(), bare.c_str()) == 0) {
+                                e.race.forbidden.push_back(int(vi));
+                                break;
+                            }
+                    }
+                    e.race.forbiddenNames.clear();
+                    // PK10: EMD_SetFilterIA (0x551530): integers as they are, a vehicle name by its table index; a name
+                    // the table does not know ends the command there (the earlier entries stay).
+                    for (const std::string& tk : e.race.aiFilterTokens) {
+                        char* end = nullptr;
+                        const long v = std::strtol(tk.c_str(), &end, 10);
+                        if (!tk.empty() && *end == '\0') {
+                            e.race.aiFilter.push_back(int(v));
+                            continue;
+                        }
+                        const std::string bare = tk.compare(0, 8, "MESH_ID_") == 0 ? tk.substr(8) : tk;
+                        bool found = false;
+                        for (size_t vi = 0; vi < vehicleTable.size(); ++vi)
+                            if (strcasecmp(vehicleTable[vi].c_str(), bare.c_str()) == 0) {
+                                e.race.aiFilter.push_back(int(vi)), found = true;
+                                break;
+                            }
+                        if (!found) break;
+                    }
+                    e.race.aiFilterTokens.clear();
+                    // The race's AI list is the EMD_SetFilterIA one unless AddMissionParam gave a list (0x575b00 replaces it).
+                    if (e.aiVehicleLabels.empty())
+                        for (int id : e.race.aiFilter)
+                            e.aiVehicleLabels.push_back(id >= 0 && size_t(id) < vehicleTable.size() ? vehicleTable[size_t(id)] : std::string());
                     if (timerOverride > 0) e.race.timeLimit = timerOverride;
+                    // AddMissionPARAM 0x575b00: a vehicle list other than NONE ("41_10_20_...") becomes the
+                    // mission's AI vehicles (+0xa8) and its AI count (+0x50 = their number), replacing
+                    // EMD_SetNbIA. hubinfos.tsc runs after the mission build (level load 0x559290).
+                    if (!e.aiVehicles.empty() && strcasecmp(e.aiVehicles.c_str(), "NONE") != 0)
+                        e.race.aiCount = int(std::count(e.aiVehicles.begin(), e.aiVehicles.end(), '_')) + 1;
                     e.note = note;
                     const bool hasRoute = (e.race.start[0] != 0 || e.race.start[2] != 0) &&
                                           (!e.race.checkpoints.empty() || e.race.finish[0] != 0 || e.race.finish[2] != 0);

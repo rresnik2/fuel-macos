@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -73,50 +74,6 @@ Mat4 localMatrix(const std::array<double, 3>& scale, const std::array<double, 4>
     return m;
 }
 
-std::array<double, 4> slerp(std::array<double, 4> a, std::array<double, 4> b, double f) {
-    double d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-    if (d < 0) {
-        for (double& c : b) c = -c;
-        d = -d;
-    }
-    std::array<double, 4> o;
-    if (d > 0.9995) {
-        for (size_t i = 0; i < 4; ++i) o[i] = a[i] + (b[i] - a[i]) * f;
-        return o;
-    }
-    const double th = std::acos(std::min(1.0, d)), s = std::sin(th);
-    const double wa = std::sin((1 - f) * th) / s, wb = std::sin(f * th) / s;
-    for (size_t i = 0; i < 4; ++i) o[i] = wa * a[i] + wb * b[i];
-    return o;
-}
-
-// Value of a keyframe track at time `t`: linear, or spherical for rotations.
-template <size_t N>
-void sampleKeys(const std::vector<std::pair<float, std::array<float, N>>>& keys, double t, std::array<double, N>* out) {
-    if (keys.empty()) return;
-    auto at = [&](size_t i) {
-        std::array<double, N> v;
-        for (size_t k = 0; k < N; ++k) v[k] = keys[i].second[k];
-        return v;
-    };
-    size_t i = 1;
-    while (i < keys.size() && t > keys[i].first) ++i;
-    if (t <= keys[0].first) {
-        *out = at(0);
-    } else if (i >= keys.size()) {
-        *out = at(keys.size() - 1);
-    } else {
-        const double t0 = keys[i - 1].first, t1 = keys[i].first;
-        const double f = t1 > t0 ? (t - t0) / (t1 - t0) : 0.0;
-        const auto a = at(i - 1), b = at(i);
-        if constexpr (N == 4) {
-            *out = slerp(a, b, f);
-        } else {
-            for (size_t k = 0; k < N; ++k) (*out)[k] = a[k] + (b[k] - a[k]) * f;
-        }
-    }
-}
-
 uint32_t linkName(const DpcFile& dpc, const DpcFile::Entry& e) {
     const std::vector<uint8_t> link = dpc.link(e);
     uint32_t v = 0;
@@ -147,6 +104,120 @@ std::string vehicleArchetype(const std::string& tscText, const std::string& vari
     return {};
 }
 
+std::optional<SeatPoint> riderSeatPoint(const DpcFile& vehicleDpc, const AssembledVehicle& av) {
+    if (!av.skeleton) return std::nullopt;
+    const DpcFile::Entry* e = vehicleDpc.find(*av.skeleton);
+    if (e == nullptr) return std::nullopt;
+    const auto body = vehicleDpc.body(*e);
+    if (!body) return std::nullopt;
+    const Skel sk = parseSkelBody(*body);
+    static const uint32_t kHead = asoboCrc("Head");  // registry node 61
+    for (const Bone& b : sk.bones) {
+        if (b.name != kHead) continue;
+        SeatPoint s;
+        s.t = {b.world[12], b.world[13], b.world[14]};
+        const float id[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                if (std::fabs(b.world[size_t(r * 4 + c)] - id[r * 3 + c]) > 1e-4f) s.rotationIdentity = false;
+        return s;
+    }
+    return std::nullopt;
+}
+
+std::array<std::array<float, 3>, 4> riderIkPoints(const DpcFile& dpc, const AssembledVehicle& av) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::array<std::array<float, 3>, 4> out;
+    for (auto& p : out) p = {nan, nan, nan};
+    static const uint32_t crc[4] = {asoboCrc("IK_LEFTHAND"), asoboCrc("IK_RIGHTHAND"), asoboCrc("IK_LEFTFOOT"), asoboCrc("IK_RIGHTFOOT")};
+    auto place = [](const Mat4& m, const std::array<float, 3>& c) {
+        const double x = c[0], y = c[1], z = c[2];
+        return std::array<float, 3>{float(x * m[0] + y * m[4] + z * m[8] + m[12]), float(x * m[1] + y * m[5] + z * m[9] + m[13]),
+                                    float(x * m[2] + y * m[6] + z * m[10] + m[14])};
+    };
+    for (const PlacedPart& part : av.parts) {  // parts in assembly order; the first that has the point wins
+        if (!part.drawn() || part.shape != PartShape::Mesh) continue;
+        const DpcFile::Entry* e = dpc.find(part.meshId);
+        if (e == nullptr) continue;
+        std::vector<NamedSphere> spheres;
+        std::vector<NamedBox> boxes;
+        try {
+            const std::vector<uint8_t> link = dpc.link(*e);
+            spheres = parseMeshLinkSpheres(link);
+            boxes = parseMeshLinkBoxes(link);
+        } catch (const std::exception&) {
+            continue;
+        }
+        for (int k = 0; k < 4; ++k) {
+            if (!std::isnan(out[size_t(k)][0])) continue;
+            for (const NamedBox& b : boxes)
+                if (b.name == crc[k]) {
+                    out[size_t(k)] = place(part.world, b.centre());
+                    break;
+                }
+            if (!std::isnan(out[size_t(k)][0])) continue;
+            for (const NamedSphere& sp : spheres)
+                if (sp.name == crc[k]) {
+                    out[size_t(k)] = place(part.world, sp.centre);
+                    break;
+                }
+        }
+    }
+    return out;
+}
+
+std::array<std::array<double, 9>, 2> riderIkHandFrames(const DpcFile& dpc, const AssembledVehicle& av) {
+    std::array<std::array<double, 9>, 2> out{};
+    for (auto& f : out) f[0] = std::numeric_limits<double>::quiet_NaN();
+    static const uint32_t crc[2] = {asoboCrc("IK_LEFTHAND"), asoboCrc("IK_RIGHTHAND")};
+    bool done[2] = {false, false};
+    for (const PlacedPart& part : av.parts) {  // the same first-part-wins search as riderIkPoints
+        if (!part.drawn() || part.shape != PartShape::Mesh) continue;
+        const DpcFile::Entry* e = dpc.find(part.meshId);
+        if (e == nullptr) continue;
+        std::vector<NamedSphere> spheres;
+        std::vector<NamedBox> boxes;
+        try {
+            const std::vector<uint8_t> link = dpc.link(*e);
+            spheres = parseMeshLinkSpheres(link);
+            boxes = parseMeshLinkBoxes(link);
+        } catch (const std::exception&) {
+            continue;
+        }
+        for (int k = 0; k < 2; ++k) {
+            if (done[k]) continue;
+            for (const NamedBox& b : boxes)
+                if (b.name == crc[k]) {
+                    // box axes: row r = (rows[r * 4], rows[r * 4 + 1], rows[r * 4 + 2]) = image of axis r (row-vector; the
+                    // other reading turns the driving hands 106 deg from their boxes, this one 26 deg: --animcheck), then the part
+                    double P[9];
+                    for (int r = 0; r < 3; ++r) {
+                        const double l = std::sqrt(double(part.world[size_t(r * 4)]) * part.world[size_t(r * 4)] + double(part.world[size_t(r * 4 + 1)]) * part.world[size_t(r * 4 + 1)] +
+                                                   double(part.world[size_t(r * 4 + 2)]) * part.world[size_t(r * 4 + 2)]);
+                        for (int c = 0; c < 3; ++c) P[r * 3 + c] = l > 0 ? part.world[size_t(r * 4 + c)] / l : (r == c);
+                    }
+                    double B[9];
+                    for (int r = 0; r < 3; ++r) {  // unit rows
+                        double v[3] = {b.rows[size_t(r * 4)], b.rows[size_t(r * 4 + 1)], b.rows[size_t(r * 4 + 2)]};
+                        const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                        for (int c = 0; c < 3; ++c) B[r * 3 + c] = l > 0 ? v[c] / l : (r == c);
+                    }
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c) out[size_t(k)][size_t(r * 3 + c)] = B[r * 3] * P[c] + B[r * 3 + 1] * P[3 + c] + B[r * 3 + 2] * P[6 + c];
+                    done[k] = true;
+                    break;
+                }
+            if (done[k]) continue;
+            for (const NamedSphere& sp : spheres)
+                if (sp.name == crc[k]) {
+                    done[k] = true;  // found as a point: no orientation (stays NaN)
+                    break;
+                }
+        }
+    }
+    return out;
+}
+
 Rider::Rider(const DpcFile& pilot) : dpc_(pilot) {
     const DpcFile::Entry* lodE = pilot.find(kPilotLod);
     if (lodE == nullptr) throw std::runtime_error("PILOT.DPC has no rider Lod_Z");
@@ -158,6 +229,18 @@ Rider::Rider(const DpcFile& pilot) : dpc_(pilot) {
     const DpcFile::Entry* skinE = pilot.find(lod.objects[0]);
     if (skinE == nullptr) throw std::runtime_error("rider Skin_Z missing");
     skin_ = parseSkinBody(pilot.body(*skinE).value());
+    lodSkins_.push_back(skin_);  // P104: the lower levels (the same parts and skeleton)
+    for (size_t k = 1; k < lod.objects.size(); ++k)
+        if (const DpcFile::Entry* e = pilot.find(lod.objects[k]); e != nullptr && e->classCrc == cls::Skin)
+            lodSkins_.push_back(parseSkinBody(pilot.body(*e).value()));
+        else
+            break;
+    lodD_ = lod.baseDistance;
+    if (const std::vector<uint8_t> l = pilot.link(*lodE); l.size() >= 92) {
+        float v;
+        std::memcpy(&v, &l[88], 4);
+        lodView_ = std::isfinite(v) ? v : 0;
+    }
     const DpcFile::Entry* skelE = pilot.find(parseObjectLink(pilot.link(*skinE)).dataId);
     if (skelE == nullptr) throw std::runtime_error("rider Skel_Z missing");
     skel_ = parseSkelBody(pilot.body(*skelE).value());
@@ -185,65 +268,11 @@ const Rider::Animation& Rider::animation(int slot) const {
     const DpcFile::Entry* e = dpc_.find(s->second);
     if (e == nullptr) throw std::runtime_error("rider animation missing");
     const std::vector<uint8_t> body = dpc_.body(*e).value();
-    // Animation_Z body: duration, three header values, then the arrays: A rotation keys (12 B),
-    // B (40 B), C scale keys (24 B), D translation keys (24 B), E, F-L, M bone tracks (28 B), N, O, P.
-    ByteReader r(body);
     Animation a;
-    a.duration = r.f32();
-    r.u32();
-    a.loop = (r.u16() & 1) != 0;  // flags (+0x14 at run time): bit 0 = loop (0x7c02a0)
-    r.u16();
-    const uint32_t nrot = r.count();
-    const uint8_t* rotData = r.raw(size_t(nrot) * 12);
-    r.skipArray(0x28);
-    r.u16();
-    const uint32_t nsca = r.count();
-    const uint8_t* scaData = r.raw(size_t(nsca) * 0x18);
-    r.u16();
-    const uint32_t ntra = r.count();
-    const uint8_t* traData = r.raw(size_t(ntra) * 0x18);
-    for (uint32_t i = 0, n = r.count(); i < n; ++i) {
-        r.u32();
-        r.skipArray(20);
-    }
-    for (size_t sz : {size_t(12), size_t(12), size_t(0x18), size_t(0x18), size_t(12), size_t(12), size_t(12)}) {
-        r.u16();
-        r.skipArray(sz);
-    }
-    const uint32_t ntracks = r.count();
-    const uint8_t* trackData = r.raw(size_t(ntracks) * 0x1C);
-    r.skipArray(0x1C);
-    r.skipArray(12);
-    r.skipArray(12);
-    r.expectEnd();
-
-    auto vec = [](const uint8_t* p, size_t i) {
-        float t;
-        int16_t v[3];
-        std::memcpy(&t, p + i * 0x18, 4);
-        std::memcpy(v, p + i * 0x18 + 4, 6);
-        return std::make_pair(t, std::array<float, 3>{v[0] / 4096.0f, v[1] / 4096.0f, v[2] / 4096.0f});
-    };
-    for (uint32_t i = 0; i < ntracks; ++i) {
-        const uint8_t* p = trackData + size_t(i) * 0x1C;
-        uint32_t crc;
-        uint16_t u[12];
-        std::memcpy(&crc, p, 4);
-        std::memcpy(u, p + 4, 24);
-        Track tr;
-        if (size_t(u[2]) + u[3] > ntra || size_t(u[4]) + u[5] > nrot || size_t(u[6]) + u[7] > nsca)
-            throw std::runtime_error("animation track outside its key arrays");
-        for (size_t k = u[2]; k < size_t(u[2]) + u[3]; ++k) tr.translation.push_back(vec(traData, k));
-        for (size_t k = u[6]; k < size_t(u[6]) + u[7]; ++k) tr.scale.push_back(vec(scaData, k));
-        for (size_t k = u[4]; k < size_t(u[4]) + u[5]; ++k) {
-            float t;
-            int16_t q[4];
-            std::memcpy(&t, rotData + k * 12, 4);
-            std::memcpy(q, rotData + k * 12 + 4, 8);
-            tr.rotation.push_back({t, {q[0] / 2000.0f, q[1] / 2000.0f, q[2] / 2000.0f, q[3] / 2000.0f}});
-        }
-        a.tracks[crc] = std::move(tr);
-    }
+    if (!a.clip.parse(body)) throw std::runtime_error("malformed rider animation");
+    a.duration = a.clip.duration;
+    a.loop = a.clip.loops();  // flags (+0x14 at run time): bit 0 = loop (0x7c02a0)
+    for (size_t i = 0; i < a.clip.tracks.size(); ++i) a.tracks[a.clip.tracks[i].bone] = int(i);
     return anims_.emplace(s->second, std::move(a)).first->second;
 }
 
@@ -255,9 +284,9 @@ std::vector<Mat4> Rider::poseWorlds(const Animation* a, double time) const {
         std::array<double, 3> t = {b.localT[0], b.localT[1], b.localT[2]}, s = {b.localScale[0], b.localScale[1], b.localScale[2]};
         if (a != nullptr) {
             if (auto it = a->tracks.find(b.name); it != a->tracks.end()) {
-                sampleKeys(it->second.rotation, time, &q);
-                sampleKeys(it->second.translation, time, &t);
-                sampleKeys(it->second.scale, time, &s);
+                anim::Pose p{q, s, t};
+                a->clip.sample(it->second, time, p);
+                q = p.q, s = p.s, t = p.t;
             }
         }
         const Mat4 local = localMatrix(s, q, t);
@@ -313,6 +342,16 @@ uint32_t Rider::liveryMaterial(const std::string& name) const {
 }
 
 float Rider::duration(int slot) const { return animation(slot).duration; }
+
+void Rider::events(int slot, double from, double to, bool closed, std::vector<std::pair<uint32_t, uint32_t>>& out) const {
+    const Animation& a = animation(slot);
+    std::vector<std::pair<float, uint32_t>> ev;
+    for (size_t t = 0; t < a.clip.tracks.size(); ++t) {
+        ev.clear();
+        a.clip.events(int(t), from, to, closed, ev);
+        for (const auto& e : ev) out.push_back({a.clip.tracks[t].bone, e.second});
+    }
+}
 bool Rider::loops(int slot) const { return animation(slot).loop; }
 
 int Rider::bone(const std::string& name) const {
@@ -338,9 +377,9 @@ void Rider::sampleLocal(int slot, double time, std::vector<BoneTRS>& out, std::v
     for (size_t i = 0; i < skel_.bones.size(); ++i) {
         const auto it = a.tracks.find(skel_.bones[i].name);
         if (it == a.tracks.end()) continue;
-        sampleKeys(it->second.rotation, time, &out[i].q);
-        sampleKeys(it->second.translation, time, &out[i].t);
-        sampleKeys(it->second.scale, time, &out[i].s);
+        anim::Pose p{out[i].q, out[i].s, out[i].t};
+        a.clip.sample(it->second, time, p);
+        out[i].q = p.q, out[i].s = p.s, out[i].t = p.t;
         if (has) (*has)[i] = 1;
     }
 }
@@ -362,9 +401,12 @@ BakedMesh Rider::bake(int slot, double time, int head, int chest, int legs, int 
     return out;
 }
 
-void Rider::skin(const SkinTemplate& t, const std::vector<Mat4>& world, std::vector<uint8_t>& vertices) const {
+Mat4 Rider::skinMatrix(int b, const std::vector<Mat4>& world) const { return mul(invBind_[size_t(b)], world[size_t(b)]); }
+
+void Rider::skin(const SkinTemplate& t, const std::vector<Mat4>& world, std::vector<uint8_t>& vertices, const RiderJiggle* jiggle) const {
     std::vector<Mat4> skinM(world.size());
     for (size_t i = 0; i < world.size(); ++i) skinM[i] = mul(invBind_[i], world[i]);
+    const bool jig = jiggle != nullptr && jiggle->active() && t.hasJiggle;
     vertices.resize(t.verts.size() * BakedMesh::kStride);
     for (size_t vi = 0; vi < t.verts.size(); ++vi) {
         const SkinTemplate::V& v = t.verts[vi];
@@ -384,6 +426,14 @@ void Rider::skin(const SkinTemplate& t, const std::vector<Mat4>& world, std::vec
             if (l > 0)
                 for (int c = 0; c < 3; ++c) a[c] /= l;
         };
+        if (jig && v.jig > 0 && v.jw > 0) {  // PHYSIQUE: the glute helper bone's offset, moved like its base bone (Hips)
+            const JiggleBone& jb = t.jiggleBones[size_t(v.jig - 1)];
+            if (jb.base >= 0 && size_t(jb.base) < skinM.size()) {
+                const std::array<double, 3> d = jiggle->displace(v.jig - 1, v.pos);
+                const Mat4& M = skinM[size_t(jb.base)];
+                for (size_t c = 0; c < 3; ++c) p[c] += v.jw * (d[0] * M[c] + d[1] * M[4 + c] + d[2] * M[8 + c]);
+            }
+        }
         norm(n);
         norm(tg);
         uint8_t* o = &vertices[vi * BakedMesh::kStride];
@@ -396,19 +446,74 @@ void Rider::skin(const SkinTemplate& t, const std::vector<Mat4>& world, std::vec
     }
 }
 
+std::set<uint32_t> riderLiveryNames(const DpcFile& pilot) {
+    std::set<uint32_t> out;
+    for (uint32_t id : pilot.ids(cls::MaterialAnim))
+        if (const DpcFile::Entry* e = pilot.find(id)) out.insert(linkName(pilot, *e));
+    return out;
+}
+
+int riderLiveryCount(const std::set<uint32_t>& names, const std::string& part, bool types) {
+    char buf[64];
+    int n = 0;
+    for (int k = 1; k < 1000; ++k) {
+        if (types) std::snprintf(buf, sizeof buf, "LIVERY_01_%s%d", part.c_str(), k);
+        else std::snprintf(buf, sizeof buf, "LIVERY_%02d_%s", k, part.c_str());
+        if (!names.count(asoboCrc(buf))) break;
+        ++n;
+    }
+    return n;
+}
+
 Rider::SkinTemplate Rider::prepareSkin(int head, int chest, int legs, int livery) const {
+    Parts p;
+    p.head = head, p.chest = chest, p.legs = legs;
+    p.headLivery = p.chestLivery = p.legsLivery = p.bodyLivery = livery;
+    return prepareSkin(p);
+}
+
+namespace {
+// The livery material names of a garage choice: part material name CRC -> livery material name (prepareSkin).
+std::map<uint32_t, std::string> liveryNames(const Rider::Parts& parts) {
     char buf[48];
-    const std::string partNames[3] = {"Head" + std::to_string(head), "Chest" + std::to_string(chest), "Legs" + std::to_string(legs)};
-    std::map<uint32_t, std::string> liveryOf;  // part material name CRC -> livery material name
-    auto addLivery = [&](const std::string& part) {
+    std::map<uint32_t, std::string> liveryOf;
+    auto addLivery = [&](const std::string& part, int livery) {
         std::snprintf(buf, sizeof buf, "LIVERY_%02d_%s", livery, part.c_str());
         liveryOf[asoboCrc("LIVERY_XX_" + part)] = buf;
     };
-    addLivery("HEAD" + std::to_string(head));
-    addLivery("CHEST" + std::to_string(chest));
-    addLivery("LEGS" + std::to_string(legs));
-    std::snprintf(buf, sizeof buf, "LIVERY_%02d_BODY1", livery);
+    addLivery("HEAD" + std::to_string(parts.head), parts.headLivery);
+    addLivery("CHEST" + std::to_string(parts.chest), parts.chestLivery);
+    addLivery("LEGS" + std::to_string(parts.legs), parts.legsLivery);
+    // The skin: body type <skin> with its livery (0x42b420: pilot +0xe8 / +0xe0, counts 0x5dc850 / 0x5dc710).
+    std::snprintf(buf, sizeof buf, "LIVERY_%02d_BODY%d", parts.bodyLivery, parts.skin);
     liveryOf[asoboCrc("LIVERY_XX_BODY")] = buf;
+    return liveryOf;
+}
+}  // namespace
+
+BakedMaterial Rider::partMaterial(uint32_t nameCrc, const std::vector<uint32_t>& preferred, const Parts& parts) const {  // PHYSIQUE
+    const std::map<uint32_t, std::string> liveryOf = liveryNames(parts);
+    BakedMaterial bm;
+    bm.materialId = materialNamed(nameCrc, preferred);
+    if (auto lv = liveryOf.find(nameCrc); lv != liveryOf.end())
+        if (const uint32_t lm = liveryMaterial(lv->second))
+            if (const DpcFile::Entry* le = dpc_.find(lm)) {
+                const Material mat = parseMaterialBody(dpc_.body(*le).value());
+                bm.diffuseTex = mat.textures[0];
+                bm.specularTex = mat.textures[4];
+            }
+    return bm;
+}
+
+Rider::SkinTemplate Rider::prepareSkin(const Parts& parts, int level) const { return prepareSkin(parts, level, 7u); }
+
+Rider::SkinTemplate Rider::prepareSkin(const Parts& parts, int level, unsigned partMask) const {
+    const Skin& skin_ = lodSkins_.at(size_t(std::clamp(level, 0, int(lodSkins_.size()) - 1)));  // P104
+    const std::string allParts[3] = {"Head" + std::to_string(parts.head), "Chest" + std::to_string(parts.chest), "Legs" + std::to_string(parts.legs)};
+    std::vector<std::string> partNames;
+    for (int k = 0; k < 3; ++k)
+        if (partMask & (1u << k)) partNames.push_back(allParts[k]);  // PHYSIQUE: a subset
+    const std::map<uint32_t, std::string> liveryOf = liveryNames(parts);  // part material name CRC -> livery material name
 
     SkinTemplate st;
     BakedMesh& out = st.mesh;

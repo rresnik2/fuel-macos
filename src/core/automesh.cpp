@@ -79,12 +79,13 @@ uint8_t rt(const Permutation& p, double v) { return p[size_t(int64_t(std::floor(
 
 // The decor quadtree leaf holding (px, pz) for a camera at (cx, cz) (p15 D1, P31 D: 12288 m
 // roots, split while the camera is within 2.0625 x size of the chunk centre, 24 m leaves).
-double leafSize(double px, double pz, double camX, double camZ) {
+// P94: `slack` > 0 gives the smallest leaf for a camera anywhere within `slack` of (cx, cz).
+double leafSize(double px, double pz, double camX, double camZ, double slack = 0) {
     constexpr double kRoot = 12288.0, kSplit = 2.0625, kMinChunk = 24.01;
     double size = kRoot;
     double ox = std::round(px / kRoot) * kRoot, oz = std::round(pz / kRoot) * kRoot;
     while (size > kMinChunk) {
-        const double r = size * kSplit;
+        const double r = size * kSplit + slack;
         if ((ox - camX) * (ox - camX) + (oz - camZ) * (oz - camZ) >= r * r) break;
         ox += (px >= ox ? 0.25 : -0.25) * size;
         oz += (pz >= oz ? 0.25 : -0.25) * size;
@@ -95,12 +96,13 @@ double leafSize(double px, double pz, double camX, double camZ) {
 
 // 0x78cbf0 / 0x78e2c0 emit cull for a chunk of size C (W+0xa78 = 30, +0xa7c = +0xa80 = 0.033,
 // split 2.0625).
-bool culled(const AutoMeshRule& r, double C) {
-    if (r.noOcclusion) return false;
-    if (r.viewDist > 0 && (C * 0.707106 + r.viewDist) / 2.0625 < C) return true;
-    if (C > 30.0 && r.radius < 0.033 * C) return true;
+bool culled(bool noOcclusion, float radius, float viewDist, double C) {
+    if (noOcclusion) return false;
+    if (viewDist > 0 && (C * 0.707106 + viewDist) / 2.0625 < C) return true;
+    if (C > 30.0 && radius < 0.033 * C) return true;
     return false;
 }
+bool culled(const AutoMeshRule& r, double C) { return culled(r.noOcclusion, r.radius, r.viewDist, C); }
 
 // Ground normal over +-r (0x64e130): (h(x-r) - h(x+r), 2r, h(z-r) - h(z+r)), normalised.
 void groundNormal(const TerrainDetail& d, double x, double z, double r, double n[3]) {
@@ -656,12 +658,16 @@ void AutoMesh::placeInCell(const Context& ctx, int list, double x0, double z0, d
             // 0x789f90 dune test (<= 1): the port's dune share is at most 1.
             const double edge = double(road.edge) - r.radius;  // 0x6fac40 - radius
             if (!(r.roadMiddle || r.onTerra || edge >= 1.0)) continue;
-            if (r.onRockyArea && gp.rock < yawRnd * 0.9 + 0.1) continue;  // 0x6b7f10
+            if (r.onRockyArea && g.decorDensity(px, pz) < yawRnd * 0.9 + 0.1) continue;  // 0x6b7f10 (p36: >= 0.9 r + 0.1)
             if (r.closeToRoad && edge > 50.0) continue;
             if (r.farFromRoad && edge < 50.0) continue;
             if (r.cultivatedField ? gp.field == 0 : gp.field != 0) continue;  // point bit 0x80000
             if (gp.underWater()) continue;                                 // 0x65a390 lake depth > 0.001
-            if (r.gulchSide) continue;  // 0x7a0620 gulch side not ported (3 rules)
+            // P80 (notes p80-terrain-big.md B3): Gulch_Query 0x7a0620 = gulch profile 0x7a00e0 > 0.001 at the point
+            // (asm 0x78c271..). A rule without GulchSide (+0x66) is never placed in a gulch; a GulchSide rule needs the hit
+            // and moves 10 x toward it (not ported: 3 rules, rejected). Rule byte +0x61 (no flatness test) is never set.
+            if (r.gulchSide) continue;
+            if (det.inGulch(x, z)) continue;
             if (!flatEnough(det, x, z, r.radius, r.pente * r.radius, r.trou * r.radius)) continue;
             ok = true;
         }
@@ -698,6 +704,47 @@ void AutoMesh::placeInCell(const Context& ctx, int list, double x0, double z0, d
     out.list = int16_t(list), out.rule = int16_t(c.rule), out.m = c.m;
 }
 
+std::vector<std::array<double, 2>> offsetPolyline(const std::vector<std::array<double, 2>>& p, double d) {
+    const size_t n = std::min<size_t>(p.size(), 512);
+    std::vector<std::array<double, 2>> out;
+    for (size_t i = 0; i < n; ++i) {
+        const auto& a = p[i == 0 ? 0 : i - 1];
+        const auto& b = p[i + 1 < n ? i + 1 : n - 1];
+        double dx = b[0] - a[0], dz = b[1] - a[1];
+        const double l = std::hypot(dx, dz);
+        if (l < 1e-6) dx = 0, dz = 1;
+        else dx /= l, dz /= l;
+        out.push_back({p[i][0] - dz * d, p[i][1] + dx * d});
+    }
+    return out;
+}
+
+bool roadShortCut(const std::vector<std::array<double, 2>>& pts, int start, int count, int step, double px, double pz, double& qx, double& qz) {
+    // 0x78e030 (ECX = start, EDI = the offset curve's xz floats, EAX = the sample; args out, count, step). x87 at PC_53:
+    // the squared lengths go to fsqrt through a float argument (0x40ed20); the straight distance is kept as a float, the
+    // along-road length is the float running sum plus the new segment (asm 0x78e174..0x78e17d).
+    const int end = step > 0 ? count - 1 : 0;
+    auto len = [](double dx, double dz) { return std::sqrt(double(float(dz * dz + dx * dx))); };
+    int k = start;
+    if (k < 0 || k >= int(pts.size())) return false;
+    float best = 1e6f, d = float(len(pts[size_t(k)][0] - px, pts[size_t(k)][1] - pz));
+    double along = len(pts[size_t(k)][0] - px, pts[size_t(k)][1] - pz);
+    bool found = false;
+    while (d <= 300.0f) {
+        if (50.0f < d && d < 300.0f && along / d > 1.5 && d < best) {
+            best = d, found = true;
+            qx = pts[size_t(k)][0], qz = pts[size_t(k)][1];
+        }
+        if (k == end) break;
+        const auto prev = pts[size_t(k)];
+        k += step;
+        if (k < 0 || k >= int(pts.size())) break;  // port guard (FUEL stops at `end`)
+        d = float(len(pts[size_t(k)][0] - px, pts[size_t(k)][1] - pz));
+        along = len(pts[size_t(k)][0] - prev[0], pts[size_t(k)][1] - prev[1]) + double(float(along));
+    }
+    return found;
+}
+
 // RoadMesh along one GwRoad line on one side (+1, -1, 0 = middle): 0x78e2c0 + 0x78d7c0.
 void AutoMesh::placeAlongRoad(const Context& ctx, uint32_t lineIndex, int side, std::vector<Spawn>& out) const {
     const RoadNetwork::Line& line = ctx.lines->lines[lineIndex];
@@ -711,27 +758,22 @@ void AutoMesh::placeAlongRoad(const Context& ctx, uint32_t lineIndex, int side, 
         const bool classed = type == 4 || type == 5 || (type >= 6 && type <= 12) || type == 18 || type == 19;
         if (classed && !(r.roadTypes & (1u << type))) continue;
         const double off = side != 0 ? (halfWidth(ctx.types, type) + r.sideDist) * side : r.middleDist;
-        // Offset polyline (0x6f8f80; the smoothing pass 0x6f8ea0 is not ported).
-        std::vector<std::array<double, 2>> pts;
-        const size_t n = line.points.size();
-        for (size_t i = 0; i < n; ++i) {
-            const auto& a = line.points[i == 0 ? 0 : i - 1];
-            const auto& b = line.points[i + 1 < n ? i + 1 : n - 1];
-            double dx = b[0] - a[0], dz = b[1] - a[1];
-            const double l = std::hypot(dx, dz);
-            if (l < 1e-6) dx = 0, dz = 1;
-            else dx /= l, dz /= l;
-            // +side = right of the travel direction (x, z) -> (dz, -dx).
-            pts.push_back({line.points[i][0] + dz * off, line.points[i][1] - dx * off});
-        }
+        // Offset polyline (0x6f8f80 -> 0x6f7360, offsetPolyline; the smoothing pass 0x6f8ea0 is not ported).
+        std::vector<std::array<double, 2>> src;
+        for (const auto& q : line.points) src.push_back({double(q[0]), double(q[1])});
+        // The port's side +1 is right of travel; FUEL's d = side x (...) moves left (0x78e562), so the port's `side`
+        // is FUEL's negated. Kept as before (OPEN: whether 0x78d7c0's interior/exterior and facing tests agree).
+        const std::vector<std::array<double, 2>> pts = offsetPolyline(src, -off);
         // Resample every Frequency metres from Phase (<= 512 samples).
         std::vector<std::array<double, 2>> smp;
+        std::vector<int> smpSeg;  // the offset-curve segment of each sample (auStack_800, for ShortCut)
         double along = r.phase, acc = 0;
         for (size_t i = 0; i + 1 < pts.size() && smp.size() < 512; ++i) {
             const double dx = pts[i + 1][0] - pts[i][0], dz = pts[i + 1][1] - pts[i][1], l = std::hypot(dx, dz);
             while (along < acc + l && smp.size() < 512) {
                 const double t = (along - acc) / l;
                 smp.push_back({pts[i][0] + dx * t, pts[i][1] + dz * t});
+                smpSeg.push_back(int(i));
                 along += r.frequency;
             }
             acc += l;
@@ -771,6 +813,23 @@ void AutoMesh::placeAlongRoad(const Context& ctx, uint32_t lineIndex, int side, 
             if (r.linePosition) cx = (x + nx[0]) * 0.5, cz = (z + nx[1]) * 0.5;
             ex /= el, ez /= el;
             if (!r.linePosition && side < 0) ex = -ex, ez = -ez;
+            if (r.shortCut && !r.linePosition) {
+                // PK32 (asm 0x78ed57..0x78eedf): a ShortCut rule (only DebrisFeu_Souche03) is placed only where 0x78e030
+                // finds the road looping back, backward from the sample's segment k then forward from k + 1, and that
+                // point Q lies on the sample's side: n = normalize(-t.z, t.x) (t = the segment, the offset direction of
+                // 0x6f7360), (n . D) x FUEL's side >= 0, D = normalize(Q - sample). FUEL's side is the port's negated (above).
+                // The instance faces D (flag 1 of 0x78d7c0: the end point sample + D x radius).
+                const int k = smpSeg[size_t(i)], cnt = int(pts.size());
+                double qx = 0, qz = 0;
+                if (!roadShortCut(pts, k, cnt, -1, x, z, qx, qz) && !roadShortCut(pts, k + 1, cnt, 1, x, z, qx, qz)) continue;
+                double Dx = qx - x, Dz = qz - z;
+                const double Dl = std::hypot(Dx, Dz);
+                if (Dl < 1e-9) continue;
+                Dx /= Dl, Dz /= Dl;
+                const double tx = pts[size_t(k) + 1][0] - pts[size_t(k)][0], tz = pts[size_t(k) + 1][1] - pts[size_t(k)][1];
+                if (!((-tz * Dx + tx * Dz) * double(-side) >= 0)) continue;  // the normalisation of n keeps the sign
+                ex = Dx, ez = Dz;
+            }
             // 0x78d7c0: crossing roads, flat surfaces, climate, clearance, slope.
             if (r.sideDist < 1000.0f) {
                 const NearRoad nr = nearestRoad(ctx.roads, cx, cz);
@@ -797,6 +856,14 @@ void AutoMesh::placeAlongRoad(const Context& ctx, uint32_t lineIndex, int side, 
             out.push_back(sp);
         }
     }
+}
+
+std::vector<PlacedMesh> AutoMesh::templateParts(uint32_t crc) const {
+    std::vector<PlacedMesh> out;
+    const auto it = templateOf_.find(crc);
+    if (it == templateOf_.end() || it->second < 0) return out;
+    for (const Part& p : templates_[size_t(it->second)].parts) out.push_back(p.mesh);
+    return out;
 }
 
 // The spawn (0x78d1b0 -> ground element kind 0x17 -> 0x778650): the template's node tree moved
@@ -841,7 +908,13 @@ void AutoMesh::emit(const Context& ctx, const Spawn& s, std::vector<PlacedMesh>&
     }
 }
 
-void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out, size_t* roadFrom) {
+bool autoCellHolds(const PlacedMesh::AutoCell& cell, double camX, double camZ) {
+    const double C = leafSize(cell.x, cell.z, camX, camZ);
+    return C < cell.maxC && !culled(cell.noOcclusion, cell.radius, cell.viewDist, C);
+}
+
+void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vector<PlacedMesh>& out, size_t* roadFrom,
+                        std::vector<Collectible>* collect, std::vector<DecorSound>* decor, double slack) {
     stats_ = {};
     if (roadFrom) *roadFrom = out.size();
     if (ctx.terrain == nullptr || !ctx.terrain->detail || ctx.ground == nullptr) return;
@@ -854,12 +927,15 @@ void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vecto
     const Pass passes[] = {{0, 20.0, 100.0, 2.0625 * 192 + 140}, {1, 50.0, 400.0, 2.0625 * 768 + 560}, {2, 50.0, 400.0, 2.0625 * 768 + 560}};
     for (const Pass& P : passes) {
         if (lists_[size_t(P.list)].empty()) continue;
-        const int64_t i0 = int64_t(std::floor((camX - P.reach) / P.cell)), i1 = int64_t(std::floor((camX + P.reach) / P.cell));
-        const int64_t j0 = int64_t(std::floor((camZ - P.reach) / P.cell)), j1 = int64_t(std::floor((camZ + P.reach) / P.cell));
+        const double reach = P.reach + slack;
+        const int64_t i0 = int64_t(std::floor((camX - reach) / P.cell)), i1 = int64_t(std::floor((camX + reach) / P.cell));
+        const int64_t j0 = int64_t(std::floor((camZ - reach) / P.cell)), j1 = int64_t(std::floor((camZ + reach) / P.cell));
         for (int64_t j = j0; j <= j1; ++j)
             for (int64_t i = i0; i <= i1; ++i) {
                 const double x0 = double(i) * P.cell, z0 = double(j) * P.cell;
-                const double C = leafSize(x0 + 0.5, z0 + 0.5, camX, camZ);
+                // P94: with the slack, the smallest leaf any camera near (camX, camZ) gives this cell; the emit cull
+                // below is monotonic in C, so a smaller C passes whatever a larger one does.
+                const double C = leafSize(x0 + 0.5, z0 + 0.5, camX, camZ, slack);
                 if (C >= P.maxC) continue;
                 const uint64_t key = (uint64_t(uint32_t(int32_t(i))) << 32) | uint32_t(int32_t(j));
                 auto [cit, fresh] = cellCache_[P.list].try_emplace(key);
@@ -868,14 +944,38 @@ void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vecto
                 if (s.rule < 0 || culled(lists_[size_t(P.list)][size_t(s.rule)], C)) continue;
                 const size_t before = out.size();
                 emit(ctx, s, out);
+                if (slack > 0) {  // P94: the renderer's per-frame test
+                    const AutoMeshRule& r = lists_[size_t(P.list)][size_t(s.rule)];
+                    for (size_t k = before; k < out.size(); ++k)
+                        out[k].autoCell = {x0 + 0.5, z0 + 0.5, float(P.maxC), r.radius, r.viewDist, r.noOcclusion, true};
+                }
                 stats_.cellObjects += out.size() > before;
+                if (decor && out.size() > before && !decorSound_.empty()) {
+                    const AutoMeshRule& r = lists_[size_t(P.list)][size_t(s.rule)];
+                    if (decorSound_.count(r.crc)) {  // the node: the mean of the parts' origins (port; the record's y is not the ground)
+                        double cx = 0, cy = 0, cz = 0;
+                        for (size_t k = before; k < out.size(); ++k) cx += out[k].world[12], cy += out[k].world[13], cz += out[k].world[14];
+                        const double n = double(out.size() - before);
+                        decor->push_back({cx / n, cy / n, cz / n, r.crc});
+                    }
+                }
+                if (collect && out.size() > before) {
+                    const AutoMeshRule& r = lists_[size_t(P.list)][size_t(s.rule)];
+                    const bool f1 = r.crc == asoboCrc("IT_FUEL01"), f2 = r.crc == asoboCrc("IT_FUEL02");
+                    if (f1 || f2) {  // where the drums stand: the mean of the template parts' origins (port)
+                        double cx = 0, cy = 0, cz = 0;
+                        for (size_t k = before; k < out.size(); ++k) cx += out[k].world[12], cy += out[k].world[13], cz += out[k].world[14];
+                        const double n = double(out.size() - before);
+                        collect->push_back({cx / n, cy / n, cz / n, f1 ? 100.0f : 400.0f, r.radius, before, out.size() - before});
+                    }
+                }
             }
     }
     if (roadFrom) *roadFrom = out.size();
     // Roads (C < 200, W+0xa84): GwRoad lines of the gathered types (0x78f130: 4, 5, 6, 8, 9, 10,
     // 11, 12, 18, 19; not 7) near the camera, both sides and the middle.
     if (ctx.lines != nullptr && ctx.roads != nullptr && !lists_[3].empty()) {
-        const double reach = 2.0625 * 384 + 300;
+        const double reach = 2.0625 * 384 + 300 + slack;
         const int64_t c0x = int64_t(std::floor((camX - reach) / RoadNetwork::kCell)), c1x = int64_t(std::floor((camX + reach) / RoadNetwork::kCell));
         const int64_t c0z = int64_t(std::floor((camZ - reach) / RoadNetwork::kCell)), c1z = int64_t(std::floor((camZ + reach) / RoadNetwork::kCell));
         std::vector<uint32_t> lines;
@@ -895,10 +995,15 @@ void AutoMesh::generate(const Context& ctx, double camX, double camZ, std::vecto
                 auto [rit, fresh] = roadCache_.try_emplace(key);
                 if (fresh) placeAlongRoad(ctx, li, side, rit->second);
                 for (const Spawn& s : rit->second) {
-                    const double C = leafSize(s.m[12], s.m[14], camX, camZ);
+                    const double C = leafSize(s.m[12], s.m[14], camX, camZ, slack);
                     if (C >= 200.0 || culled(lists_[3][size_t(s.rule)], C)) continue;
                     const size_t before = out.size();
                     emit(ctx, s, out);
+                    if (slack > 0) {  // P94
+                        const AutoMeshRule& r = lists_[3][size_t(s.rule)];
+                        for (size_t k = before; k < out.size(); ++k)
+                            out[k].autoCell = {s.m[12], s.m[14], 200.0f, r.radius, r.viewDist, r.noOcclusion, true};
+                    }
                     stats_.roadObjects += out.size() > before;
                 }
             }

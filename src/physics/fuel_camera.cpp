@@ -342,6 +342,7 @@ void ChaseCamera::buildContext(Ctx& c, float dt, const VehicleInput& veh, const 
     const float s = clampf(c.speed * 0.03f, 0, 1);
     c.fovTgt = k[6] * (1 - s) + k[7] * s;
     if (veh.boost) c.fovTgt = fv::lerpf(c.fovTgt, k[8], clampf(c.speed * 0.1f, 0, 1));
+    if (veh.nitroFov > 0) c.fovTgt += veh.nitroFov * clampf(c.speed * 0.1f, 0, 1);  // [nitro] smoothed below (1.05/s)
     c.Dd = normalize(-c.F);
 }
 
@@ -532,6 +533,7 @@ CameraPose ChaseCamera::update(float dt, const VehicleInput& veh, const WorldQue
         const float lo = c.veh->P->size() > 574 ? (*c.veh->P)[572] : 0, hi = c.veh->P->size() > 574 ? (*c.veh->P)[573] : 1;
         const float mx = c.veh->P->size() > 574 ? (*c.veh->P)[574] : 0;
         blur = hi > lo ? mx * clampf((c.speed - lo) / (hi - lo), 0, 1) : 0;
+        blur += c.veh->nitroBlur;  // [nitro]
     }
     if (Orel.y < 0) {
         const Vec3 f = flatNormalize(Orel, {0, 0, 0});
@@ -622,20 +624,28 @@ CameraPose ChaseCamera::update(float dt, const VehicleInput& veh, const WorldQue
         c.roll = -0.3f;
         c.snap = true;  // FOV written straight (the end-of-frame smoothing is skipped while snapping)
         c.fovTgt = fov;
-    } else if (v == 10 || v == 11) {  // wreck / drown: slow orbit from a fixed world point
+    } else if (v == 10 || v == 11) {  // wreck / tornado (phys+0x1420 == 2, P43: not drowning): slow orbit from a fixed world point
         const int w = v - 10;
         wreckT_[w] += dt;
         const float t = wreckT_[w];
         if (c.snap) {
             const Vec3 p = c.C + c.up * 1.5f + (c.Fuxz * -std::fabs(std::cos(0.1f * t)) + c.Suxz * std::sin(0.1f * t)) * 10.0f;
             wreckPos_[w][0] = c.ox + p.x, wreckPos_[w][1] = c.oy + p.y, wreckPos_[w][2] = c.oz + p.z;
-            if (v == 11 && world.ground)  // (I) above the water/ground
+            if (v == 11 && world.ground)
                 wreckPos_[w][1] = std::max(wreckPos_[w][1], double(world.ground(wreckPos_[w][0], wreckPos_[w][1], wreckPos_[w][2], true)) + 1.0);
         }
         pos_ = {float(wreckPos_[w][0] - c.ox), float(wreckPos_[w][1] - c.oy), float(wreckPos_[w][2] - c.oz)};
         tgt_ = c.C + c.up * 0.5f + c.Fu * 0.5f;
+        const float fovDist = len(tgt_ - pos_);
+        // View 11 (0x40bb1c..0x40bbce): 0x5bcaa0 gives the nearest tornado; the camera looks at it, 40 m above the
+        // ground there (0x402620 + [0x99647c] = 40). [I] which point the 40 m lifts (target here) is inferred.
+        double tp[3];
+        if (v == 11 && world.tornado && world.tornado(c.ox + c.C.x, c.oz + c.C.z, tp)) {
+            const double gy = world.ground ? world.ground(tp[0], tp[1], tp[2], true) : tp[1];
+            tgt_ = {float(tp[0] - c.ox), float(gy + 40.0 - c.oy), float(tp[2] - c.oz)};
+        }
         c.roll = 0.25f * std::cos(0.133f * t);
-        c.fovTgt = std::min(200.0f / std::max(len(tgt_ - pos_), 1e-3f), 90.0f);
+        c.fovTgt = std::min(200.0f / std::max(fovDist, 1e-3f), 90.0f);  // [port] from the vehicle's distance
     } else if (v == 13) {  // page camera (absolute)
         pos_ = {float(page_[0] - c.ox), float(page_[1] - c.oy), float(page_[2] - c.oz)};
         tgt_ = {float(page_[3] - c.ox), float(page_[4] - c.oy), float(page_[5] - c.oz)};
